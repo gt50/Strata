@@ -128,7 +128,8 @@ a system ROCm 7, because AMD's wheels hold one family. A split pays only when no
 
 Setup does not offer tuning (calibration) on AMD. A tuning run by hand (`./setup.sh --calibrate`) is saved for that AMD card and
 reused. The Monitor shows the card's load, VRAM, temperature and power from Linux sysfs; on Windows from the driver's ADL
-library (`atiadlxx.dll`, part of Adrenalin: activity, graphics temperature, ASIC power) and the OS counter
+library (`atiadlxx.dll`, part of Adrenalin: activity, graphics temperature, board power where the card reports it,
+else ASIC power) and the OS counter
 `\GPU Adapter Memory(<luid>)\Dedicated Usage` (checked on a Radeon 8060S; an APU's ASIC power is the whole chip).
 
 ## Windows
