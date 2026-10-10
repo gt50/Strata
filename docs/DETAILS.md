@@ -526,7 +526,13 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   older install gets it with `UPDATE.bat` / `./update.sh`, or `python -m pip install "jsonschema>=4.23,<5"` in `.venv`); without it
   the answer is only checked to be one JSON object. Malformed output returns **502** with
   `error.code: structured_output_failed`, an invalid schema **400**. JSON formats combined with tools or MCP are refused.
-  Streaming buffers the answer and emits content only after validation. Math answers often hold LaTeX such as `\alpha`, which is
+  Streaming buffers the answer and emits content only after validation. While the model writes, the keep-alive comments
+  (about one a second) say how far it is (`: keep-alive: structured output buffered until it is validated, 312 pieces (1480 characters) written so far`).
+  A schema that is one required string field (`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`,
+  no enum, pattern or length limit) can be answered as plain text with `"structured_plain_string": true` in
+  `strata-<model>.json` (opt-in): the server builds `{"text": ...}` around it. On a scanned rent roll (UD-IQ4_XS, temperature 0)
+  the JSON form wrote the escaped newline 256 times instead of the page's end; the plain-text form finished the page in 165 tokens.
+  Math answers often hold LaTeX such as `\alpha`, which is
   not a valid JSON escape. Add `"repair_latex_escapes": true` to the `response_format` (or to `text.format` on `/v1/responses`) and,
   only after the strict parse failed, the server doubles the backslashes that are not valid escapes and checks the answer again.
   Valid output is never touched. `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX` are valid JSON, so they stay: a `\beta` beside a `\alpha`
