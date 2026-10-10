@@ -479,6 +479,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `prevent_sleep` | off | Windows only: keeps the PC awake while a request runs or waits (`SetThreadExecutionState`). On Linux and macOS one startup line says it does nothing. |
 | `sampling` | the model card | Defaults for requests that leave sampling fields out, for example `{"temperature": 1.0, "top_p": 0.95, "top_k": 20}`. |
 | `aliases` | none | Extra model names listed in `/v1/models`, like llama-server's `--alias`. Any other name is still served. |
+| `forward` | none | `{path: URL}`: POST requests to these paths are answered by another server, e.g. `{"/v1/embeddings": "http://127.0.0.1:8081/v1/embeddings"}` for an embedding model beside this one, so apps keep one base URL. The answer comes back as it came. The Host, API-key and web-page checks are Strata's own; Strata's API key is not sent on. Strata's own paths cannot be forwarded; a server that does not answer is a `502` with `code: forward_failed`. |
 | `fit_max_tokens` | `true` | A request whose `max_tokens` runs past the context gets it shortened to the room left. `false` (or `--no-fit-max-tokens`) returns 400 instead. A prompt that leaves no room is always refused. |
 | `engine_silence_s` | `300` | Ends the engine after this many seconds without a line during a request (`0` = wait forever). While a prompt is read, each chunk may take three times the previous one's time. |
 | `parallel` | `1` | Up to N requests decoded together in batch slots ([BATCHING.md](BATCHING.md)). |
