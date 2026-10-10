@@ -281,7 +281,25 @@ def extract_json(text: str) -> str:
     return s[start:]
 
 
-def validated_json(text, validator, finish):
+INCOMPLETE = {
+    # the generator's "stop_cause" for a reply it ended before its end (see Service.run): a bigger budget cannot help
+    "repetition": ("structured output was incomplete: the reply repeated the same text over and over and Strata stopped "
+                   "it (repeat_stop_tokens), so a larger output budget will not help. Long free text inside a JSON "
+                   "string can make the model loop; a schema with one string field is answered as plain text instead "
+                   "(structured_plain_string)"),
+    "reasoning_loop": ("structured output was incomplete: the thinking repeated the same passages and Strata stopped "
+                       "it (reasoning_loop_recovery), so a larger output budget will not help"),
+}
+
+
+def incomplete_message(finish, cause=None):
+    """The error for a structured answer that did not end on its own."""
+    return INCOMPLETE.get(cause) or f"structured output was incomplete (finish_reason={finish}); increase the output budget"
+
+
+def validated_json(text, validator, finish, cause=None):
+    """The answer as canonical JSON, or StructuredOutputError.  `cause`: the generator's stop_cause, when it ended
+    the reply itself (a repetition) rather than at the output budget."""
     def pairs(items):
         obj = {}
         for key, value in items:
@@ -294,7 +312,7 @@ def validated_json(text, validator, finish):
         raise ValueError(f"invalid JSON constant: {value}")
 
     if finish != "stop":
-        raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); increase the output budget")
+        raise StructuredOutputError(incomplete_message(finish, cause))
     if isinstance(validator, _PlainString):
         return _wrapped(text, validator, pairs, constant)
     try:
