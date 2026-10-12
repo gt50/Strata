@@ -145,8 +145,9 @@ int real_model(const std::string& shard) {
             std::printf("  refused: %s\n", err.c_str());
             return 1;
         }
-        std::printf("  %lld layers + %lld MTP, n_embd %lld, vocab %lld, context %lld, rms_eps %g\n", (long long) g.n_layers,
-                    (long long) g.n_nextn, (long long) g.n_embd, (long long) g.n_vocab, (long long) g.n_ctx_train, g.rms_eps);
+        std::printf("  %lld layers + %lld MTP, n_embd %lld, vocab %lld, context %lld, rms_eps %g, norm_eps %g\n",
+                    (long long) g.n_layers, (long long) g.n_nextn, (long long) g.n_embd, (long long) g.n_vocab,
+                    (long long) g.n_ctx_train, g.rms_eps, g.norm_eps);
         std::printf("  layers (M = MLA + indexer, k = KDA, | = MTP): %s  -> %lld MLA, %lld KDA\n", layer_map(g).c_str(),
                     (long long) g.n_mla_layers(), (long long) g.n_kda_layers());
         std::printf("  KDA: %lld heads x %lld, conv %lld, gate lower bound %s%g\n", (long long) g.n_head,
@@ -193,6 +194,7 @@ int main(int argc, char** argv) {
         check(g.n_embd == 4096 && g.n_vocab == 154880 && g.n_ctx_train == 1048576 && g.n_head == 64,
               "  n_embd 4096, vocab 154880, context 1048576, 64 heads");
         check(g.rms_eps > 0.99e-5 && g.rms_eps < 1.01e-5, "  the RMS epsilon (1e-5), not the plain layer-norm one (1e-6)");
+        check(g.norm_eps > 0.99e-6 && g.norm_eps < 1.01e-6, "  the indexer key's LayerNorm epsilon (1e-6)");
         check(g.kda_head_dim == 128 && g.ssm_d_conv == 4 && g.has_kda_gate_lower_bound && g.kda_gate_lower_bound == -5.0,
               "  KDA: head 128, conv 4, gate lower bound -5");
         check(g.q_lora_rank == 1536 && g.kv_lora_rank == 512 && g.n_rot == 0 && g.head_dim_k == 256 && g.head_dim_v == 256,

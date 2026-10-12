@@ -853,9 +853,11 @@ inline std::string read_geometry(const GgufFile& f, core::Glm5NextGeometry& g) {
     g.n_layers = blocks - g.n_nextn;
     if (!read_int("embedding_length", g.n_embd, true) || !read_int("context_length", g.n_ctx_train, false) ||
         !read_int("attention.head_count", g.n_head, true) || !read_int("vocab_size", g.n_vocab, false) ||
-        !read_num("attention.layer_norm_rms_epsilon", g.rms_eps, true))
+        !read_num("attention.layer_norm_rms_epsilon", g.rms_eps, true) ||
+        !read_num("attention.layer_norm_epsilon", g.norm_eps, false))
         return err;
     if (!(g.rms_eps > 0)) return p + "attention.layer_norm_rms_epsilon must be positive";
+    if (!(g.norm_eps >= 0)) return p + "attention.layer_norm_epsilon must not be negative";
     if (g.n_vocab == 0)
         if (const MetaValue* t = f.get("tokenizer.ggml.tokens"); t && t->type == MetaType::ARRAY) g.n_vocab = (int64_t) t->count;
 

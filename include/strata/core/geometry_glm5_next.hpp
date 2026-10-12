@@ -20,6 +20,9 @@ struct Glm5NextGeometry {
     int64_t n_vocab = 0;              ///< vocab_size, else the length of tokenizer.ggml.tokens (154880)
     int64_t n_ctx_train = 0;          ///< context_length (1048576)
     double rms_eps = 0;               ///< attention.layer_norm_rms_epsilon
+    /// attention.layer_norm_epsilon (1e-6): the indexer key's LayerNorm.  Optional as in llama.cpp, whose value-
+    /// initialized f_norm_eps is then 0
+    double norm_eps = 0;
 
     /// Per block, MTP layers included: 1 = MLA attention, 0 = KDA linear attention (attention.head_count_kv, an
     /// array: 0 marks a linear layer, as llama.cpp's is_recr).
