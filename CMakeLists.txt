@@ -383,6 +383,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_prompt_attn.cu
                           src/kernels/cuda/fused_gdn.cu
                           src/kernels/cuda/kda.cu
+                          src/kernels/cuda/mla.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
@@ -870,6 +871,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kda_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kda_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kda_parity COMMAND kda_parity --selftest)
+
+  # GLM-5.3-Flash's MLA attention (per-head absorb GEMVs, latent cache store, decode attention) against llama.cpp's math
+  add_executable(mla_parity src/kernels/mla_parity.cpp)
+  target_include_directories(mla_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(mla_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME mla_parity COMMAND mla_parity --selftest)
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${_strata_gpu_include_directories})
