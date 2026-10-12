@@ -73,4 +73,36 @@ void kda_gate(const float* raw, const float* dt_bias, const float* ssm_a, float*
 void kda_scan_norm(float* state, const float* qkv, const float* gate, const float* beta, const float* z,
                    const float* o_norm, float eps, float* y, int heads, int n_tokens, void* stream);
 
+/// Tokens per chunk of kda_scan_norm_chunked, and per super-block (one prep and one scan launch each).
+inline constexpr int kKdaChunk = 32;
+inline constexpr int kKdaSuperBlock = 512;
+
+/// The scratch kda_scan_norm_chunked needs, in floats: per chunk of the first super-block and per head, the chunk's
+/// T and P (kKdaChunk^2 each) and its cumulative gate (kKdaChunk x 128).  It stops growing at kKdaSuperBlock tokens
+/// (64 heads: 25.2 MB).
+size_t kda_chunked_scratch_floats(int heads, int n_tokens);
+
+/// kda_scan_norm in chunks of kKdaChunk tokens: the WY form of the delta rule as flash-linear-attention computes it,
+/// with KDA's per-channel decay inside every product, all in FP32.  Per head, with Gam_t the gate's sum per key
+/// channel from the chunk's start to t (inclusive), (x) the elementwise product, and S0 the state before the chunk:
+///
+///     A[t][i] = beta_t sum_c k_t[c] k_i[c] exp(Gam_t[c] - Gam_i[c])   (i < t),   T = (I + A)^-1
+///     P[t][i] =        sum_c q_t[c] k_i[c] exp(Gam_t[c] - Gam_i[c])   (i <= t)
+///     Y_t     = beta_t (v_t - S0^T (exp(Gam_t) (x) k_t)),   D = T Y   (the delta rule's correction per token)
+///     o_t     = S0^T (exp(Gam_t) (x) q_t) + sum_{i <= t} P[t][i] D_i
+///     S       = diag(exp(Gam_last)) S0 + sum_t (exp(Gam_last - Gam_t) (x) k_t) D_t^T
+///
+/// Every exponent is <= 0 (gates are <= 0), so nothing overflows whatever the lower bound.  The same state and
+/// outputs as kda_scan_norm up to FP32 rounding (the sums run in another order; kda_parity: largest difference over
+/// largest value 3.5e-6 at 2048 tokens).  Same arguments, plus `scratch` (kda_chunked_scratch_floats(heads,
+/// n_tokens) floats, the caller's); y is written twice (o, then the norm).
+///
+/// Which to use is the caller's choice, by measurement.  On a Radeon 8060S (gfx1151, 40 CUs; kda_parity --bench,
+/// 64 heads, the two launches alternating, two runs) this one against kda_scan_norm: 1.02-1.13x at 32 and 128
+/// tokens, 0.87-0.93x at 512, 1.08x at 2048, 1.21-1.27x at 8192 - a prep of about 2.5 us a token once a prompt
+/// outgrows the cache, and a scan of about 3.5.  Not yet run on a CUDA card.
+void kda_scan_norm_chunked(float* state, const float* qkv, const float* gate, const float* beta, const float* z,
+                           const float* o_norm, float eps, float* y, int heads, int n_tokens, float* scratch,
+                           void* stream);
+
 }  // namespace strata::kernels

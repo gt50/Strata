@@ -15,7 +15,10 @@
 //
 // Then the kernels run one token, and a run of seven tokens both in one launch and split 1 + 2 + 4, which must be
 // bitwise identical to the single launch (the state and the conv history carry across launches exactly).
-// `--bench` adds each kernel's time for one layer at T = 1 (decode) and T = 512 (a prompt run).
+// The chunked scan (kda_scan_norm_chunked) is checked against the reference at 1, 100 and (8 heads) 1100 tokens, and
+// against kda_scan_norm at those and 2048 tokens (largest |difference| over largest |value|, gdn_rec_parity's measure).
+// `--bench` adds each kernel's time for one layer at T = 1 (decode) and T = 512 (a prompt run), and the two scans'
+// times from 32 to 8192 tokens.
 #include "strata/kernels/kda.hpp"
 
 #include <cuda_runtime.h>
@@ -102,21 +105,23 @@ void ref_gate(const std::vector<float>& raw, const std::vector<float>& dt, const
 }
 
 /// The KDA branch of ggml_compute_forward_gated_delta_net, then build_kda_layer's output norm, for T tokens.
-/// `st` is [H][D * D] in ggml's layout, s[j * D + i] = S[i][j].  `decay_on_value` is rival 1, `decay_after` 2.
+/// `st` is [nh][D * D] in ggml's layout, s[j * D + i] = S[i][j].  `decay_on_value` is rival 1, `decay_after` 2;
+/// `nh` heads (the layer's 64 unless a long run is to stay quick on the CPU).
 void ref_scan_norm(std::vector<double>& st, const std::vector<float>& qkv, const std::vector<float>& gate,
                    const std::vector<float>& beta, const std::vector<float>& z, const std::vector<float>& gamma, int T,
-                   std::vector<float>& y, bool decay_on_value = false, bool decay_after = false) {
-    y.assign((size_t) T * DI, 0.0f);
+                   std::vector<float>& y, bool decay_on_value = false, bool decay_after = false, int nh = H) {
+    const int di = nh * D;
+    y.assign((size_t) T * di, 0.0f);
     const double scale = 1.0 / std::sqrt((double) D);
     std::vector<double> delta((size_t) D), dec((size_t) D), o((size_t) D);
-    for (int h = 0; h < H; ++h) {
+    for (int h = 0; h < nh; ++h) {
         double* M = &st[(size_t) h * D * D];
         for (int t = 0; t < T; ++t) {
-            const float* q = &qkv[(size_t) t * 3 * DI + (size_t) h * D];
-            const float* k = q + DI;
-            const float* v = q + 2 * DI;
-            const float* g = &gate[(size_t) t * DI + (size_t) h * D];
-            const double b = beta[(size_t) t * H + h];
+            const float* q = &qkv[(size_t) t * 3 * di + (size_t) h * D];
+            const float* k = q + di;
+            const float* v = q + 2 * di;
+            const float* g = &gate[(size_t) t * di + (size_t) h * D];
+            const double b = beta[(size_t) t * nh + h];
             for (int i = 0; i < D; ++i) dec[(size_t) i] = std::exp((double) g[i]);
             auto apply_decay = [&] {          // S[i][:] *= exp(g[i])  =>  M[j][i] *= exp(g[i])
                 for (int j = 0; j < D; ++j)
@@ -140,7 +145,7 @@ void ref_scan_norm(std::vector<double>& st, const std::vector<float>& qkv, const
             }
             const double inv = 1.0 / std::sqrt(ss / D + (double) kRmsEps);
             for (int j = 0; j < D; ++j) {
-                const size_t at = (size_t) t * DI + (size_t) h * D + j;
+                const size_t at = (size_t) t * di + (size_t) h * D + j;
                 y[at] = (float) (o[(size_t) j] * inv * (double) gamma[(size_t) j] * sigmoid_d((double) z[at]));
             }
         }
@@ -148,18 +153,18 @@ void ref_scan_norm(std::vector<double>& st, const std::vector<float>& qkv, const
 }
 
 /// Strata's (D, H, D) state, [(i * H + h) * D + j], from and to ggml's per-head s[j * D + i].
-std::vector<float> to_dev(const std::vector<double>& st) {
-    std::vector<float> d((size_t) D * H * D);
-    for (int h = 0; h < H; ++h)
+std::vector<float> to_dev(const std::vector<double>& st, int nh = H) {
+    std::vector<float> d((size_t) D * nh * D);
+    for (int h = 0; h < nh; ++h)
         for (int i = 0; i < D; ++i)
-            for (int j = 0; j < D; ++j) d[((size_t) i * H + h) * D + j] = (float) st[(size_t) h * D * D + (size_t) j * D + i];
+            for (int j = 0; j < D; ++j) d[((size_t) i * nh + h) * D + j] = (float) st[(size_t) h * D * D + (size_t) j * D + i];
     return d;
 }
-std::vector<float> from_dev(const std::vector<float>& d) {
-    std::vector<float> st((size_t) H * D * D);
-    for (int h = 0; h < H; ++h)
+std::vector<float> from_dev(const std::vector<float>& d, int nh = H) {
+    std::vector<float> st((size_t) nh * D * D);
+    for (int h = 0; h < nh; ++h)
         for (int i = 0; i < D; ++i)
-            for (int j = 0; j < D; ++j) st[(size_t) h * D * D + (size_t) j * D + i] = d[((size_t) i * H + h) * D + j];
+            for (int j = 0; j < D; ++j) st[(size_t) h * D * D + (size_t) j * D + i] = d[((size_t) i * nh + h) * D + j];
     return st;
 }
 std::vector<float> to_float(const std::vector<double>& v) { return std::vector<float>(v.begin(), v.end()); }
@@ -189,6 +194,19 @@ void expect_close(const char* what, const std::vector<float>& want, const std::v
     const double rel = rel_l1(want, got);
     const bool ok = rel <= tol;
     std::printf("  %-52s rel %.3e %s\n", what, rel, ok ? "" : "*** over tolerance ***");
+    if (!ok) ++g_bad;
+}
+
+/// Largest |difference| over largest |value|: gdn_rec_parity's measure for two FP32 kernels that sum in other orders.
+void expect_max_rel(const char* what, const std::vector<float>& want, const std::vector<float>& got, double tol) {
+    double d = 0, m = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        d = std::fmax(d, std::fabs((double) want[i] - (double) got[i]));
+        m = std::fmax(m, std::fabs((double) want[i]));
+    }
+    const double rel = d / (m > 1e-30 ? m : 1e-30);
+    const bool ok = rel <= tol;
+    std::printf("  %-52s max %.3e %s\n", what, rel, ok ? "" : "*** over tolerance ***");
     if (!ok) ++g_bad;
 }
 
@@ -361,6 +379,102 @@ int main(int argc, char** argv) {
         expect_bitwise("kda_scan_norm: y", y_got, download(dy, y_want.size()));
         expect_bitwise("kda_scan_norm: state", st_got, download(ds, st0.size()));
         cudaFree(dh); cudaFree(ds); cudaFree(dy);
+    }
+
+    // ================= the chunked scan =================
+    std::printf("\nkda_scan_norm_chunked (chunks of %d, super-blocks of %d), against the reference and kda_scan_norm:\n",
+                strata::kernels::kKdaChunk, strata::kernels::kKdaSuperBlock);
+    {
+        struct Case { int nh, T; bool ref; };
+        // one token; a partial last chunk; three super-blocks, the last partial (8 heads keep the CPU quick); and
+        // 2048 tokens of all 64 heads against the token-by-token kernel only
+        const Case cases[] = {{H, 1, true}, {H, 100, true}, {8, 1100, true}, {H, 2048, false}};
+        for (const Case& cs : cases) {
+            const int nh = cs.nh, n = cs.T, di = nh * D;
+            std::vector<float> qkv((size_t) n * 3 * di), gt((size_t) n * di), bt((size_t) n * nh), zt((size_t) n * di),
+                ah((size_t) nh);
+            for (auto& x : qkv) x = gauss(rng);
+            for (int t = 0; t < n; ++t)   // q and k L2-normalized per head, as kda_conv_l2 leaves them
+                for (int hh = 0; hh < 2 * nh; ++hh) {
+                    float* p = &qkv[(size_t) t * 3 * di + (size_t) hh * D];
+                    double ss = 0;
+                    for (int i = 0; i < D; ++i) ss += (double) p[i] * (double) p[i];
+                    for (int i = 0; i < D; ++i) p[i] = (float) ((double) p[i] / std::sqrt(ss + (double) kL2Eps));
+                }
+            for (auto& a : ah) a = -std::exp(unit(rng) * std::log(16.0f));
+            for (int t = 0; t < n; ++t)   // the lower-bound gate of a unit-normal pre-activation
+                for (int c = 0; c < di; ++c)
+                    gt[(size_t) t * di + c] =
+                        (float) ((double) kLowerBound * sigmoid_d(-(double) ah[(size_t) (c / D)] * (double) gauss(rng)));
+            for (auto& x : bt) x = (float) sigmoid_d(gauss(rng));
+            for (auto& x : zt) x = gauss(rng);
+            std::vector<double> s0((size_t) nh * D * D);
+            for (auto& x : s0) x = 0.05 * gauss(rng);
+
+            float *dq = upload(qkv), *dg = upload(gt), *db = upload(bt), *dz = upload(zt);
+            float *ds_seq = upload(to_dev(s0, nh)), *ds_ch = upload(to_dev(s0, nh));
+            float *dy_seq = nullptr, *dy_ch = nullptr, *dscr = nullptr;
+            check(cudaMalloc(&dy_seq, (size_t) n * di * 4), "y seq");
+            check(cudaMalloc(&dy_ch, (size_t) n * di * 4), "y chunked");
+            check(cudaMalloc(&dscr, strata::kernels::kda_chunked_scratch_floats(nh, n) * 4), "scratch");
+            strata::kernels::kda_scan_norm(ds_seq, dq, dg, db, dz, d_gamma, kRmsEps, dy_seq, nh, n, nullptr);
+            strata::kernels::kda_scan_norm_chunked(ds_ch, dq, dg, db, dz, d_gamma, kRmsEps, dy_ch, nh, n, dscr, nullptr);
+            check(cudaDeviceSynchronize(), "chunked");
+            const std::vector<float> y_seq = download(dy_seq, (size_t) n * di), y_ch = download(dy_ch, (size_t) n * di);
+            const std::vector<float> st_seq = from_dev(download(ds_seq, s0.size()), nh);
+            const std::vector<float> st_ch = from_dev(download(ds_ch, s0.size()), nh);
+            char what[96];
+            if (cs.ref) {
+                std::vector<double> s_ref = s0;
+                std::vector<float> y_ref;
+                ref_scan_norm(s_ref, qkv, gt, bt, zt, gamma, n, y_ref, false, false, nh);
+                std::snprintf(what, sizeof what, "%2d heads x %4d tokens: y vs reference", nh, n);
+                expect_close(what, y_ref, y_ch, 2e-5);
+                std::snprintf(what, sizeof what, "%2d heads x %4d tokens: state vs reference", nh, n);
+                expect_close(what, to_float(s_ref), st_ch, 2e-5);
+            }
+            std::snprintf(what, sizeof what, "%2d heads x %4d tokens: y vs kda_scan_norm", nh, n);
+            expect_max_rel(what, y_seq, y_ch, 1e-4);
+            std::snprintf(what, sizeof what, "%2d heads x %4d tokens: state vs kda_scan_norm", nh, n);
+            expect_max_rel(what, st_seq, st_ch, 1e-4);
+            for (float* p : {dq, dg, db, dz, ds_seq, ds_ch, dy_seq, dy_ch, dscr}) cudaFree(p);
+        }
+    }
+
+    // ================= --bench: the two scans over a prompt =================
+    if (bench) {
+        std::printf("\nkda_scan_norm vs kda_scan_norm_chunked, all %d heads, best of 5 launches:\n", H);
+        for (const int n : {32, 128, 512, 2048, 8192}) {
+            std::vector<float> qkv((size_t) n * 3 * DI), gt((size_t) n * DI), bt((size_t) n * H), zt((size_t) n * DI);
+            for (auto& x : qkv) x = 0.088f * gauss(rng);   // about unit rows of 128
+            for (auto& x : gt) x = kLowerBound * unit(rng);
+            for (auto& x : bt) x = unit(rng);
+            for (auto& x : zt) x = gauss(rng);
+            float *dq = upload(qkv), *dg = upload(gt), *db = upload(bt), *dz = upload(zt), *ds = upload(to_dev(st0));
+            float *dy = nullptr, *dscr = nullptr;
+            check(cudaMalloc(&dy, (size_t) n * DI * 4), "y");
+            check(cudaMalloc(&dscr, strata::kernels::kda_chunked_scratch_floats(H, n) * 4), "scratch");
+            cudaEvent_t e0, e1;
+            check(cudaEventCreate(&e0), "ev");
+            check(cudaEventCreate(&e1), "ev");
+            float best[2] = {1e30f, 1e30f};
+            for (int it = 0; it < 6; ++it)
+                for (int which = 0; which < 2; ++which) {   // alternate, so a clock step affects both alike
+                    check(cudaEventRecord(e0, nullptr), "rec");
+                    if (which == 0) strata::kernels::kda_scan_norm(ds, dq, dg, db, dz, d_gamma, kRmsEps, dy, H, n, nullptr);
+                    else strata::kernels::kda_scan_norm_chunked(ds, dq, dg, db, dz, d_gamma, kRmsEps, dy, H, n, dscr, nullptr);
+                    check(cudaEventRecord(e1, nullptr), "rec");
+                    check(cudaEventSynchronize(e1), "sync");
+                    float ms = 0;
+                    check(cudaEventElapsedTime(&ms, e0, e1), "el");
+                    if (it > 0) best[which] = std::fmin(best[which], ms);   // the first is a warm-up
+                }
+            std::printf("  T = %-5d  token by token %9.3f ms (%5.2f us/token)   chunked %9.3f ms (%5.2f us/token)   %.2fx\n", n,
+                        best[0], 1000.0 * best[0] / n, best[1], 1000.0 * best[1] / n, best[0] / best[1]);
+            for (float* p : {dq, dg, db, dz, ds, dy, dscr}) cudaFree(p);
+            cudaEventDestroy(e0);
+            cudaEventDestroy(e1);
+        }
     }
 
     for (float* p : {d_hist, d_x, d_w[0], d_w[1], d_w[2], d_raw, d_dt, d_a, d_beta, d_z, d_gamma, d_st, d_qkv, d_gate,
