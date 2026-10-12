@@ -6,9 +6,14 @@
 //      positions, chunk-boundary counts (1, 31, 32, 33) and 2048 shuffled rows out of 5000
 //   4. the chain q -> Wk_b -> attention -> Wv_b at 8 heads against the UNABSORBED form, llama.cpp's algebra before
 //      absorption: explicit keys k_hj = Wk_b[h]^T c_j and values v_hj = Wv_b[h] c_j per head and position
+//   5. mla_decode_attn_step: the count from the device step, the grid by the capacity - the same bits as the host
+//      count at widths 2051, 100 and 1
+//   6. mla_prompt_attn: a causal prompt of 100 tokens (query t over rows 0 .. t), and 4 queries over their own
+//      selections (2051, 2049, 1, 37 shuffled rows), against the reference; query 0 also against the decode kernel
 //
 // Rival readings are shown to differ on the fixture first: the weights read transposed ([h][n_in][n_out]), and the
-// score scale 1 / sqrt(512) (the latent width) for 1 / sqrt(256).  `--bench` times the decode-time kernels.
+// score scale 1 / sqrt(512) (the latent width) for 1 / sqrt(256).  `--bench` times the decode-time kernels and a
+// prompt's attention.
 #include "strata/kernels/mla.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -319,6 +324,111 @@ int main(int argc, char** argv) {
         cudaFree(d_q); cudaFree(d_qa); cudaFree(d_ol); cudaFree(d_out); cudaFree(d_scr); cudaFree(d_ids);
     }
 
+    // ================= 5. the count from the step: decode =================
+    std::printf("\nmla_decode_attn_step (the count on the device, the grid by the capacity 2051):\n");
+    constexpr int64_t CAP = 2051;
+    {
+        std::vector<float> qa((size_t) H * L);
+        for (auto& x : qa) x = 0.15f * gauss(rng);
+        std::vector<int32_t> perm((size_t) ROWS);
+        std::iota(perm.begin(), perm.end(), 0);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        std::vector<int32_t> ids(perm.begin(), perm.begin() + CAP);
+        float* d_qa = upload(qa);
+        int32_t* d_ids = upload(ids);
+        float *d_o1 = nullptr, *d_o2 = nullptr, *d_scr = nullptr;
+        int32_t* d_st = nullptr;
+        check(cudaMalloc(&d_o1, qa.size() * 4), "o1");
+        check(cudaMalloc(&d_o2, qa.size() * 4), "o2");
+        check(cudaMalloc(&d_scr, mla_decode_attn_scratch_floats(H, CAP) * 4), "scratch");
+        check(cudaMalloc(&d_st, kStepCount * 4), "step");
+        for (const int64_t width : {CAP, (int64_t) 100, (int64_t) 1}) {
+            int32_t st[kStepCount] = {0, 0, 0, (int32_t) width};
+            check(cudaMemcpy(d_st, st, sizeof st, cudaMemcpyHostToDevice), "st");
+            mla_decode_attn(d_qa, d_cache, d_ids, width, (float) scale, d_scr, d_o1, H, nullptr);
+            mla_decode_attn_step(d_qa, d_cache, d_ids, d_st, CAP, (float) scale, d_scr, d_o2, H, nullptr);
+            check(cudaDeviceSynchronize(), "step attn");
+            char what[96];
+            std::snprintf(what, sizeof what, "width %4lld: the same bits as the host count", (long long) width);
+            const bool same = download(d_o1, qa.size()) == download(d_o2, qa.size());
+            std::printf("  %-56s %s\n", what, same ? "yes" : "*** NO ***");
+            if (!same) ++g_bad;
+        }
+        cudaFree(d_qa); cudaFree(d_ids); cudaFree(d_o1); cudaFree(d_o2); cudaFree(d_scr); cudaFree(d_st);
+    }
+
+    // ================= 6. prompt attention =================
+    std::printf("\nmla_prompt_attn, %d heads:\n", H);
+    {
+        // a causal prompt of 100 tokens, rows 0 .. 99: query t sees rows 0 .. t (no ids)
+        constexpr int TQ = 100;
+        std::vector<float> qa((size_t) TQ * H * L);
+        for (auto& x : qa) x = 0.15f * gauss(rng);
+        std::vector<int32_t> steps((size_t) TQ * kStepCount);
+        for (int t = 0; t < TQ; ++t) {
+            steps[(size_t) t * kStepCount + kStepPos] = t;
+            steps[(size_t) t * kStepCount + kStepNKv] = t + 1;
+            steps[(size_t) t * kStepCount + kStepNBid] = (t + 1) / 4;
+            steps[(size_t) t * kStepCount + kStepWidth] = t + 1;
+        }
+        float* d_qa = upload(qa);
+        int32_t* d_steps = upload(steps);
+        float* d_o = nullptr;
+        check(cudaMalloc(&d_o, qa.size() * 4), "o");
+        mla_prompt_attn(d_qa, d_cache, nullptr, d_steps, 0, TQ, (float) scale, d_o, H, nullptr);
+        check(cudaDeviceSynchronize(), "prompt");
+        const std::vector<float> got = download(d_o, qa.size());
+        std::vector<float> want;
+        for (int t = 0; t < TQ; ++t) {
+            std::vector<int32_t> rows((size_t) t + 1);
+            std::iota(rows.begin(), rows.end(), 0);
+            const std::vector<float> qt(qa.begin() + (size_t) t * H * L, qa.begin() + (size_t) (t + 1) * H * L);
+            const std::vector<float> ot = ref_attn(qt, cache, rows, H, scale);
+            want.insert(want.end(), ot.begin(), ot.end());
+        }
+        expect_close("a causal prompt of 100 tokens, query t over rows 0 .. t", want, got, 1e-5);
+        cudaFree(d_qa); cudaFree(d_steps); cudaFree(d_o);
+    }
+    {
+        // selections of 2051, 2049, 1 and 37 rows out of 5000, shuffled, each query its own; and query 0 against
+        // the decode kernel on the same selection
+        const int64_t widths[4] = {2051, 2049, 1, 37};
+        constexpr int NQ = 4;
+        std::vector<float> qa((size_t) NQ * H * L);
+        for (auto& x : qa) x = 0.15f * gauss(rng);
+        std::vector<int32_t> ids((size_t) NQ * CAP, 0), steps((size_t) NQ * kStepCount, 0);
+        std::vector<std::vector<int32_t>> rows(NQ);
+        for (int q = 0; q < NQ; ++q) {
+            std::vector<int32_t> perm((size_t) ROWS);
+            std::iota(perm.begin(), perm.end(), 0);
+            std::shuffle(perm.begin(), perm.end(), rng);
+            rows[(size_t) q].assign(perm.begin(), perm.begin() + widths[q]);
+            std::copy(rows[(size_t) q].begin(), rows[(size_t) q].end(), ids.begin() + (size_t) q * CAP);
+            steps[(size_t) q * kStepCount + kStepWidth] = (int32_t) widths[q];
+        }
+        float* d_qa = upload(qa);
+        int32_t *d_ids = upload(ids), *d_steps = upload(steps);
+        float *d_o = nullptr, *d_od = nullptr, *d_scr = nullptr;
+        check(cudaMalloc(&d_o, qa.size() * 4), "o");
+        check(cudaMalloc(&d_od, (size_t) H * L * 4), "od");
+        check(cudaMalloc(&d_scr, mla_decode_attn_scratch_floats(H, CAP) * 4), "scratch");
+        mla_prompt_attn(d_qa, d_cache, d_ids, d_steps, CAP, NQ, (float) scale, d_o, H, nullptr);
+        mla_decode_attn(d_qa, d_cache, d_ids, widths[0], (float) scale, d_scr, d_od, H, nullptr);
+        check(cudaDeviceSynchronize(), "prompt sparse");
+        const std::vector<float> got = download(d_o, qa.size());
+        std::vector<float> want;
+        for (int q = 0; q < NQ; ++q) {
+            const std::vector<float> qq(qa.begin() + (size_t) q * H * L, qa.begin() + (size_t) (q + 1) * H * L);
+            const std::vector<float> oq = ref_attn(qq, cache, rows[(size_t) q], H, scale);
+            want.insert(want.end(), oq.begin(), oq.end());
+        }
+        expect_close("4 queries over 2051, 2049, 1 and 37 selected rows each", want, got, 1e-5);
+        const std::vector<float> got0(got.begin(), got.begin() + (size_t) H * L);
+        expect_close("query 0 against mla_decode_attn (another summation order)", download(d_od, (size_t) H * L), got0,
+                     1e-6);
+        cudaFree(d_qa); cudaFree(d_ids); cudaFree(d_steps); cudaFree(d_o); cudaFree(d_od); cudaFree(d_scr);
+    }
+
     // ================= --bench: one layer's decode-time kernels =================
     if (bench) {
         std::printf("\none MLA layer at decode (the parts here), %d heads, mean of 200:\n", H);
@@ -352,6 +462,43 @@ int main(int argc, char** argv) {
         }
         cudaEventDestroy(e0); cudaEventDestroy(e1);
         cudaFree(d_q); cudaFree(d_qa); cudaFree(d_ol); cudaFree(d_out); cudaFree(d_scr);
+
+        // a prompt's attention, one layer: causal prompts (every row up to each query), and 2048 queries each over
+        // its own 2051 rows of the 5000 (a long prompt's steady state, past the indexer's bound)
+        std::printf("\nprompt attention, one layer, %d heads, mean of 5:\n", H);
+        for (const int tq : {512, 2048, -2048}) {
+            const int nq = tq < 0 ? -tq : tq;
+            float *d_pq = nullptr, *d_po = nullptr;
+            check(cudaMalloc(&d_pq, (size_t) nq * H * L * 4), "pq");
+            check(cudaMalloc(&d_po, (size_t) nq * H * L * 4), "po");
+            check(cudaMemset(d_pq, 0, (size_t) nq * H * L * 4), "pq0");
+            std::vector<int32_t> steps((size_t) nq * kStepCount, 0), ids;
+            for (int t = 0; t < nq; ++t) steps[(size_t) t * kStepCount + kStepWidth] = tq < 0 ? (int32_t) CAP : t + 1;
+            if (tq < 0) {
+                ids.resize((size_t) nq * CAP);
+                for (auto& r : ids) r = (int32_t) (rng() % ROWS);
+            }
+            int32_t* d_steps = upload(steps);
+            int32_t* d_ids = tq < 0 ? upload(ids) : nullptr;
+            cudaEvent_t a, b;
+            check(cudaEventCreate(&a), "ev");
+            check(cudaEventCreate(&b), "ev");
+            mla_prompt_attn(d_pq, d_cache, d_ids, d_steps, CAP, nq, (float) scale, d_po, H, nullptr);
+            check(cudaEventRecord(a, nullptr), "rec");
+            for (int i = 0; i < 5; ++i) mla_prompt_attn(d_pq, d_cache, d_ids, d_steps, CAP, nq, (float) scale, d_po, H, nullptr);
+            check(cudaEventRecord(b, nullptr), "rec");
+            check(cudaEventSynchronize(b), "sync");
+            float ms = 0;
+            check(cudaEventElapsedTime(&ms, a, b), "el");
+            double rows = 0;
+            for (int t = 0; t < nq; ++t) rows += steps[(size_t) t * kStepCount + kStepWidth];
+            std::printf("  %4d queries, %s   %8.2f ms   (%.1f us a query, %.2f TFLOP/s)\n", nq,
+                        tq < 0 ? "2051 selected rows each     " : "causal (query t: t + 1 rows)", ms / 5, ms / 5 * 1000 / nq,
+                        rows * H * L * 4.0 / (ms / 5 * 1e-3) / 1e12);
+            cudaEventDestroy(a); cudaEventDestroy(b);
+            cudaFree(d_pq); cudaFree(d_po); cudaFree(d_steps);
+            if (d_ids) cudaFree(d_ids);
+        }
     }
 
     cudaFree(d_wk); cudaFree(d_wv); cudaFree(d_cache);

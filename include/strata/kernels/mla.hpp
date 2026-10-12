@@ -25,6 +25,8 @@
 // THE CACHE: FP16 latent rows [row][L], as llama.cpp's default cache type; K and V are the same row.
 #pragma once
 
+#include "strata/kernels/qsa.hpp"   // the step layout (kStepWidth) the indexer's selection shares
+
 #include <cstdint>
 
 namespace strata::kernels {
@@ -57,5 +59,18 @@ uint64_t mla_decode_attn_scratch_floats(int heads, int64_t max_sel);
 /// them.  heads must be a multiple of kMlaHeadGroup; n_sel >= 1.
 void mla_decode_attn(const float* q_abs, const uint16_t* cache, const int32_t* ids, int64_t n_sel, float scale,
                      float* scratch, float* o, int heads, void* stream);
+
+/// mla_decode_attn with the count read on the device, step[kStepWidth] (kpool_step's, as qsa_block_topk wrote ids
+/// for): the grid is sized by the capacity `cap`, so a decode step can be captured once and replayed at every
+/// position.  scratch: mla_decode_attn_scratch_floats(heads, cap).
+void mla_decode_attn_step(const float* q_abs, const uint16_t* cache, const int32_t* ids, const int32_t* step,
+                          int64_t cap, float scale, float* scratch, float* o, int heads, void* stream);
+
+/// A prompt: nq queries, each over its own selection - ids[q][0 .. steps[q][kStepWidth]) (qsa_block_topk's rows for
+/// that query; null: rows 0 .. width - 1, a causal prefix).  q_abs and o [nq][heads][L].  A block per (query,
+/// kMlaHeadGroup heads) walks its rows with an online softmax: no scratch, and no split - a prompt has queries
+/// enough to fill the card.  The queries' own latent rows must be in the cache first (mla_kv_store).
+void mla_prompt_attn(const float* q_abs, const uint16_t* cache, const int32_t* ids, const int32_t* steps, int64_t cap,
+                     int64_t nq, float scale, float* o, int heads, void* stream);
 
 }  // namespace strata::kernels
