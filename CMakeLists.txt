@@ -261,6 +261,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
   add_test(NAME gguf_geometry_test COMMAND gguf_geometry_test)
+  # GLM-5.3-Flash's geometry (llama.cpp's glm5-next keys) from its metadata (synthetic; no forward pass yet)
+  add_executable(gguf_geometry_glm5_next_test tests/core/gguf_geometry_glm5_next_test.cpp)
+  target_link_libraries(gguf_geometry_glm5_next_test PRIVATE strata_artifact)
+  add_test(NAME gguf_geometry_glm5_next_test COMMAND gguf_geometry_glm5_next_test)
 
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)

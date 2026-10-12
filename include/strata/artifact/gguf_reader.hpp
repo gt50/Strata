@@ -35,6 +35,7 @@
 
 #include "strata/artifact/gguf_split.hpp"
 #include "strata/core/geometry.hpp"
+#include "strata/core/geometry_glm5_next.hpp"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -749,6 +750,207 @@ inline std::string check_architecture(const GgufFile& f) {
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);
     return err;
+}
+
+// ---- GLM-5.3-Flash (llama.cpp's "glm5-next"): the geometry its file declares, under the key names llama.cpp's
+// converter writes (conversion/glm.py) and its loader reads (src/models/glm5-next.cpp).  The engine has no forward
+// pass for it, so check_architecture above still refuses it; this is what a port reads first.
+
+/// Fills `g` from a glm5-next metadata shard.  Returns "" or the first problem.  The keys llama.cpp's loader requires
+/// are required here; the ones it reads as optional keep their defaults.  Keys that state one thing twice must
+/// agree (key_length = kv_lora_rank + rope.dimension_count, value_length = kv_lora_rank), and the structure has to
+/// add up: a head_count_kv entry per block, an indexer type per main layer, top_k a whole number of k-pools, fewer
+/// dense leading layers than layers.  A per-layer value llama.cpp allows (swiglu clamps, the expert width) must be
+/// the same on every layer that has it: GLM-5.3-Flash writes one value, and a per-layer one is not modelled.
+inline std::string read_geometry(const GgufFile& f, core::Glm5NextGeometry& g) {
+    g = core::Glm5NextGeometry{};
+    const MetaValue* arch = f.get("general.architecture");
+    if (!arch) return "missing general.architecture";
+    if (arch->s != "glm5-next") return "architecture is '" + arch->s + "', not 'glm5-next'";
+    const std::string p = "glm5-next.";
+    std::string err;
+    auto is_int = [](const MetaValue& v) {
+        return v.is_num() && v.type != MetaType::F32 && v.type != MetaType::F64 && v.type != MetaType::BOOL;
+    };
+    // an integer key into `out`: present (or not `required`), an integer, at least `min`
+    auto read_int = [&](const char* key, int64_t& out, bool required, int64_t min = 1) {
+        const MetaValue* v = f.get(p + key);
+        if (!v) {
+            if (required) err = "missing " + p + key;
+            return !required;
+        }
+        if (!is_int(*v)) {
+            err = p + key + " is not an integer";
+            return false;
+        }
+        if ((int64_t) v->u < min) {
+            err = p + key + " = " + std::to_string((int64_t) v->u) + ", it must be at least " + std::to_string(min);
+            return false;
+        }
+        out = (int64_t) v->u;
+        return true;
+    };
+    // a number key (integer or float) into `out`
+    auto read_num = [&](const char* key, double& out, bool required) {
+        const MetaValue* v = f.get(p + key);
+        if (!v) {
+            if (required) err = "missing " + p + key;
+            return !required;
+        }
+        if (!v->is_num() || v->type == MetaType::BOOL) {
+            err = p + key + " is not a number";
+            return false;
+        }
+        out = v->type == MetaType::F32 || v->type == MetaType::F64 ? v->f : (double) (int64_t) v->u;
+        return true;
+    };
+    auto read_bool = [&](const char* key, bool& out) {
+        const MetaValue* v = f.get(p + key);
+        if (!v) return true;
+        if (v->type != MetaType::BOOL && !is_int(*v)) {
+            err = p + key + " is not a boolean";
+            return false;
+        }
+        out = v->u != 0;
+        return true;
+    };
+    // a number given once or per block: an array must hold `n` entries, and the entries other than 0 (a layer
+    // without the thing) must be equal; `out` is that value, or 0 when every entry is 0
+    auto read_uniform = [&](const char* key, double& out, int64_t n, bool required) {
+        const MetaValue* v = f.get(p + key);
+        if (!v || v->type != MetaType::ARRAY) return read_num(key, out, required);
+        if (v->count != (uint64_t) n || v->items.size() != v->count) {
+            err = p + key + " must list one entry for each of the " + std::to_string(n) + " blocks";
+            return false;
+        }
+        out = 0;
+        for (size_t i = 0; i < v->items.size(); ++i) {
+            const MetaValue& e = v->items[i];
+            if (!e.is_num() || e.type == MetaType::BOOL) {
+                err = p + key + "[" + std::to_string(i) + "] is not a number";
+                return false;
+            }
+            const double x = e.type == MetaType::F32 || e.type == MetaType::F64 ? e.f : (double) (int64_t) e.u;
+            if (x == 0) continue;
+            if (out != 0 && x != out) {
+                err = p + key + " differs between layers (" + std::to_string(out) + " and " + std::to_string(x) +
+                      " at " + std::to_string(i) + "): a per-layer value is not modelled";
+                return false;
+            }
+            out = x;
+        }
+        return true;
+    };
+
+    // blocks: the main layers, then the MTP ones
+    int64_t blocks = 0;
+    if (!read_int("block_count", blocks, true) || !read_int("nextn_predict_layers", g.n_nextn, false, 0)) return err;
+    if (blocks > 64)
+        return p + "block_count = " + std::to_string(blocks) + ": the reader keeps per-block arrays of at most 64";
+    if (g.n_nextn >= blocks)
+        return p + "nextn_predict_layers = " + std::to_string(g.n_nextn) + " leaves no main layer of the " +
+               std::to_string(blocks) + " blocks";
+    g.n_layers = blocks - g.n_nextn;
+    if (!read_int("embedding_length", g.n_embd, true) || !read_int("context_length", g.n_ctx_train, false) ||
+        !read_int("attention.head_count", g.n_head, true) || !read_int("vocab_size", g.n_vocab, false) ||
+        !read_num("attention.layer_norm_rms_epsilon", g.rms_eps, true))
+        return err;
+    if (!(g.rms_eps > 0)) return p + "attention.layer_norm_rms_epsilon must be positive";
+    if (g.n_vocab == 0)
+        if (const MetaValue* t = f.get("tokenizer.ggml.tokens"); t && t->type == MetaType::ARRAY) g.n_vocab = (int64_t) t->count;
+
+    // the layer kinds: head_count_kv per block, 0 = KDA linear attention
+    const MetaValue* kv = f.get(p + "attention.head_count_kv");
+    if (!kv) return "missing " + p + "attention.head_count_kv";
+    if (kv->type == MetaType::ARRAY) {
+        if (kv->count != (uint64_t) blocks || kv->items.size() != kv->count)
+            return p + "attention.head_count_kv must list one entry for each of the " + std::to_string(blocks) + " blocks";
+        for (const MetaValue& e : kv->items) {
+            if (!is_int(e)) return p + "attention.head_count_kv holds a value that is not an integer";
+            g.is_mla.push_back(e.u != 0 ? 1 : 0);
+        }
+    } else {
+        if (!is_int(*kv)) return p + "attention.head_count_kv is not an integer";
+        g.is_mla.assign((size_t) blocks, kv->u != 0 ? 1 : 0);
+    }
+
+    // KDA
+    if (!read_int("kda.head_dim", g.kda_head_dim, true) || !read_int("ssm.conv_kernel", g.ssm_d_conv, true)) return err;
+    g.has_kda_gate_lower_bound = f.get(p + "kda.gate_lower_bound") != nullptr;
+    if (!read_num("kda.gate_lower_bound", g.kda_gate_lower_bound, false)) return err;
+
+    // MLA
+    if (!read_int("attention.q_lora_rank", g.q_lora_rank, true) || !read_int("attention.kv_lora_rank", g.kv_lora_rank, true) ||
+        !read_int("rope.dimension_count", g.n_rot, false, 0) || !read_int("attention.key_length_mla", g.head_dim_k, true) ||
+        !read_int("attention.value_length_mla", g.head_dim_v, true))
+        return err;
+    if (g.n_rot > g.head_dim_k)
+        return p + "rope.dimension_count = " + std::to_string(g.n_rot) + " is wider than key_length_mla = " +
+               std::to_string(g.head_dim_k);
+    int64_t key_length = g.kv_lora_rank + g.n_rot, value_length = g.kv_lora_rank;
+    if (!read_int("attention.key_length", key_length, false) || !read_int("attention.value_length", value_length, false))
+        return err;
+    if (key_length != g.kv_lora_rank + g.n_rot)
+        return p + "attention.key_length = " + std::to_string(key_length) + ", but kv_lora_rank + rope.dimension_count = " +
+               std::to_string(g.kv_lora_rank + g.n_rot) + " (the MLA cache row)";
+    if (value_length != g.kv_lora_rank)
+        return p + "attention.value_length = " + std::to_string(value_length) + ", but kv_lora_rank = " +
+               std::to_string(g.kv_lora_rank) + " (the MLA cache holds the latent)";
+
+    // the sparse indexer
+    if (!read_int("attention.indexer.head_count", g.idx_heads, true) ||
+        !read_int("attention.indexer.key_length", g.idx_key_dim, true) ||
+        !read_int("attention.indexer.top_k", g.idx_top_k, true) || !read_int("attention.indexer.kpool", g.idx_kpool, true) ||
+        !read_bool("attention.indexer.kpool_select_tail", g.idx_kpool_select_tail))
+        return err;
+    if (g.idx_kpool < 2 || g.idx_top_k % g.idx_kpool != 0)
+        return p + "attention.indexer.top_k = " + std::to_string(g.idx_top_k) + " and kpool = " +
+               std::to_string(g.idx_kpool) + ": the pool must be at least 2 cells and top_k a whole number of pools";
+    g.idx_full.assign((size_t) g.n_layers, 1);
+    if (const MetaValue* t = f.get(p + "attention.indexer.types")) {
+        if (t->type != MetaType::ARRAY || t->count != (uint64_t) g.n_layers || t->items.size() != t->count)
+            return p + "attention.indexer.types must list one entry for each of the " + std::to_string(g.n_layers) +
+                   " main layers";
+        for (size_t i = 0; i < t->items.size(); ++i) g.idx_full[i] = t->items[i].u != 0 ? 1 : 0;
+    }
+
+    // mHC
+    if (!read_int("hyper_connection.count", g.hc, true) ||
+        !read_int("hyper_connection.sinkhorn_iterations", g.hc_sinkhorn_iters, true) ||
+        !read_num("hyper_connection.epsilon", g.hc_eps, true))
+        return err;
+    if (g.hc < 2) return p + "hyper_connection.count = " + std::to_string(g.hc) + ": one stream has nothing to mix";
+    if (!(g.hc_eps > 0)) return p + "hyper_connection.epsilon must be positive";
+
+    // MoE
+    double ff_exp = 0;
+    if (!read_int("expert_count", g.n_expert, true) || !read_int("expert_used_count", g.n_expert_used, true) ||
+        !read_int("expert_shared_count", g.n_expert_shared, true, 0) ||
+        !read_uniform("expert_feed_forward_length", ff_exp, blocks, true) ||
+        !read_int("leading_dense_block_count", g.n_dense_lead, false, 0) ||
+        !read_num("expert_weights_scale", g.expert_weights_scale, false) ||
+        !read_bool("expert_weights_norm", g.expert_weights_norm) ||
+        !read_int("expert_gating_func", g.expert_gating, false) ||
+        !read_uniform("swiglu_clamp_exp", g.swiglu_clamp_exp, blocks, false))
+        return err;
+    g.swiglu_clamp_shexp = g.swiglu_clamp_exp;   // llama.cpp: the routed experts' clamp unless the key says otherwise
+    if (!read_uniform("swiglu_clamp_shexp", g.swiglu_clamp_shexp, blocks, false)) return err;
+    g.n_ff_exp = (int64_t) ff_exp;
+    if (g.n_ff_exp < 1 || (double) g.n_ff_exp != ff_exp)
+        return p + "expert_feed_forward_length must be a positive whole number";
+    if (g.n_expert_used > g.n_expert)
+        return p + "expert_used_count = " + std::to_string(g.n_expert_used) + " is more than expert_count = " +
+               std::to_string(g.n_expert);
+    if (g.expert_gating != 1 && g.expert_gating != 2 && g.expert_gating != 4)
+        return p + "expert_gating_func = " + std::to_string(g.expert_gating) + ", not 1 (softmax), 2 (sigmoid) or "
+               "4 (sqrtsoftplus)";
+    if (g.n_dense_lead >= g.n_layers)
+        return p + "leading_dense_block_count = " + std::to_string(g.n_dense_lead) + " leaves no MoE layer of the " +
+               std::to_string(g.n_layers);
+    if (g.n_dense_lead > 0 && !read_int("feed_forward_length", g.n_ff_dense, true)) return err;
+    g.n_ff_shexp = g.n_ff_exp * g.n_expert_shared;
+    if (g.n_expert_shared > 0 && !read_int("expert_shared_feed_forward_length", g.n_ff_shexp, false)) return err;
+    return {};
 }
 
 } // namespace strata
