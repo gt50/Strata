@@ -30,6 +30,10 @@
 //     proj; one block per 8 rows) 19-21 us x 64 = 1.3 ms, mhc_finalize 7.8 us x 90 = 0.7 ms, q8_1 quantizations
 //     1.8 us x 440 = 0.8 ms (a KDA layer quantizes the same h six times), ~1.5-2 us for every tiny kernel
 //
+//     then fixed: the attention / FFN norms in mhc_pre's finalize (2.9 ms gone, finalize +0.2), the F32 GEMV a block
+//     a row (0.16 ms), mhc_mix_partial over 6 x the blocks (1.0 ms), each decode input quantized once (192 calls,
+//     0.33 ms), the other GLM norms a block a row (glm_rms_norm) - 1623 kernels, GlmModel::decode 53.0, rebuilt 50.7-51.5
+//
 // On HIP under Windows the events around launches close early (the whole step "at" 692-1182 GB/s, over the memory's
 // 256): the cross-check table prints them beside the host clock.
 #include "glm_ref.hpp"

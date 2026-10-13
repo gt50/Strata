@@ -233,6 +233,24 @@ int main(int argc, char** argv) {
         expect(worst < 1e-4, "comb's rows and columns each sum to 1", buf);
     }
     expect_close("h = sum_i pre_i X[i]", want.h, download(d_h, (size_t) T * D), 1e-6);
+    {   // the sublayer's norm in the same call: h = (h w) / rms(h), and the gating as without it
+        std::vector<float> nw((size_t) D), want_n((size_t) T * D);
+        for (auto& v : nw) v = 1.0f + 0.2f * gauss(rng);
+        for (int t = 0; t < T; ++t) {
+            double ss = 0;
+            for (int d = 0; d < D; ++d) ss += (double) want.h[(size_t) t * D + d] * want.h[(size_t) t * D + d];
+            const double inv = 1.0 / std::sqrt(ss / D + kRmsEps);
+            for (int d = 0; d < D; ++d) want_n[(size_t) t * D + d] = (float) (want.h[(size_t) t * D + d] * nw[d] * inv);
+        }
+        float* d_nw = upload(nw);
+        k::mhc_pre(d_x, d_fn, d_sc, d_base, T, D, kRmsEps, kHcEps, ITERS, d_scr, d_h, d_post, d_comb, nullptr, nullptr,
+                   d_nw, kRmsEps);
+        check(cudaDeviceSynchronize(), "pre + norm");
+        expect_close("with norm_w: h = rms_norm(sum_i pre_i X[i]) * w", want_n, download(d_h, (size_t) T * D), 1e-6);
+        expect(download(d_post, (size_t) T * HC) == got_post && download(d_comb, (size_t) T * 16) == got_comb,
+               "with norm_w: post and comb bitwise as without");
+        cudaFree(d_nw);
+    }
 
     std::printf("\nmhc_post, in place:\n");
     {

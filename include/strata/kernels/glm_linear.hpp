@@ -27,7 +27,18 @@ GlmLinearKind glm_linear_kind(int type, int64_t n_in) noexcept;
 size_t glm_linear_scratch_bytes(int64_t max_n_in, int n_tok);
 
 /// y [n_tok][n_out] = W x [n_tok][n_in].  scratch: glm_linear_scratch_bytes (unused by F32 / BF16).
-void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* scratch, void* stream);
+///
+/// `quantized`: scratch already holds x's q8_1 - the call before quantized the same x, n_in and n_tok on the same path
+/// (glm_linear_quantizes: kLinearNative and kLinearIq lay it out differently), with up to 8 tokens - so this one only
+/// runs the product.  A decode layer's projections of one input (KDA's q, k, v, f_a, beta, g_a) quantize it once.
+void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* scratch, void* stream,
+                bool quantized = false);
+/// Whether glm_linear quantizes its input on this path (kLinearNative, kLinearIq).
+inline bool glm_linear_quantizes(GlmLinearKind k) noexcept { return k == kLinearNative || k == kLinearIq; }
+
+/// x [rows][cols] = (x w) / rms(x) in place (w null: no weight), what rms_norm_weighted computes - a block of 256 a
+/// row, for GLM's few wide rows (rms_norm_weighted's single warp a row took 12-30 us on a 1536- or 4096-wide one).
+void glm_rms_norm(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream);
 
 /// The grouped-expert call for one token's k chosen experts (distinct, as a top-k is): group i is expert ids[i], its
 /// blob at expert_ptrs[ids[i]], with the one entry i (token 0, output row i).  Read on the device, so a decode step can

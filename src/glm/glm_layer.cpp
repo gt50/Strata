@@ -39,6 +39,33 @@ bool full_indexer(const core::Glm5NextGeometry& g, int64_t il) {
     return il >= g.n_layers || g.idx_full.empty() || g.idx_full[(size_t) il] != 0;
 }
 
+/// A sublayer's projections: one token through glm_linear, each input quantized once (a projection of the same input,
+/// on the same path, as the quantizing call before it reuses that call's q8_1), more through ctx.linear (the prompt
+/// products).  So an input must not change between two calls that read it: the sublayers write each buffer before
+/// they project it, never after.
+struct Linear {
+    GlmContext& ctx;
+    int n;
+    void* stream;
+    const float* last = nullptr;
+    k::GlmLinearKind kind = k::kLinearNone;
+    int64_t n_in = 0;
+    void operator()(const GlmLinear& m, const float* in, float* out) {
+        if (n != 1) {
+            ctx.linear(m, in, out, n, stream);
+            return;
+        }
+        const k::GlmLinearKind kd = k::glm_linear_kind(m.type, m.n_in);
+        const bool q = k::glm_linear_quantizes(kd);
+        k::glm_linear(m, in, out, 1, ctx.q8, stream, q && in == last && kd == kind && m.n_in == n_in);
+        if (q) {
+            last = in;
+            kind = kd;
+            n_in = m.n_in;
+        }
+    }
+};
+
 }  // namespace
 
 GlmContext::~GlmContext() {
@@ -207,11 +234,7 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
     const int di = H * (int) g.kda_head_dim;
     const int n = (int) ctx.n_;
     const float rms_eps = (float) g.rms_eps;
-    void* q8 = ctx.q8;
-    auto lin = [&](const GlmLinear& m, const float* in, float* out) {
-        if (n == 1) k::glm_linear(m, in, out, 1, q8, stream);
-        else ctx.gemm_->linear(m, in, out, n, q8, stream);
-    };
+    Linear lin{ctx, n, stream};
     if (!g.is_mla[(size_t) il]) {
         if (n == 1) {
             lin(w.wq, ctx.h, ctx.qkv);
@@ -244,16 +267,18 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
         lin(w.wo, ctx.y, ctx.f);
         return true;
     }
+    const bool full = full_indexer(g, il);
+    // h's projections, then qr's: at decode each input is quantized once
     lin(w.wq_a, ctx.h, ctx.qr);
-    k::rms_norm_weighted(ctx.qr, w.q_a_norm, n, g.q_lora_rank, rms_eps, stream);
-    lin(w.wq_b, ctx.qr, ctx.q);
     lin(w.wkv_a, ctx.h, ctx.kv);
+    if (full) lin(w.idx_k, ctx.h, ctx.ik);
+    k::glm_rms_norm(ctx.qr, w.q_a_norm, n, g.q_lora_rank, rms_eps, stream);
+    lin(w.wq_b, ctx.qr, ctx.q);
+    if (full) lin(w.idx_q_b, ctx.qr, ctx.iq);
     // one token: the row from the device step (a captured decode step writes the right one at every replay)
     k::mla_kv_store(ctx.kv, w.kv_a_norm, rms_eps, st.latent, ctx.pos_, n, stream, n == 1 ? ctx.step : nullptr);
     k::mla_head_gemv(ctx.q, w.k_b, ctx.q_abs, H, DK, L, n, stream);
-    if (full_indexer(g, il)) {
-        lin(w.idx_q_b, ctx.qr, ctx.iq);
-        lin(w.idx_k, ctx.h, ctx.ik);
+    if (full) {
         lin(w.idx_gate, ctx.h, ctx.ig);
         if (n == 1) {   // the decode step's row and pool from the device step (capturable)
             k::kpool_key_store(ctx.ik, ctx.ig, w.idx_k_norm, w.idx_k_norm_b, (float) g.norm_eps, st.idx_cache, 0, 1,
@@ -413,11 +438,7 @@ bool GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLay
                        void* stream, std::string& err) {
     const int D = (int) g.n_embd;
     const int n = (int) ctx.n_;
-    void* q8 = ctx.q8;
-    auto lin = [&](const GlmLinear& m, const float* in, float* out) {
-        if (n == 1) k::glm_linear(m, in, out, 1, q8, stream);
-        else ctx.gemm_->linear(m, in, out, n, q8, stream);
-    };
+    Linear lin{ctx, n, stream};
     if (il < g.n_dense_lead) {
         lin(w.ffn_gate, ctx.h, ctx.fg);
         lin(w.ffn_up, ctx.h, ctx.fu);
@@ -556,14 +577,12 @@ bool glm_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const GlmLaye
     const int iters = (int) g.hc_sinkhorn_iters;
 
     k::mhc_pre(x, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, n, D, rms_eps, hc_eps, iters, ctx.mhc_scr, ctx.h,
-               ctx.post, ctx.comb, nullptr, stream);
-    k::rms_norm_weighted(ctx.h, w.attn_norm, n, D, rms_eps, stream);
+               ctx.post, ctx.comb, nullptr, stream, w.attn_norm, rms_eps);   // and the attention's norm
     if (!GlmLayerImpl::attention(g, il, w, st, ctx, stream, err)) return false;
     k::mhc_post(ctx.f, ctx.post, ctx.comb, x, n, D, stream);
 
     k::mhc_pre(x, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, n, D, rms_eps, hc_eps, iters, ctx.mhc_scr, ctx.h,
-               ctx.post, ctx.comb, nullptr, stream);
-    k::rms_norm_weighted(ctx.h, w.ffn_norm, n, D, rms_eps, stream);
+               ctx.post, ctx.comb, nullptr, stream, w.ffn_norm, rms_eps);   // and the FFN's norm
     if (!GlmLayerImpl::ffn(g, il, w, ctx, stream, err)) return false;
     k::mhc_post(ctx.f, ctx.post, ctx.comb, x, n, D, stream);
     return launched("glm_layer_decode", err);
@@ -580,11 +599,11 @@ bool glm_mtp_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const Glm
     const float rms_eps = (float) g.rms_eps;
     const cudaStream_t s = (cudaStream_t) stream;
     cudaMemcpyAsync(ctx.h, x, (size_t) n * D * sizeof(float), cudaMemcpyDeviceToDevice, s);
-    k::rms_norm_weighted(ctx.h, w.attn_norm, n, D, rms_eps, stream);
+    k::glm_rms_norm(ctx.h, w.attn_norm, n, D, rms_eps, stream);
     if (!GlmLayerImpl::attention(g, il, w, st, ctx, stream, err)) return false;
     k::add_inplace(x, ctx.f, (int64_t) n * D, stream);
     cudaMemcpyAsync(ctx.h, x, (size_t) n * D * sizeof(float), cudaMemcpyDeviceToDevice, s);
-    k::rms_norm_weighted(ctx.h, w.ffn_norm, n, D, rms_eps, stream);
+    k::glm_rms_norm(ctx.h, w.ffn_norm, n, D, rms_eps, stream);
     if (!GlmLayerImpl::ffn(g, il, w, ctx, stream, err)) return false;
     k::add_inplace(x, ctx.f, (int64_t) n * D, stream);
     return launched("glm_mtp_layer_decode", err);

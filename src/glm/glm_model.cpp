@@ -268,7 +268,7 @@ bool GlmModel::decode_body(void* stream, std::string& err) {
 void GlmModel::head(int64_t row, void* stream) {
     const int D = (int) g_.n_embd;
     k::mhc_mean(x_ + (size_t) row * 4 * D, h_, 1, D, stream);
-    k::rms_norm_weighted(h_, w_.output_norm, 1, D, (float) g_.rms_eps, stream);
+    k::glm_rms_norm(h_, w_.output_norm, 1, D, (float) g_.rms_eps, stream);
     k::glm_linear(w_.output, h_, logits_, 1, ctx_.q8, stream);
 }
 
@@ -319,7 +319,7 @@ bool GlmModel::prompt(const int32_t* tokens, int64_t n, int64_t pos0, void* stre
                 if (first) cudaMemcpyAsync(hall_, h_pending_, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
                 if (m > 0) {   // h_nextn of the chunk's tokens: as head() computes it, a row each
                     k::mhc_mean(x_, hall_ + first * D, (int) m, D, stream);
-                    k::rms_norm_weighted(hall_ + first * D, w_.output_norm, m, D, (float) g_.rms_eps, stream);
+                    k::glm_rms_norm(hall_ + first * D, w_.output_norm, m, D, (float) g_.rms_eps, stream);
                 }
                 if (!mtp_pass(pos0 + c0 - first, first + m, hall_, stream, err)) return false;
             }
@@ -344,8 +344,8 @@ bool GlmModel::mtp_pass(int64_t pos0, int64_t rows, const float* h_rows, void* s
     if (h_rows != hall_) cudaMemcpyAsync(hall_, h_rows, rb, cudaMemcpyDeviceToDevice, s);
     if (tm) cudaMemcpyAsync(tm, hall_, rb, cudaMemcpyDeviceToDevice, s);
     k::iq_embed_rows(emb.type, emb.data, emb.row_bytes, mtp_tok_, R, D, eb_, stream);
-    k::rms_norm_weighted(eb_, w_.enorm, R, D, eps, stream);
-    k::rms_norm_weighted(hall_, w_.hnorm, R, D, eps, stream);
+    k::glm_rms_norm(eb_, w_.enorm, R, D, eps, stream);
+    k::glm_rms_norm(hall_, w_.hnorm, R, D, eps, stream);
     const size_t row = (size_t) D * sizeof(float);
     cudaMemcpy2DAsync(e_, 2 * row, eb_, row, row, (size_t) R, cudaMemcpyDeviceToDevice, s);
     cudaMemcpy2DAsync(e_ + D, 2 * row, hall_, row, row, (size_t) R, cudaMemcpyDeviceToDevice, s);
@@ -380,7 +380,7 @@ bool GlmModel::mtp_decode(int32_t token, int64_t pos, const float* h, void* stre
     cudaMemcpyAsync(mtp_tok_, &token, sizeof token, cudaMemcpyHostToDevice, s);   // staged before it returns
     if (!mtp_pass(pos, 1, h, stream, err)) return false;
     cudaMemcpyAsync(mtp_h_, xm_, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
-    k::rms_norm_weighted(mtp_h_, w_.mtp_head_norm ? w_.mtp_head_norm : w_.output_norm, 1, D, (float) g_.rms_eps,
+    k::glm_rms_norm(mtp_h_, w_.mtp_head_norm ? w_.mtp_head_norm : w_.output_norm, 1, D, (float) g_.rms_eps,
                          stream);
     k::glm_linear(w_.mtp_head.data ? w_.mtp_head : w_.output, mtp_h_, mtp_logits_, 1, ctx_.q8, stream);
     return launched("GlmModel::mtp_decode", err);

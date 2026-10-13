@@ -15,21 +15,55 @@ namespace {
 
 constexpr int kNativeCols = 8;   // native_mmvq's columns a call
 
-/// A warp per output row, its lanes striding the row; the row's sums for every token, the row read once per token
-/// from cache.
+/// The sum of v over a block of 256, every thread getting it (red: 8 floats of shared memory, free again after).
+__device__ __forceinline__ float block_sum_256(float v, float* red) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+    __syncthreads();
+    float s = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) s += red[w];
+    __syncthreads();
+    return s;
+}
+
+/// A block of 256 per output row, 4 values a thread a step (float4 when the row allows: n_in % 4 == 0, which a GGUF
+/// F32 row of a multiple-of-32 width is); the row's sums for every token, the row read once per token from cache.  A
+/// warp a row left the router's and the indexer's few rows at 20 us a call.
 __global__ void __launch_bounds__(256) f32_gemv_kernel(const float* __restrict__ w, const float* __restrict__ x,
                                                        float* __restrict__ y, int64_t n_in, int64_t n_out, int n_tok) {
-    const int64_t row = (int64_t) blockIdx.x * 8 + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    if (row >= n_out) return;
+    __shared__ float red[8];
+    const int64_t row = blockIdx.x;
     const float* wr = w + row * n_in;
+    const bool vec = (n_in & 3) == 0;
     for (int t = 0; t < n_tok; ++t) {
         const float* xt = x + (int64_t) t * n_in;
         float acc = 0.0f;
-        for (int64_t i = lane; i < n_in; i += 32) acc = fmaf(wr[i], xt[i], acc);
-        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, off);
-        if (lane == 0) y[(int64_t) t * n_out + row] = acc;
+        if (vec) {
+            for (int64_t i = 4 * (int64_t) threadIdx.x; i < n_in; i += 4 * 256) {
+                const float4 a = *reinterpret_cast<const float4*>(wr + i), b = *reinterpret_cast<const float4*>(xt + i);
+                acc = fmaf(a.x, b.x, acc);
+                acc = fmaf(a.y, b.y, acc);
+                acc = fmaf(a.z, b.z, acc);
+                acc = fmaf(a.w, b.w, acc);
+            }
+        } else {
+            for (int64_t i = threadIdx.x; i < n_in; i += 256) acc = fmaf(wr[i], xt[i], acc);
+        }
+        acc = block_sum_256(acc, red);
+        if (threadIdx.x == 0) y[(int64_t) t * n_out + row] = acc;
     }
+}
+
+/// A block of 256 per row: the squares summed, then x = x w / rms in place (each thread its own values).
+__global__ void __launch_bounds__(256) glm_rms_norm_kernel(float* __restrict__ x, const float* __restrict__ w,
+                                                           int64_t cols, float eps) {
+    __shared__ float red[8];
+    float* r = x + (int64_t) blockIdx.x * cols;
+    float ss = 0.0f;
+    for (int64_t c = threadIdx.x; c < cols; c += 256) ss = fmaf(r[c], r[c], ss);
+    const float inv = rsqrtf(block_sum_256(ss, red) / (float) cols + eps);
+    for (int64_t c = threadIdx.x; c < cols; c += 256) r[c] = (w ? r[c] * w[c] : r[c]) * inv;
 }
 
 __global__ void expert_groups_decode_kernel(const int32_t* __restrict__ ids,
@@ -86,7 +120,7 @@ size_t glm_linear_scratch_bytes(int64_t max_n_in, int n_tok) {
     return (size_t) n_tok * (size_t) (max_n_in / 32) * 36 + 256;   // block_q8_1: fp16 scale and sum, 32 int8
 }
 
-void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* scratch, void* stream) {
+void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* scratch, void* stream, bool quantized) {
     const GlmLinearKind kind = glm_linear_kind(w.type, w.n_in);
     if (!w.data || !x || !y || n_tok <= 0 || w.n_out <= 0 || kind == kLinearNone ||
         ((kind == kLinearNative || kind == kLinearIq) && !scratch)) {
@@ -97,8 +131,7 @@ void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* s
     const cudaStream_t s = (cudaStream_t) stream;
     switch (kind) {
         case kLinearF32:
-            f32_gemv_kernel<<<(unsigned) ((w.n_out + 7) / 8), 256, 0, s>>>((const float*) w.data, x, y, w.n_in, w.n_out,
-                                                                          n_tok);
+            f32_gemv_kernel<<<(unsigned) w.n_out, 256, 0, s>>>((const float*) w.data, x, y, w.n_in, w.n_out, n_tok);
             check_launch("glm_linear (F32)");
             break;
         case kLinearBf16:
@@ -111,17 +144,27 @@ void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* s
         case kLinearNative:
             for (int t0 = 0; t0 < n_tok; t0 += kNativeCols) {
                 const int nc = std::min(kNativeCols, n_tok - t0);
-                native_quantize_q8_1(x + (int64_t) t0 * w.n_in, scratch, (int) w.n_in, nc, stream);
+                if (!quantized || n_tok > kNativeCols)
+                    native_quantize_q8_1(x + (int64_t) t0 * w.n_in, scratch, (int) w.n_in, nc, stream);
                 native_mmvq(w.type, w.data, scratch, y + (int64_t) t0 * w.n_out, (int) w.n_in, (int) w.n_out, nc, stream);
             }
             break;
         case kLinearIq:
-            quantize_q8_1_rows(x, n_tok, w.n_in, scratch, stream);
+            if (!quantized) quantize_q8_1_rows(x, n_tok, w.n_in, scratch, stream);
             iq_mmvq(w.type, w.data, scratch, y, (int) w.n_in, (int) w.n_out, n_tok, stream);
             break;
         default:
             break;
     }
+}
+
+void glm_rms_norm(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream) {
+    if (!x || rows <= 0 || cols <= 0 || rows > 0x7fffffff) {
+        std::fprintf(stderr, "glm_rms_norm: invalid arguments\n");
+        std::exit(1);
+    }
+    glm_rms_norm_kernel<<<(unsigned) rows, 256, 0, (cudaStream_t) stream>>>(x, w, cols, eps);
+    check_launch("glm_rms_norm");
 }
 
 void glm_expert_groups_decode(const int32_t* ids, const unsigned long long* expert_ptrs, int k,

@@ -31,9 +31,13 @@ uint64_t mhc_pre_scratch_floats(int n_tok, int n_embd);
 /// The pre half for n_tok tokens: h [n_tok][n_embd] = sum_i pre_i X[i], and the post weights [n_tok][4] and comb
 /// [n_tok][16] (comb[src * 4 + dst]) that mhc_post needs; pre [n_tok][4] too when non-null.  hc_scale (3,),
 /// hc_base (24,).  n_embd a multiple of 32.
+///
+/// norm_w (n_embd,), when set: the sublayer's own norm too, h = rms_norm(h) * norm_w with norm_eps - what
+/// rms_norm_weighted would do after it, (h w) / rms(h), in the same kernel (a GLM layer's attn_norm / ffn_norm; one
+/// block-wide reduction instead of a launch whose single warp walked the row: 28-30 us a call on the 8060S).
 void mhc_pre(const float* x, const float* hc_fn, const float* hc_scale, const float* hc_base, int n_tok, int n_embd,
              float rms_eps, float hc_eps, int sinkhorn_iters, float* scratch, float* h, float* post, float* comb,
-             float* pre, void* stream);
+             float* pre, void* stream, const float* norm_w = nullptr, float norm_eps = 0.0f);
 
 /// The post half, in place: X[t][dst] = post[t][dst] f[t] + sum_src comb[t][src][dst] X[t][src], f [n_tok][n_embd].
 void mhc_post(const float* f, const float* post, const float* comb, float* x, int n_tok, int n_embd, void* stream);

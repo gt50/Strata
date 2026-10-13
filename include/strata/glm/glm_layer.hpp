@@ -1,7 +1,7 @@
 // include/strata/glm/glm_layer.hpp - one GLM-5.3-Flash layer at decode: the kernels of kda.hpp, mla.hpp, kpool.hpp,
 // glm_moe.hpp and mhc.hpp in the order llama.cpp's glm5-next graph runs them (upstream src/models/glm5-next.cpp):
 //
-//     h = mhc_pre(X, hc_attn);  h = rms_norm(h) * attn_norm
+//     h = mhc_pre(X, hc_attn);  h = rms_norm(h) * attn_norm           (one call: mhc_pre takes the norm)
 //     f = KDA(h)   or   MLA(h) over the k-pool indexer's selection
 //     X = mhc_post(f, X)
 //     h = mhc_pre(X, hc_ffn);   h = rms_norm(h) * ffn_norm
