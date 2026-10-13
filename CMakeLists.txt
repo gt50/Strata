@@ -386,6 +386,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/mla.cu
                           src/kernels/cuda/kpool.cu
                           src/kernels/cuda/glm_moe.cu
+                          src/kernels/cuda/mhc.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
@@ -891,6 +892,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(glm_moe_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_moe_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME glm_moe_parity COMMAND glm_moe_parity --selftest)
+
+  # GLM-5.3-Flash's mHC: the four residual streams' pre (mixes, Sinkhorn, h), post, init and mean
+  add_executable(mhc_parity src/kernels/mhc_parity.cpp)
+  target_include_directories(mhc_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(mhc_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME mhc_parity COMMAND mhc_parity --selftest)
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${_strata_gpu_include_directories})
