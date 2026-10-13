@@ -153,6 +153,51 @@ __global__ void __launch_bounds__(1024) glm_argmax_kernel(const float* __restric
     }
 }
 
+/// One block of E threads: each entry's expert's first entry (shared), then its group, its slot (the entries of the
+/// groups before, and of its own before it) - every count O(E), E <= 1024.
+__global__ void __launch_bounds__(1024) expert_groups_window_kernel(const int32_t* __restrict__ ids,
+                                                                    const unsigned long long* __restrict__ expert_ptrs,
+                                                                    int k, int E, unsigned long long* __restrict__ grp_ptr,
+                                                                    int32_t* __restrict__ grp_start,
+                                                                    int32_t* __restrict__ n_groups,
+                                                                    int32_t* __restrict__ ent_dst,
+                                                                    int32_t* __restrict__ ent_tok) {
+    __shared__ int first[1024];
+    const int i = threadIdx.x;
+    int e = -1, f = i;
+    if (i < E) {
+        e = ids[i];
+        for (int j = 0; j < i; ++j)
+            if (ids[j] == e) {
+                f = j;
+                break;
+            }
+        first[i] = f;
+    }
+    __syncthreads();
+    if (i < E) {
+        int g = 0, start = 0, p = 0;
+        for (int j = 0; j < E; ++j) {
+            const int fj = first[j];
+            if (fj == j && j < f) ++g;      // a group before this one
+            if (fj < f) ++start;            // an entry of a group before this one
+            if (fj == f && j < i) ++p;      // an entry of this group before this one
+        }
+        ent_tok[start + p] = i / k;
+        ent_dst[start + p] = i;
+        if (f == i) {
+            grp_ptr[g] = expert_ptrs[e];
+            grp_start[g] = start;
+        }
+    }
+    if (i == 0) {
+        int ng = 0;
+        for (int j = 0; j < E; ++j) ng += first[j] == j ? 1 : 0;
+        grp_start[ng] = E;
+        *n_groups = ng;
+    }
+}
+
 __global__ void expert_groups_decode_kernel(const int32_t* __restrict__ ids,
                                             const unsigned long long* __restrict__ expert_ptrs, int k,
                                             unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
@@ -274,6 +319,20 @@ void glm_expert_groups_decode(const int32_t* ids, const unsigned long long* expe
                                                                                  grp_start, n_groups, ent_dst,
                                                                                  ent_tok, n_tok);
     check_launch("glm_expert_groups_decode");
+}
+
+void glm_expert_groups_window(const int32_t* ids, const unsigned long long* expert_ptrs, int k, int n_tok,
+                              unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
+                              int32_t* ent_tok, void* stream) {
+    const int e = n_tok * k;
+    if (!ids || !expert_ptrs || !grp_ptr || !grp_start || !n_groups || !ent_dst || !ent_tok || k <= 0 || n_tok <= 0 ||
+        e > 1024) {
+        std::fprintf(stderr, "glm_expert_groups_window: invalid arguments\n");
+        std::exit(1);
+    }
+    expert_groups_window_kernel<<<1, e < 32 ? 32 : (e + 31) / 32 * 32, 0, (cudaStream_t) stream>>>(
+        ids, expert_ptrs, k, e, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+    check_launch("glm_expert_groups_window");
 }
 
 void glm_argmax_rows(const float* logits, int rows, int n, int32_t* out, void* stream) {

@@ -12,10 +12,12 @@
 // spent on it.
 //
 // Measured on the Radeon 8060S (glm_graph_parity --spec 45: GLM-5.3-Flash's shapes, 8 resident IQ4_XS experts a
-// layer), a decode token 50.7 ms: a window of 2 tokens 71.2 ms, 4 114.8, 8 199.6 (21 ms a token more: each token's
-// experts are read for it alone - a group an entry, as decode groups them); commit 2.1-3.1 ms.  Not yet captured as a
-// graph, not with an expert provider's cache past what it holds at once, and the MTP block's acceptance on the real
-// weights not yet measured (the synthetic model's random MTP block drafts nothing that holds).
+// layer), a decode token 50.7 ms: a window of 2 tokens 55.4 ms, 4 67.5, 8 100.7; commit 1.9-4.0 ms.  The window's
+// experts are grouped by expert, each read once for its tokens (glm_expert_groups_window) - with a group an entry it
+// was 71.2 / 114.8 / 199.6.  That model's tokens all choose the same 8 experts, so this is the most the grouping can
+// save: GLM-5.3-Flash's tokens choose 8 of 288, and share fewer.  Not yet captured as a graph, not with an expert
+// provider's cache past what it holds at once, and the MTP block's acceptance on the real weights not yet measured
+// (the synthetic model's random MTP block drafts nothing that holds).
 #pragma once
 
 #include "strata/glm/glm_model.hpp"

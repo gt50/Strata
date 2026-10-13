@@ -49,6 +49,16 @@ void glm_expert_groups_decode(const int32_t* ids, const unsigned long long* expe
                               unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
                               int32_t* ent_tok, void* stream, int n_tok = 1);
 
+/// The grouped-expert call for a verify window: n_tok tokens' k choices each (ids [n_tok][k], an expert at most once a
+/// token), grouped by expert so each one's weights are read once for every token that chose it - groups in the order
+/// of their expert's first entry, a group's entries in token order; entry i (token i / k) still writes output row i.
+/// Each entry's sums are bitwise a one-entry group's (native_expert_grouped's row_dot_multi adds every entry in the
+/// same order however many share a pass).  Read on the device.  E = n_tok k <= 1024: grp_ptr [E], grp_start [E + 1],
+/// n_groups [1], ent_dst / ent_tok [E].
+void glm_expert_groups_window(const int32_t* ids, const unsigned long long* expert_ptrs, int k, int n_tok,
+                              unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
+                              int32_t* ent_tok, void* stream);
+
 /// out[r] = the argmax of row r of `logits` (rows of n): the first index of the largest value, NaN never picked, 0
 /// when nothing is above -inf.  A block of 1024 a row; graph-capturable.
 void glm_argmax_rows(const float* logits, int rows, int n, int32_t* out, void* stream);

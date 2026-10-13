@@ -488,14 +488,19 @@ bool GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLay
         return false;
     }
     k::quantize_q8_1_rows(ctx.h, n, D, ctx.xq, stream);
-    if (n == 1 || ctx.exact) {   // grouped on the device, a group an entry (a verify window's too: each a decode step's)
+    if (n == 1 || ctx.exact) {   // grouped on the device: a decode step's a group an expert; a verify window's by
+                                 // expert, each read once for its tokens (each entry's sums still a decode step's)
         const unsigned long long* ptrs = w.expert_ptrs;
         if (!ptrs) {
             ptrs = ctx.expert_provider->experts(il, ctx.eids, n * kU, stream, err);
             if (!ptrs) return false;
         }
-        k::glm_expert_groups_decode(ctx.eids, ptrs, kU, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
-                                    ctx.ent_tok, stream, n);
+        if (n == 1)
+            k::glm_expert_groups_decode(ctx.eids, ptrs, kU, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
+                                        ctx.ent_tok, stream);
+        else
+            k::glm_expert_groups_window(ctx.eids, ptrs, kU, n, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
+                                        ctx.ent_tok, stream);
         k::native_expert_grouped_clamped(w.expert_layout, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
                                          ctx.ent_tok, n * kU, n * kU, ctx.xq, ctx.exp_scr, ctx.parts,
                                          (float) g.swiglu_clamp_exp, stream);

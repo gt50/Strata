@@ -61,6 +61,40 @@ int main(int argc, char** argv) {
     for (auto& t : w) t = rnd();
     std::printf("glm_spec: verify windows and commit against decode (5 layers + MTP, n_embd 1024)\n");
 
+    // 0. a window's experts grouped by expert: 3 tokens of 2 choices, experts 5 and 2, 2 and 7, 5 and 2
+    {
+        const vector<int32_t> ids = {5, 2, 2, 7, 5, 2};
+        vector<unsigned long long> table(8);
+        for (int e = 0; e < 8; ++e) table[(size_t) e] = 1000 + (unsigned long long) e;
+        int32_t* d_ids = upload(ids);
+        unsigned long long* d_table = upload(table);
+        unsigned long long* d_ptr = nullptr;
+        int32_t *d_start = nullptr, *d_ng = nullptr, *d_dst = nullptr, *d_tok = nullptr;
+        check(cudaMalloc(&d_ptr, 6 * 8), "ptr");
+        check(cudaMalloc(&d_start, 7 * 4), "start");
+        check(cudaMalloc(&d_ng, 4), "ng");
+        check(cudaMalloc(&d_dst, 6 * 4), "dst");
+        check(cudaMalloc(&d_tok, 6 * 4), "tok");
+        k::glm_expert_groups_window(d_ids, d_table, 2, 3, d_ptr, d_start, d_ng, d_dst, d_tok, s);
+        check(cudaStreamSynchronize(s), "groups");
+        int32_t ng = 0;
+        check(cudaMemcpy(&ng, d_ng, 4, cudaMemcpyDeviceToHost), "ng");
+        vector<unsigned long long> ptr(3);
+        vector<int32_t> start(4), dst(6), tok(6);
+        check(cudaMemcpy(ptr.data(), d_ptr, 3 * 8, cudaMemcpyDeviceToHost), "ptr");
+        check(cudaMemcpy(start.data(), d_start, 4 * 4, cudaMemcpyDeviceToHost), "start");
+        check(cudaMemcpy(dst.data(), d_dst, 6 * 4, cudaMemcpyDeviceToHost), "dst");
+        check(cudaMemcpy(tok.data(), d_tok, 6 * 4, cudaMemcpyDeviceToHost), "tok");
+        // groups 5 {entries 0, 4}, 2 {1, 2, 5}, 7 {3}
+        const bool ok = ng == 3 && ptr == vector<unsigned long long>{1005, 1002, 1007} &&
+                        start == vector<int32_t>{0, 2, 5, 6} && dst == vector<int32_t>{0, 4, 1, 2, 5, 3} &&
+                        tok == vector<int32_t>{0, 2, 0, 1, 2, 1};
+        expect(ok, "0. a window's 6 expert choices grouped by expert: 3 groups, entries in token order");
+        for (void* p : {(void*) d_ids, (void*) d_table, (void*) d_ptr, (void*) d_start, (void*) d_ng, (void*) d_dst,
+                        (void*) d_tok})
+            cudaFree(p);
+    }
+
     // the plain run: the prompt, then w[0..12) decoded at 12 .. 23, every token's logits kept
     a.reset(s);
     if (!a.prompt(prompt.data(), 12, 0, s, err)) die(err);
