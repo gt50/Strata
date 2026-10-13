@@ -107,10 +107,19 @@ int bench() {
     int32_t* d_ids = nullptr;
     check(cudaMalloc(&d_ids, 64), "ids");
     std::string err;
+    glm::GlmExpertSource dsrc = src;   // the same experts, read unbuffered from the file
+    dsrc.gate_file = dsrc.up_file = dsrc.down_file = 0;
+    dsrc.gate_off = m.shard(0).data_start() + m.find("blk.0.ffn_gate_exps.weight")->offset;
+    dsrc.up_off = m.shard(0).data_start() + m.find("blk.0.ffn_up_exps.weight")->offset;
+    dsrc.down_off = m.shard(0).data_start() + m.find("blk.0.ffn_down_exps.weight")->offset;
     for (bool mapped : {false, true})
-        for (int threads : {1, 4, 8}) {
+        for (int threads : {0, 1, 4, 8}) {   // 0: unbuffered reads (the default when the cache has the files)
             glm::GlmExpertCache c;
-            if (!c.init({src}, (int64_t) NE, 8, mapped, threads, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            if (!(threads ? c.init({src}, (int64_t) NE, 8, mapped, threads, err)
+                          : c.init({dsrc}, (int64_t) NE, 8, mapped, 1, err, {path.string()}))) {
+                std::fprintf(stderr, "%s\n", err.c_str());
+                return 1;
+            }
             // 4 calls of 8 misses each (8 slots: every call evicts the last), the first one not timed
             double ms = 0;
             for (int call = 0; call < 5; ++call) {
@@ -123,8 +132,12 @@ int bench() {
                 if (call) ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             }
             const double mb = 4 * 8 * (double) src.layout.bytes / 1e6;
-            std::printf("  8 misses into %-11s slots, %d thread%s: %6.2f ms a call, %5.2f GB/s\n",
-                        mapped ? "mapped host" : "device", threads, threads > 1 ? "s" : " ", ms / 4, mb / ms);
+            if (threads)
+                std::printf("  8 misses into %-11s slots, mapped file, %d thread%s: %6.2f ms a call, %5.2f GB/s\n",
+                            mapped ? "mapped host" : "device", threads, threads > 1 ? "s" : " ", ms / 4, mb / ms);
+            else
+                std::printf("  8 misses into %-11s slots, unbuffered reads:      %6.2f ms a call, %5.2f GB/s\n",
+                            mapped ? "mapped host" : "device", ms / 4, mb / ms);
         }
     {
         glm::GlmExpertCache c;
@@ -268,16 +281,21 @@ int main(int argc, char** argv) {
         bool fill, mapped;
         const char* what;
     };
-    for (const CacheCase& c : {CacheCase{24, false, false, "a cache of 24 slots in device memory, empty at start"},
-                               CacheCase{4, false, true, "a cache of 4 slots (one layer's k) in mapped host memory"},
-                               CacheCase{40, true, false, "a cache of 40 slots filled before the first token"}}) {
+    for (const CacheCase& c0 : {CacheCase{24, false, false, "a cache of 24 slots in device memory, empty at start"},
+                                CacheCase{4, false, true, "a cache of 4 slots (one layer's k) in mapped host memory"},
+                                CacheCase{40, true, false, "a cache of 40 slots filled before the first token"}})
+    for (const bool direct_reads : {true, false}) {
+        const std::string label = std::string(c0.what) + (direct_reads ? ", unbuffered reads" : ", through the mapping");
+        const CacheCase c{c0.slots, c0.fill, c0.mapped, label.c_str()};
         const strata::GgufModel m({path.string()});
         glm::GlmLoadedWeights lw;
         glm::GlmLoadOptions opt;
         opt.experts = c.mapped ? glm::GlmExpertHome::MappedHost : glm::GlmExpertHome::Device;
         opt.expert_cache_slots = c.slots;
         opt.cache_fill = c.fill;
+        opt.direct_reads = direct_reads;
         if (!lw.load(m, g, opt, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        expect(lw.expert_cache()->direct() == direct_reads, label + ": the read path asked for");
         glm::GlmModel loaded;
         if (!loaded.init(g, lw.weights(), MAX_CTX, err, lw.expert_cache())) {
             std::fprintf(stderr, "%s\n", err.c_str());

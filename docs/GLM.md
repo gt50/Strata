@@ -1,7 +1,7 @@
 # GLM-5.3-Flash (experimental)
 
-**Experimental: the real model runs and answers correctly on one PC, but very slowly (under 1 token per second) while
-most of its experts come from the SSD.** Strata's GLM-5.3-Flash support runs [Z.ai's GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
+**Experimental: the real model runs and answers correctly on one PC, but slowly (about 2 tokens per second, 14-17 s
+before a short prompt's first token) while most of its experts come from the SSD.** Strata's GLM-5.3-Flash support runs [Z.ai's GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 from [Unsloth's UD-IQ4_XS GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) on its own engine path (`src/glm`):
 another architecture than Qwen3.8-Flash-Next, with none of the Qwen engine's packs, memory modes or draft layer. Every
 piece below was checked against a double-precision transcription of llama.cpp's `glm5-next` graph on small synthetic
@@ -16,7 +16,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 
 | | |
 | --- | --- |
-| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 0.4-0.8 tokens/s and 25-80 s for a 20-token prompt, bound by copying experts from the file |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 1.7-1.9 tokens/s and 13-17 s for a 20-token prompt, bound by reading experts from the SSD |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
@@ -158,7 +158,8 @@ other weights, inside the carve-out), greedy, through `serve/server.py`:
   down. Loaded in 45.7 s.
 - **Answers:** "What is the capital of France?" (effort low): "The capital of France is Paris."; a haiku with
   thinking off; a tool call streamed as `get_weather` with `{"city": "Paris", "days": 2}` (the number typed).
-- **Speed:** almost all the time goes to copying missed experts from the mapped file into slots, at 0.45-0.9 GB/s:
+- **Speed:** almost all the time goes to reading missed experts from the file into slots. First through the file's
+  mapping (each 4 KB page faulted in), at 0.45-0.9 GB/s:
 
 | Request | Prompt | Its experts | Answer | Its experts |
 | --- | --- | --- | --- | --- |
@@ -167,9 +168,22 @@ other weights, inside the carve-out), greedy, through `serve/server.py`:
 | 24 tokens, again | 80.8 s | 607 hits, 3,022 misses (36.0 GB) | 9 tokens, 17.7 s | 1,892 hits, 796 misses (9.5 GB) |
 | 180 tokens (a tool) | 229.1 s | 435 hits, 9,068 misses (107.8 GB) | 18 tokens, 58.3 s | 3,322 hits, 2,390 misses (28.4 GB) |
 
-A token of an answer misses about 88 experts (1 GB); a 24-token prompt touches about 3,600 different experts, more
-than the 3,000 slots, so the same prompt again is no faster. The NVMe reads several GB/s: the copy from the mapped file
-(page faults) is what is slow, and the next step. The engine prints these lines per request in its log.
+Then with unbuffered reads (the default now: `platform::DirectFile`, each expert's three slabs into pinned staging
+buffers, up to 48 reads in flight, then to the slot on a copy stream), the same requests and the same experts, at
+2.3-2.6 GB/s; loading (filling the slots) 45.7 -> 20-26 s:
+
+| Request | Prompt | Answer | Through the mapping |
+| --- | --- | --- | --- |
+| 24 tokens, cold start | 17.2 s | 9 tokens, 4.6 s (1.92 tokens/s) | 61.9 s, 0.76 tokens/s |
+| 21 tokens | 13.4 s | 22 tokens, 12.4 s (1.69 tokens/s) | 34.8 s, 0.53 tokens/s |
+| 24 tokens, again | 14.2 s | 9 tokens, 4.7 s (1.90 tokens/s) | 80.8 s, 0.49 tokens/s |
+| 180 tokens (a tool) | 43.8 s | 18 tokens, 13.7 s (1.86 tokens/s) | 229.1 s, 0.44 tokens/s |
+
+The drive reads 3.6-4.0 GB/s unbuffered at this read size with 8-32 reads in flight (1.2 GB/s with one), so the
+cache gets about two thirds of it; `STRATA_IO_THREADS` 8 or 16 changed nothing. A token of an answer misses about 88
+experts (1 GB), about 2 per layer, one layer after another: the reads wait for each layer's router. A 24-token prompt
+touches about 3,600 different experts, more than the 3,000 slots, so the same prompt again is no faster. The engine
+prints these lines per request in its log; `STRATA_GLM_MAPPED_READS=1` reads through the mapping as before.
 
 ## Tests
 
@@ -191,7 +205,7 @@ python tools/test_setup_glm.py
 
 ## Not done yet
 
-- Fast expert reads (large unbuffered reads instead of page faults on the mapped file), and an automatic slot count
+- Prefetching experts (a token's reads now wait for each layer's router in turn), and an automatic slot count
   for APUs, whose reported free GPU memory includes shared system RAM (on the 8060S 115 GB: the automatic count did
   not fit; the run above set `--glm-expert-cache 3000`).
 - Quality against llama.cpp on the same file.

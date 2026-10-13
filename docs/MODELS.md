@@ -147,7 +147,7 @@ START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** by Z.ai is another model, not a version of the one
 above: 288 experts per layer, a 1M-token context, MIT license. Setup offers Unsloth's UD-IQ4_XS of it (`--family
 glm`, a 157 GB download), which Strata runs on its own engine path. It is experimental: the path is checked piece by
-piece on an AMD Radeon 8060S, where the real model also answers correctly but very slowly so far (under 1 token per
+piece on an AMD Radeon 8060S, where the real model also answers correctly but slowly so far (about 2 tokens per
 second, most experts read from the SSD); the ready-made engines do not have it, and it has no images. Details, what is measured and what is not: [GLM-5.3-Flash](GLM.md).
 
 ```

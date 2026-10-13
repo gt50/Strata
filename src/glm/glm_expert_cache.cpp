@@ -1,9 +1,12 @@
 // src/glm/glm_expert_cache.cpp - see include/strata/glm/glm_expert_cache.hpp.
 #include "strata/glm/glm_expert_cache.hpp"
 
+#include "strata/platform/direct_file.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -13,6 +16,10 @@ namespace strata::glm {
 namespace {
 
 uint64_t align256(uint64_t n) { return (n + 255) & ~(uint64_t) 255; }
+
+constexpr uint64_t kAlign = platform::DirectFile::alignment();   // unbuffered reads: offset, length, address
+constexpr int kStages = 16;   // staging buffers: a decode call's 8 misses, and a prompt round's reads in flight
+uint64_t align_up(uint64_t n, uint64_t a) { return (n + a - 1) / a * a; }
 
 double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -30,6 +37,14 @@ bool cuda_ok(cudaError_t e, const char* what, std::string& err) {
 GlmExpertCache::~GlmExpertCache() { release(); }
 
 void GlmExpertCache::release() {
+    for (void* e : stage_events_)
+        if (e) cudaEventDestroy((cudaEvent_t) e);
+    stage_events_.clear();
+    if (copy_stream_) cudaStreamDestroy((cudaStream_t) copy_stream_);
+    copy_stream_ = nullptr;
+    if (staging_) cudaFreeHost(staging_);
+    staging_ = nullptr;
+    files_.clear();
     if (host_) cudaFreeHost(host_);
     else if (blobs_) cudaFree(blobs_);
     if (tables_) cudaFree(tables_);
@@ -40,7 +55,7 @@ void GlmExpertCache::release() {
 }
 
 bool GlmExpertCache::init(std::vector<GlmExpertSource> sources, int64_t n_expert, int64_t slots, bool mapped_host,
-                          int threads, std::string& err) {
+                          int threads, std::string& err, const std::vector<std::string>& files) {
     release();
     src_ = std::move(sources);
     n_expert_ = n_expert;
@@ -86,6 +101,38 @@ bool GlmExpertCache::init(std::vector<GlmExpertSource> sources, int64_t n_expert
     for (int32_t s = 0; s < (int32_t) slots; ++s) push_back(s);
     call_ = 0;
     stats_ = Stats{};
+    // unbuffered reads, when every MoE block names its files
+    bool named = !files.empty();
+    for (const GlmExpertSource& s : src_)
+        if (s.gate)
+            for (const int f : {s.gate_file, s.up_file, s.down_file}) named = named && f >= 0 && f < (int) files.size();
+    if (named) {
+        for (const std::string& p : files) {
+            auto f = std::make_unique<platform::DirectFile>();
+            if (!f->open(p, err)) {
+                err = "GlmExpertCache: " + p + ": " + err;
+                release();
+                return false;
+            }
+            files_.push_back(std::move(f));
+        }
+        stage_bytes_ = align_up(slot_bytes_ + 6 * kAlign, kAlign);   // each slab widened by up to 2 x 4 KB
+        cudaStream_t cs = nullptr;
+        if (!cuda_ok(cudaHostAlloc((void**) &staging_, stage_bytes_ * kStages, cudaHostAllocDefault), "staging", err) ||
+            !cuda_ok(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking), "the copy stream", err)) {
+            release();
+            return false;
+        }
+        copy_stream_ = cs;
+        for (int i = 0; i < kStages; ++i) {
+            cudaEvent_t ev = nullptr;
+            if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "an event", err)) {
+                release();
+                return false;
+            }
+            stage_events_.push_back(ev);
+        }
+    }
     return true;
 }
 
@@ -113,6 +160,7 @@ void GlmExpertCache::push_back(int32_t s) {
 /// slabs of the stacked tensors, the jobs spread over threads_ threads.
 bool GlmExpertCache::fetch(const std::vector<std::pair<int64_t, int32_t>>& jobs, std::string& err) {
     if (jobs.empty()) return true;
+    if (!files_.empty()) return fetch_direct(jobs, err);
     std::atomic<size_t> next{0};
     std::atomic<bool> failed{false};
     std::string first_err;
@@ -149,6 +197,134 @@ bool GlmExpertCache::fetch(const std::vector<std::pair<int64_t, int32_t>>& jobs,
     }
     if (failed) {
         err = first_err;
+        return false;
+    }
+    for (const auto& [owner, slot] : jobs) stats_.bytes += src_[(size_t) (owner / n_expert_)].layout.bytes;
+    return true;
+}
+
+/// fetch through unbuffered reads: each job's three slabs (widened to 4 KB boundaries) into a staging buffer of the
+/// ring, then to its slot (the copy stream for device slots, a memcpy for mapped host ones) while later jobs read.
+/// The jobs go in file order, so a call's reads of one tensor run close to sequentially.
+bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>& jobs_in, std::string& err) {
+    std::vector<std::pair<int64_t, int32_t>> jobs = jobs_in;
+    std::sort(jobs.begin(), jobs.end());   // block, then expert: file order within a tensor
+    struct Part { int file; uint64_t start, buf, skip, bytes, dst; uint32_t len; };
+    const int ns = (int) stage_events_.size();
+    std::vector<std::array<Part, 3>> part((size_t) ns);
+    std::vector<int> pending((size_t) ns, 0), job_of((size_t) ns, -1);
+    std::vector<char> copying((size_t) ns, 0);
+    std::vector<int> free_stages;
+    for (int s = ns - 1; s >= 0; --s) free_stages.push_back(s);
+    std::vector<int> in_flight(files_.size(), 0);
+    int reads = 0;
+    size_t next = 0, done = 0;
+    bool failed = false;
+    std::string why;
+    const cudaStream_t cs = (cudaStream_t) copy_stream_;
+
+    auto submit = [&](int s, size_t j) {
+        const int64_t block = jobs[j].first / n_expert_, e = jobs[j].first % n_expert_;
+        const GlmExpertSource& src = src_[(size_t) block];
+        const kernels::NativeExpertLayout& el = src.layout;
+        const uint64_t gu = el.up_off, dn = el.bytes - el.down_off;
+        const int fs[3] = {src.gate_file, src.up_file, src.down_file};
+        const uint64_t offs[3] = {src.gate_off + gu * (uint64_t) e, src.up_off + gu * (uint64_t) e,
+                                  src.down_off + dn * (uint64_t) e};
+        const uint64_t lens[3] = {gu, gu, dn}, dsts[3] = {0, el.up_off, el.down_off};
+        uint64_t pos = 0;
+        for (int k = 0; k < 3; ++k) {
+            const uint64_t start = offs[k] / kAlign * kAlign, end = align_up(offs[k] + lens[k], kAlign);
+            part[(size_t) s][(size_t) k] = Part{fs[k], start, pos, offs[k] - start, lens[k], dsts[k], (uint32_t) (end - start)};
+            pos += end - start;
+        }
+        job_of[(size_t) s] = (int) j;
+        pending[(size_t) s] = 0;
+        for (int k = 0; k < 3; ++k) {
+            const Part& p = part[(size_t) s][(size_t) k];
+            std::string e2;
+            if (!files_[(size_t) p.file]->submit(p.start, staging_ + stage_bytes_ * (uint64_t) s + p.buf, p.len,
+                                                 (uint64_t) (s * 3 + k), e2)) {
+                if (!failed) why = "GlmExpertCache: a read could not be queued: " + e2;
+                failed = true;
+                continue;
+            }
+            ++pending[(size_t) s];
+            ++in_flight[(size_t) p.file];
+            ++reads;
+        }
+    };
+    // a stage whose three reads are in: to its slot
+    auto place = [&](int s) {
+        const int64_t slot = jobs[(size_t) job_of[(size_t) s]].second;
+        const uint8_t* buf = staging_ + stage_bytes_ * (uint64_t) s;
+        for (const Part& p : part[(size_t) s]) {
+            if (host_) std::memcpy(host_ + slot_bytes_ * (uint64_t) slot + p.dst, buf + p.buf + p.skip, p.bytes);
+            else if (cudaMemcpyAsync(blobs_ + slot_bytes_ * (uint64_t) slot + p.dst, buf + p.buf + p.skip, p.bytes,
+                                     cudaMemcpyHostToDevice, cs) != cudaSuccess) {
+                cudaGetLastError();
+                if (!failed) why = "GlmExpertCache: copying an expert into its slot failed";
+                failed = true;
+            }
+        }
+        if (host_) {
+            free_stages.push_back(s);
+            ++done;
+        } else {
+            cudaEventRecord((cudaEvent_t) stage_events_[(size_t) s], cs);
+            copying[(size_t) s] = 1;
+        }
+    };
+    platform::Completion comps[64];
+    while (done < jobs.size() || reads > 0) {
+        while (!failed && !free_stages.empty() && next < jobs.size()) {
+            const int s = free_stages.back();
+            free_stages.pop_back();
+            submit(s, next++);
+            if (pending[(size_t) s] == 0 && !failed) place(s);
+        }
+        if (failed && reads == 0) break;
+        if (reads > 0) {   // block on one file with reads in flight, then take what the others have
+            bool blocked = false;
+            for (size_t f = 0; f < files_.size(); ++f) {
+                if (in_flight[f] == 0) continue;
+                const int n = files_[f]->wait(comps, 64, blocked ? 0 : -1);
+                blocked = true;
+                for (int i = 0; i < n; ++i) {
+                    const platform::Completion& c = comps[i];
+                    if (c.tag == platform::DirectFile::WAKE_TAG) continue;
+                    --in_flight[f];
+                    --reads;
+                    const int s = (int) (c.tag / 3), k = (int) (c.tag % 3);
+                    const Part& p = part[(size_t) s][(size_t) k];
+                    if (!c.ok || (uint64_t) c.bytes < p.skip + p.bytes) {
+                        if (!failed) why = "GlmExpertCache: an expert read came back short or failed";
+                        failed = true;
+                    }
+                    if (--pending[(size_t) s] == 0) {
+                        if (failed) free_stages.push_back(s);
+                        else place(s);
+                    }
+                }
+            }
+        } else {   // only copies left: wait for one
+            for (int s = 0; s < ns; ++s)
+                if (copying[(size_t) s]) {
+                    cudaEventSynchronize((cudaEvent_t) stage_events_[(size_t) s]);
+                    break;
+                }
+        }
+        for (int s = 0; s < ns; ++s)   // finished copies free their stage
+            if (copying[(size_t) s] && cudaEventQuery((cudaEvent_t) stage_events_[(size_t) s]) == cudaSuccess) {
+                copying[(size_t) s] = 0;
+                free_stages.push_back(s);
+                ++done;
+            }
+        if (failed && reads == 0 && std::none_of(copying.begin(), copying.end(), [](char c) { return c != 0; })) break;
+    }
+    if (!host_ && !cuda_ok(cudaStreamSynchronize(cs), "the expert copies", err)) return false;
+    if (failed) {
+        err = why;
         return false;
     }
     for (const auto& [owner, slot] : jobs) stats_.bytes += src_[(size_t) (owner / n_expert_)].layout.bytes;

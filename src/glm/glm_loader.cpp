@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 
@@ -408,12 +409,23 @@ bool GlmLoadedWeights::load(const GgufModel& m, const core::Glm5NextGeometry& g,
             s.up = m.shard(un->shard).tensor_data(*un->t);
             s.down = m.shard(dn->shard).tensor_data(*dn->t);
             s.layout = k::native_expert_layout((int) gn->t->type, (int) dn->t->type, g.n_embd, g.n_ff_exp);
+            // for unbuffered reads: each tensor's shard (the file index) and its offset in that file
+            s.gate_file = (int) gn->shard;
+            s.up_file = (int) un->shard;
+            s.down_file = (int) dn->shard;
+            s.gate_off = m.shard(gn->shard).data_start() + gn->t->offset;
+            s.up_off = m.shard(un->shard).data_start() + un->t->offset;
+            s.down_off = m.shard(dn->shard).data_start() + dn->t->offset;
             w_.blocks[(size_t) il].expert_layout = s.layout;
             w_.blocks[(size_t) il].expert_ptrs = nullptr;
         }
+        std::vector<std::string> files;
+        const char* mapped = std::getenv("STRATA_GLM_MAPPED_READS");
+        if (opt.direct_reads && !(mapped && mapped[0] == '1'))
+            for (size_t i = 0; i < m.size(); ++i) files.push_back(m.shard(i).path());
         cache_ = std::make_unique<GlmExpertCache>();
         if (!cache_->init(std::move(src), NE, opt.expert_cache_slots, opt.experts == GlmExpertHome::MappedHost,
-                          opt.cache_threads, err) ||
+                          opt.cache_threads, err, files) ||
             (opt.cache_fill && !cache_->fill_all(err)))
             return fail();
         return true;

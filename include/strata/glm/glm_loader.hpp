@@ -47,6 +47,9 @@ struct GlmLoadOptions {
     int64_t expert_cache_slots = 0;
     bool cache_fill = true;
     int cache_threads = 8;
+    /// the cache reads misses unbuffered from the shard files (not through the mapping); STRATA_GLM_MAPPED_READS=1
+    /// turns it off at load
+    bool direct_reads = true;
 };
 
 /// What glm_plan found: the bytes each home needs, and the types the file uses per role (for a report).
