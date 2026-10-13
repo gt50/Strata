@@ -1327,12 +1327,18 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     }
 }
 
+// GLM-5.3-Flash's SwiGLU limit (llama.cpp's ggml_swiglu_clamp, which glm5-next takes for its experts):
+// silu(min(gate, lim)) * clamp(up, -lim, lim).  The inputs are clamped and the SwiGLU expression below is left as it
+// is; lim <= 0 (every other model) passes them through unchanged, so those results are the same bits as before.
+__device__ __forceinline__ float swiglu_lim_g(float g, float lim) { return lim > 0.0f ? fminf(g, lim) : g; }
+__device__ __forceinline__ float swiglu_lim_u(float u, float lim) { return lim > 0.0f ? fminf(fmaxf(u, -lim), lim) : u; }
+
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, float lim) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    const float g = swiglu_lim_g(gate[i], lim);
+    h[i] = (g / (1.0f + __expf(-g))) * swiglu_lim_u(up[i], lim);
 }
 
 template<int TD>
@@ -1547,18 +1553,18 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
-                                                                  block_q8_1* __restrict__ hq) {
+                                                                  block_q8_1* __restrict__ hq, float lim) {
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
 #endif
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
-        const float g = gate[i];
+        const float g = swiglu_lim_g(gate[i], lim);
 #if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
+        const float h = (g / (1.0f + __expf(-g))) * swiglu_lim_u(up[i], lim);
 #else
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = __fmul_rn(g / (1.0f + __expf(-g)), swiglu_lim_u(up[i], lim));
 #endif
         q8_1_store(h, hq, i);
     }
@@ -2339,7 +2345,7 @@ void s26_launch_l(const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t 
     if (FQ) {
         s26_swiglu_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, hq, nh);
     } else {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, 0.0f);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     }
     const dim3 gd((unsigned) (L.n_embd / (8 * RD)), (unsigned) cap_groups);
@@ -3324,7 +3330,7 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_tok,
                                                               const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                              block_q8_1* __restrict__ hq) {
+                                                              block_q8_1* __restrict__ hq, float lim) {
     using GT = typename GridOf<TG>::T;
     using F = Fmt<TG>;
     __shared__ GT sgrid[GridOf<TG>::N];
@@ -3386,7 +3392,7 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         }
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
-            const float gg = res[warp][lane], uu = res[warp][32 + lane];
+            const float gg = swiglu_lim_g(res[warp][lane], lim), uu = swiglu_lim_u(res[warp][32 + lane], lim);
             const float xi = (gg / (1.0f + __expf(-gg))) * uu;
             float amax = fabsf(xi), sum = xi;
 #pragma unroll
@@ -3448,10 +3454,11 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 
-void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
-                           const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
-                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+namespace {
+void native_expert_grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
+                                int64_t cap_groups, int64_t cap_entries, const void* x_q8_1, void* scratch, float* out,
+                                void* stream, int64_t grid_groups, float lim) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -3462,7 +3469,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     static const bool v2 = [] { const char* v = std::getenv("STRATA_EXPERT_V2"); return v && v[0] == '1'; }();
-    if (v2 && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
+    if (v2 && lim <= 0.0f && L.gu_type == 21 && L.d_type == 20 && L.n_embd == 2560 && L.n_ff == 640) {   // S26: see s26_gu_l_kernel
         // S26 STRATA_TSUM=1: the sums as one transposed butterfly per warp (s26_tsum.cuh; bitwise the same values)
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         // (+ down rows' items spread evenly over the lanes, one load group: bitwise, harness 1.09-1.12x vs 1.03-1.06x;
@@ -3476,7 +3483,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     // stream B: UD-Q4_K_XL's Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down (see S27 above)
     static const bool v2k = [] { const char* v = std::getenv("STRATA_EXPERT_V2K"); return v && v[0] == '1'; }();
-    if (v2k && (L.gu_type == 12 || L.gu_type == 13) && (L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 &&
+    if (v2k && lim <= 0.0f && (L.gu_type == 12 || L.gu_type == 13) && (L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 &&
         L.n_ff == 640) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
@@ -3509,11 +3516,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
-            case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
-            case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
-            case 21: native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
-            case 23: native_gu_fused_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
-            default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
+            case 16: native_gu_fused_kernel<16><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, lim); break;
+            case 18: native_gu_fused_kernel<18><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, lim); break;
+            case 21: native_gu_fused_kernel<21><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, lim); break;
+            case 23: native_gu_fused_kernel<23><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, lim); break;
+            default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq, lim); break;
         }
         check("native_expert_grouped/gu fused");
     }
@@ -3571,11 +3578,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     if (sw_v1) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, lim);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else {
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq);
+                                                                                (int) L.n_ff, hq, lim);
     }
     check("native_expert_grouped/swiglu");
     }
@@ -3613,6 +3620,27 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
+}
+}  // namespace
+
+void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                           const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                           int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
+                           int64_t grid_groups) {
+    native_expert_grouped_impl(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                               out, stream, grid_groups, 0.0f);
+}
+
+void native_expert_grouped_clamped(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                   const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+                                   void* scratch, float* out, float swiglu_limit, void* stream, int64_t grid_groups) {
+    if (!(swiglu_limit >= 0.0f)) {
+        std::fprintf(stderr, "native_expert_grouped_clamped: swiglu_limit %g\n", (double) swiglu_limit);
+        std::exit(1);
+    }
+    native_expert_grouped_impl(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch,
+                               out, stream, grid_groups, swiglu_limit);
 }
 
 }  // namespace strata::kernels

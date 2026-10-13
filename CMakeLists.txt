@@ -385,6 +385,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kda.cu
                           src/kernels/cuda/mla.cu
                           src/kernels/cuda/kpool.cu
+                          src/kernels/cuda/glm_moe.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
@@ -884,6 +885,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kpool_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kpool_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kpool_parity COMMAND kpool_parity --selftest)
+
+  # GLM-5.3-Flash's MoE: the router, the clamped SwiGLU, and the grouped GGUF experts with the clamp at 4096 x 2048
+  add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp)
+  target_include_directories(glm_moe_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_moe_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME glm_moe_parity COMMAND glm_moe_parity --selftest)
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${_strata_gpu_include_directories})

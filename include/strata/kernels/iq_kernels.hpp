@@ -71,6 +71,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// `native_expert_grouped` with GLM-5.3-Flash's SwiGLU limit (swiglu_clamp_exp; llama.cpp's ggml_swiglu_clamp for
+/// glm5-next): h = silu(min(gate, lim)) * clamp(up, -lim, lim).  lim 0 is no limit, the same bits as
+/// native_expert_grouped.  A limit skips the 2560 x 640 fast paths (STRATA_EXPERT_V2 / V2K), which have none.
+/// CUDA / HIP only (the SYCL tree has no definition yet).
+void native_expert_grouped_clamped(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                   const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+                                   void* scratch, float* out, float swiglu_limit, void* stream, int64_t grid_groups = 0);
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.
