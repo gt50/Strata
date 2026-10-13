@@ -129,6 +129,11 @@ void GlmContext::set_positions(int64_t pos0, int64_t n, void* stream) {
     n_ = n;
 }
 
+void GlmContext::linear(const GlmLinear& w, const float* x, float* y, int n, void* stream) {
+    if (n == 1 || !gemm_) k::glm_linear(w, x, y, n, q8, stream);
+    else gemm_->linear(w, x, y, n, q8, stream);
+}
+
 size_t glm_layer_state_bytes(const core::Glm5NextGeometry& g, int64_t il, int64_t max_ctx) {
     Carver c;
     if (!g.is_mla[(size_t) il]) {

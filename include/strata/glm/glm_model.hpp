@@ -52,6 +52,16 @@ struct GlmModelWeights {
     const float* mtp_head_norm = nullptr;    ///< nextn.shared_head_norm; null = output_norm
 };
 
+/// A test's view of the last decode / prompt / mtp_decode call: the device buffers it fills when they are set.  A
+/// prompt of several chunks leaves its last chunk's.
+struct GlmTaps {
+    float* x = nullptr;        ///< [n_layers + 1][tokens][4][n_embd]: the streams after mhc_init and after every main block
+    int32_t* sel = nullptr;    ///< [tokens][top_k + kpool - 1]: the main layers' last selections (before the MTP block's)
+    int32_t* eids = nullptr;   ///< [tokens][n_expert_used]: the main layers' last router choices, likewise
+    float* mtp = nullptr;      ///< [3][rows][n_embd]: an MTP pass's h rows, eh_proj's output and the block's output
+    int64_t mtp_pos0 = -1, mtp_rows = 0;   ///< (host) the last MTP pass's positions
+};
+
 /// The model's state (every block's caches and recurrent state) and buffers for a context of max_ctx cells.
 class GlmModel {
 public:
@@ -73,8 +83,15 @@ public:
     bool decode(int32_t token, int64_t pos, void* stream, std::string& err);
     /// The n tokens at pos0 .. pos0 + n - 1 (a prompt, or its next part) through the main layers, max_chunk tokens a
     /// call: every block's state and caches advance as n decode() calls would advance them, by the prompt kernels;
-    /// logits() and h_nextn() hold the last token's.  (The MTP block's cache is not filled for them yet.)
+    /// logits() and h_nextn() hold the last token's.
+    ///
+    /// With an MTP block, each chunk is then run through it too (set_mtp_over_prompt), so that drafting can start
+    /// where the prompt ends: position p with token p + 1 and the main model's h at p - every position whose next
+    /// token the call has.  The last one waits for its next token: the next prompt() call's first (when it continues
+    /// at the next position), or the caller's mtp_decode(next, last, h_nextn()), which drafts as it fills it.
     bool prompt(const int32_t* tokens, int64_t n, int64_t pos0, void* stream, std::string& err);
+    /// Whether prompt() runs the MTP block over its tokens (on by default when the model has one).
+    void set_mtp_over_prompt(bool on) { mtp_prompt_ = on; }
     bool has_mtp() const { return has_mtp_; }
     /// The MTP block for `token` at `pos`, reading h [n_embd] (device; h_nextn() of the token before, or mtp_h() to
     /// draft on): mtp_logits() and mtp_h() hold the result.  The block keeps its own caches by `pos`.
@@ -88,9 +105,8 @@ public:
     int64_t max_ctx() const { return max_ctx_; }
     const GlmLayerState& state(int64_t il) const { return states_[(size_t) il]; }
     const GlmContext& context() const { return ctx_; }
-    /// A test's view: when set, decode copies the streams X to taps [n_layers + 1][4][n_embd] (device) after
-    /// mhc_init and after every main block; prompt() the last chunk's, [n_layers + 1][chunk][4][n_embd].
-    void set_taps(float* taps) { taps_ = taps; }
+    /// A test's view of the calls (GlmTaps); null stops it.
+    void set_taps(GlmTaps* taps) { taps_ = taps; }
 
 private:
     core::Glm5NextGeometry g_;
@@ -104,10 +120,18 @@ private:
     int32_t* tok_ = nullptr;
     float *e_ = nullptr, *x_ = nullptr, *h_ = nullptr, *logits_ = nullptr;
     float *xm_ = nullptr, *mtp_h_ = nullptr, *mtp_logits_ = nullptr;
-    float* taps_ = nullptr;
+    GlmTaps* taps_ = nullptr;
+    bool mtp_prompt_ = true;
+    int64_t pending_pos_ = -1;   ///< a prompt's last position, its MTP row waiting for the next token
+    float *hall_ = nullptr, *eb_ = nullptr, *h_pending_ = nullptr;
+    int32_t* mtp_tok_ = nullptr;
 
     bool start(int32_t token, int64_t pos, const char* who, void* stream, std::string& err);
     void head(int64_t row, void* stream);   ///< logits() and h_nextn() from token `row` of x_
+    /// The MTP block over `rows` positions from pos0: the next tokens in mtp_tok_, the h rows at h_rows (copied
+    /// first: it may be mtp_h_); leaves the block's output in xm_.
+    bool mtp_pass(int64_t pos0, int64_t rows, const float* h_rows, void* stream, std::string& err);
+    void tap_main(int64_t n, void* stream);   ///< the main layers' selections and router choices into the taps
 };
 
 }  // namespace strata::glm

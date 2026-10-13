@@ -3,9 +3,10 @@
 // glm5-next graph, token by token.
 //
 //   A  a 40-token prompt from a new sequence in one call (the selection is every cell; pools complete inside it),
+//      its MTP pass over positions 0 .. 38, the first draft at 39 (mtp_decode on the MTP rows the prompt filled),
 //      then 4 decode tokens that continue from the state it left
 //   B  the same prompt in three calls of 16, 16 and 8 tokens: the KDA state, the conv history and the pools carried
-//      from one chunk to the next
+//      from one chunk to the next, and each call's last MTP row completed by the next call's first token
 //   C  a 24-token prompt after 2100 cells of history (random caches and KDA state, as glm_layer_parity's), so the
 //      indexer's selection is sparse: 512 pools of the 525 and the tail
 //   D  scenario A's prompt with the experts streamed through a cache of 6 slots: every MoE layer runs in rounds of
@@ -14,7 +15,9 @@
 // Every block is checked for every token of a call from the streams the device gave it (the taps) and its latent
 // history, the way glm_model_parity checks a decode token (glm_ref.hpp's verify: 1e-4, or a set of the reference's
 // q8_1 roundings on a boundary taken the other way); the KDA blocks' conv history and state at the end of each call;
-// the last indexer's cells and the last router's experts for every token; the head on the last token.  A prompt
+// the last indexer's cells and the last router's experts for every token; the head on the last token; and the MTP
+// pass: its h rows the main model's at their positions, each row's eh_proj, block (verify), latent row, cells and
+// experts.  A prompt
 // call's projections and experts are the prompt products (glm_gemm.hpp: MMQ, the BF16 GEMM), so the reference rounds
 // their activations as those do (glm_ref.hpp's g_prompt).
 //
@@ -39,7 +42,7 @@ size_t argmax(const vector<double>& v) { return (size_t) (std::max_element(v.beg
 struct Run {
     TestModel& tm;
     glm::GlmModel& model;
-    float* taps;
+    glm::GlmTaps& taps;
     Ref r;
     int64_t fails = 0;   // this run's
 };
@@ -49,10 +52,10 @@ void verify_call(Run& run, int64_t pos0, int64_t n) {
     g_prompt = n > 1;   // a prompt call took the prompt products (glm_gemm.hpp), a decode step the GEMVs
     const Glm5NextGeometry& g = run.tm.g;
     const int64_t D = g.n_embd, NL = g.n_layers;
-    const vector<float> tp = download(run.taps, (size_t) ((NL + 1) * n * 4 * D));
-    const glm::GlmContext& ctx = run.model.context();
-    const vector<int32_t> sel_dev = download(ctx.sel_ids, (size_t) (n * (g.idx_top_k + g.idx_kpool - 1)));
-    const vector<int32_t> eid_dev = download(ctx.eids, (size_t) (n * g.n_expert_used));
+    const vector<float> tp = download(run.taps.x, (size_t) ((NL + 1) * n * 4 * D));
+    // the main layers' last selections and choices, as the call left them before its MTP pass
+    const vector<int32_t> sel_dev = download(run.taps.sel, (size_t) (n * (g.idx_top_k + g.idx_kpool - 1)));
+    const vector<int32_t> eid_dev = download(run.taps.eids, (size_t) (n * g.n_expert_used));
     int64_t last_full = -1, last_moe = -1;
     for (int64_t il = 0; il < NL; ++il) {
         if (g.is_mla[(size_t) il] && full_idx(g, il)) last_full = il;
@@ -126,6 +129,87 @@ void verify_call(Run& run, int64_t pos0, int64_t n) {
     run.fails += g_bad - before;
 }
 
+/// The h_nextn rows of the last call's tokens [from, to), from its taps: rms_norm(mean of the streams) * output_norm.
+vector<vector<double>> h_rows(Run& run, int64_t n, int64_t from, int64_t to) {
+    const Glm5NextGeometry& g = run.tm.g;
+    const int64_t D = g.n_embd, NL = g.n_layers;
+    const vector<float> tp = download(run.taps.x + (size_t) (NL * n * 4 * D), (size_t) (n * 4 * D));
+    vector<vector<double>> r;
+    for (int64_t t = from; t < to; ++t) {
+        vector<double> h((size_t) D, 0.0);
+        for (int64_t d = 0; d < D; ++d) {
+            for (int i = 0; i < 4; ++i) h[(size_t) d] += tp[(size_t) (t * 4 * D + i * D + d)];
+            h[(size_t) d] /= 4;
+        }
+        rms_w(h, run.tm.out_norm, g.rms_eps);
+        r.push_back(std::move(h));
+    }
+    return r;
+}
+
+/// The last MTP pass (a prompt's, or mtp_decode's one row): its rows' h are `want_h` (the main model's at their
+/// positions), next tokens `next`; then for each row eh_proj from the device's h and embedding row, the block from the
+/// device's eh_proj output (verify), its latent row, cells and experts.
+void verify_mtp(Run& run, const vector<vector<double>>& want_h, const vector<int32_t>& next) {
+    const Glm5NextGeometry& g = run.tm.g;
+    const int64_t D = g.n_embd, R = run.taps.mtp_rows, pos0 = run.taps.mtp_pos0, MTP = g.n_layers;
+    const int64_t before = g_bad;
+    if (R != (int64_t) want_h.size() || R != (int64_t) next.size()) {
+        ++g_bad;
+        std::printf("  the MTP pass ran %lld rows from %lld, not %zu *** ***\n", (long long) R, (long long) pos0,
+                    want_h.size());
+        run.fails += g_bad - before;
+        return;
+    }
+    g_prompt = R > 1;
+    const vector<float> tm = download(run.taps.mtp, (size_t) (3 * R * D));
+    const glm::GlmContext& ctx = run.model.context();
+    const size_t cap = (size_t) (g.idx_top_k + g.idx_kpool - 1);
+    const vector<int32_t> sel_dev = download(ctx.sel_ids, (size_t) R * cap);
+    const vector<int32_t> eid_dev = download(ctx.eids, (size_t) (R * g.n_expert_used));
+    auto row = [&](int64_t part, int64_t r) { return tm.begin() + (ptrdiff_t) ((part * R + r) * D); };
+    Block& b = run.tm.blocks[(size_t) MTP];
+    double worst_h = 0;
+    for (int64_t r = 0; r < R; ++r) {
+        const int64_t pos = pos0 + r;
+        const vector<float> hd(row(0, r), row(0, r) + D);
+        worst_h = std::max(worst_h, rel_l1(want_h[(size_t) r], hd));
+        // eh_proj: [rms(e) enorm ; rms(h) hnorm] from the device's h row
+        vector<double> e(run.tm.tok.w.begin() + (ptrdiff_t) (next[(size_t) r] * D),
+                         run.tm.tok.w.begin() + (ptrdiff_t) ((next[(size_t) r] + 1) * D));
+        vector<double> hh(hd.begin(), hd.end());
+        rms_w(e, run.tm.enorm, g.rms_eps);
+        rms_w(hh, run.tm.hnorm, g.rms_eps);
+        e.insert(e.end(), hh.begin(), hh.end());
+        const vector<float> x0(row(1, r), row(1, r) + D), x1(row(2, r), row(2, r) + D);
+        if (!verify("MTP eh_proj", pos, MTP, [&] { return Fit{rel_l1(lin_ref(run.tm.eh, e), x0)}; }, [] {})) ++g_bad;
+        latent_sync(b, pos);
+        const Snap snap = save(b, run.r);
+        if (!verify("MTP block", pos, MTP, [&] {
+                vector<double> x(x0.begin(), x0.end());
+                mtp_block_ref(b, g, MTP, pos, x, run.r);
+                return Fit{rel_l1(x, x1), latent_row_far(b) == 0};
+            }, [&] { restore(b, run.r, snap); }))
+            ++g_bad;
+        if (!latent_row_ok(b, pos, MTP)) ++g_bad;
+        vector<int32_t> got_sel(sel_dev.begin() + (ptrdiff_t) (r * (int64_t) cap),
+                                sel_dev.begin() + (ptrdiff_t) (r * (int64_t) cap + (int64_t) run.r.sel.size()));
+        std::sort(got_sel.begin(), got_sel.end());
+        const vector<int32_t> got_e(eid_dev.begin() + (ptrdiff_t) (r * g.n_expert_used),
+                                    eid_dev.begin() + (ptrdiff_t) ((r + 1) * g.n_expert_used));
+        if (got_sel != run.r.sel || got_e != run.r.eids) {
+            ++g_bad;
+            std::printf("  pos %lld MTP block: the cells or the experts *** DIFFER ***\n", (long long) pos);
+        }
+    }
+    const bool h_ok = worst_h <= 1e-6;
+    if (!h_ok) ++g_bad;
+    std::printf("  MTP pass, positions %lld .. %lld: the h rows the main model's at them (worst rel %.3e)%s%s\n",
+                (long long) pos0, (long long) (pos0 + R - 1), worst_h, h_ok ? "" : " *** ***",
+                g_bad == before ? ", every row's eh_proj, block, latent row, cells and experts match" : "");
+    run.fails += g_bad - before;
+}
+
 /// A fresh sequence on both sides: the device's KDA state zeroed, the reference's state too.
 void fresh(Run& run, void* stream) {
     run.model.reset(stream);
@@ -139,7 +223,7 @@ void history(Run& run, int64_t p0, void* stream) {
     fresh(run, stream);
     const Glm5NextGeometry& g = run.tm.g;
     const int H = (int) g.n_head, Dh = 128, di = H * Dh, L = 512;
-    for (int64_t il = 0; il < g.n_layers; ++il) {
+    for (int64_t il = 0; il < g.n_blocks(); ++il) {   // the MTP block's caches too
         Block& b = run.tm.blocks[(size_t) il];
         const glm::GlmLayerState& st = run.model.state(il);
         if (!g.is_mla[(size_t) il]) {
@@ -190,7 +274,7 @@ int gemm_check() {
     glm::GlmPromptGemm pg;
     std::string err;
     if (!pg.init(64, K, 1024, 256, 4, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
-    for (int T : {64, 40, 32, 24, 16, 12, 8, 4, 2, 1}) {
+    for (int T : {64, 40, 32, 24, 16, 12, 8, 4, 2}) {
         const vector<float> x = gvec((size_t) (T * K), 1.0f);
         float* dx = upload(x);
         float* dy = nullptr;
@@ -327,10 +411,15 @@ int main(int argc, char** argv) {
     for (int64_t il = 0; il < g.n_blocks(); ++il) tm.blocks[(size_t) il].st = model.state(il);
     float* taps = nullptr;
     check(cudaMalloc(&taps, (size_t) ((NL + 1) * CHUNK * 4 * D) * sizeof(float)), "taps");
-    model.set_taps(taps);
+    glm::GlmTaps gtaps;
+    gtaps.x = taps;
+    check(cudaMalloc(&gtaps.sel, (size_t) (CHUNK * (g.idx_top_k + g.idx_kpool - 1)) * 4), "sel taps");
+    check(cudaMalloc(&gtaps.eids, (size_t) (CHUNK * g.n_expert_used) * 4), "eids taps");
+    check(cudaMalloc(&gtaps.mtp, (size_t) (3 * (CHUNK + 1) * D) * sizeof(float)), "mtp taps");
+    model.set_taps(&gtaps);
     cudaStream_t stream;
     check(cudaStreamCreate(&stream), "stream");
-    Run run{tm, model, taps, Ref{g, {}, {}}};
+    Run run{tm, model, gtaps, Ref{g, {}, {}}};
     g_quiet = true;   // a line for each token and block only where it needed more than the rounding as made
     vector<int32_t> tokens(48);
     for (auto& t : tokens) t = (int32_t) (unit() * (float) g.n_vocab) % (int32_t) g.n_vocab;
@@ -340,7 +429,17 @@ int main(int argc, char** argv) {
     fresh(run, stream);
     prompt(run, prompt40, 0, stream);
     verify_call(run, 0, 40);
+    verify_mtp(run, h_rows(run, 40, 0, 39), vector<int32_t>(tokens.begin() + 1, tokens.begin() + 40));
     const vector<float> logits_a = download(model.logits(), (size_t) g.n_vocab);
+    {   // the first draft where the prompt ends: position 39 with token 40, on the MTP rows the prompt filled
+        const vector<float> h39 = download(model.h_nextn(), (size_t) D);
+        if (!model.mtp_decode(tokens[40], 39, model.h_nextn(), stream, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        check(cudaStreamSynchronize(stream), "mtp_decode");
+        verify_mtp(run, {vector<double>(h39.begin(), h39.end())}, {tokens[40]});
+    }
     for (int64_t p = 40; p < 44; ++p) {
         if (!model.decode(tokens[(size_t) p], p, stream, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         check(cudaStreamSynchronize(stream), "decode");
@@ -351,10 +450,21 @@ int main(int argc, char** argv) {
     std::printf("\nB: the same prompt in calls of 16, 16 and 8 tokens\n");
     run.fails = 0;
     fresh(run, stream);
+    vector<float> h_last;   // the last call's h_nextn: its last position's MTP row waits for the next call
     for (int64_t c0 : {0, 16, 32}) {
         const int64_t nc = c0 < 32 ? 16 : 8;
         prompt(run, vector<int32_t>(prompt40.begin() + c0, prompt40.begin() + c0 + nc), c0, stream);
         verify_call(run, c0, nc);
+        vector<vector<double>> want;
+        vector<int32_t> next;
+        if (c0 > 0) {
+            want.emplace_back(h_last.begin(), h_last.end());
+            next.push_back(prompt40[(size_t) c0]);
+        }
+        for (auto& h : h_rows(run, nc, 0, nc - 1)) want.push_back(h);
+        for (int64_t t = 1; t < nc; ++t) next.push_back(prompt40[(size_t) (c0 + t)]);
+        verify_mtp(run, want, next);
+        h_last = download(model.h_nextn(), (size_t) D);
     }
     const int64_t fails_b = run.fails;
 
@@ -363,6 +473,7 @@ int main(int argc, char** argv) {
     history(run, 2100, stream);
     prompt(run, vector<int32_t>(tokens.begin(), tokens.begin() + 24), 2100, stream);
     verify_call(run, 2100, 24);
+    verify_mtp(run, h_rows(run, 24, 0, 23), vector<int32_t>(tokens.begin() + 1, tokens.begin() + 24));
     const int64_t fails_c = run.fails;
 
     std::printf("\nD: scenario A's prompt with the experts streamed through a cache of 6 slots\n");

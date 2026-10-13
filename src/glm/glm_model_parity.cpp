@@ -71,7 +71,9 @@ int main(int argc, char** argv) {
     for (int64_t il = 0; il < g.n_blocks(); ++il) blocks[(size_t) il].st = model.state(il);
     float* taps = nullptr;
     check(cudaMalloc(&taps, (size_t) (NL + 1) * 4 * D * sizeof(float)), "taps");
-    model.set_taps(taps);
+    glm::GlmTaps gtaps;
+    gtaps.x = taps;
+    model.set_taps(&gtaps);
     cudaStream_t stream;
     check(cudaStreamCreate(&stream), "stream");
     model.reset(stream);

@@ -119,6 +119,8 @@ public:
     int64_t max_ctx() const { return max_ctx_; }
     int64_t max_tokens() const { return max_tokens_; }
     int64_t tokens() const { return n_; }
+    /// y [n][n_out] = x [n][n_in] . W^T: the GEMV for one token, the prompt products (glm_gemm.hpp) for more.
+    void linear(const GlmLinear& w, const float* x, float* y, int n, void* stream);
 
     /// the experts of a layer whose expert_ptrs are null (a cache), else unused
     GlmExpertProvider* expert_provider = nullptr;
