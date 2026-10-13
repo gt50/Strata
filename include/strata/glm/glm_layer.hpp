@@ -8,10 +8,13 @@
 //     f = dense SwiGLU(h)   or   sum_i w_i expert_i(h) + shared(h)        (both with the SwiGLU clamp)
 //     X = mhc_post(f, X)
 //
-// THE START OF THE GLUE, and what it is not yet: one token (decode), one layer a call, the weights already on the
-// device in their GGUF form (GlmLinear) with the small exceptions listed on GlmLayerWeights.  No loader, no prompt
-// path, no capture: the per-token values are in the step (glm_step_set), so the kernels' argument lists are already
-// constant across tokens, but nothing here captures yet.
+// The MTP block (after the main layers) is the same two sublayers around a plain residual instead of the mHC
+// (glm_mtp_layer_decode); glm_model.hpp runs the whole model around these.
+//
+// What it is not yet: one token (decode), one layer a call, the weights already on the device in their GGUF form
+// (GlmLinear) with the small exceptions listed on GlmLayerWeights.  No loader, no prompt path, no capture: the
+// per-token values are in the step (GlmContext::set_pos), so the kernels' argument lists are constant across tokens
+// except mla_kv_store's row, but nothing here captures yet.
 #pragma once
 
 #include "strata/core/geometry_glm5_next.hpp"
@@ -106,9 +109,12 @@ private:
     int64_t top_k_ = 0;
     bool select_tail_ = true;
     void* arena_ = nullptr;
-    friend bool glm_layer_decode(const core::Glm5NextGeometry&, int64_t, const GlmLayerWeights&, const GlmLayerState&,
-                                 GlmContext&, float*, void*, std::string&);
+    friend struct GlmLayerImpl;
 };
+
+/// Whether block `il`'s weights are all there, in the shapes the geometry gives and types the kernels take: what a
+/// loader checks before it allocates anything.  The MTP block (il >= n_layers) has no mHC weights and a full indexer.
+bool glm_layer_check(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, std::string& err);
 
 /// Bytes of state one block needs (KDA: conv history and state; MLA: latent, indexer cache, pooled keys).
 size_t glm_layer_state_bytes(const core::Glm5NextGeometry& g, int64_t il, int64_t max_ctx);
@@ -119,5 +125,11 @@ void glm_layer_state_carve(const core::Glm5NextGeometry& g, int64_t il, int64_t 
 /// state too.  A shared-indexer MLA layer takes the selection the last full-indexer layer left in ctx.
 bool glm_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, const GlmLayerState& st,
                       GlmContext& ctx, float* x, void* stream, std::string& err);
+
+/// The MTP block (il >= n_layers) at ctx's position, llama.cpp's graph_mtp between eh_proj and the head norm: a plain
+/// residual, no mHC - x += MLA(rms_norm(x) attn_norm) over its own (full) indexer, then x += FFN(rms_norm(x) ffn_norm).
+/// x [n_embd] in place.
+bool glm_mtp_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w,
+                          const GlmLayerState& st, GlmContext& ctx, float* x, void* stream, std::string& err);
 
 }  // namespace strata::glm

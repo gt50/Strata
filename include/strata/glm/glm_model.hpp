@@ -1,0 +1,104 @@
+// include/strata/glm/glm_model.hpp - GLM-5.3-Flash's whole forward pass for one token at decode, around
+// glm_layer_decode: llama.cpp's glm5-next graph and graph_mtp (upstream src/models/glm5-next.cpp).
+//
+//     e = tok_embd[token];  X = four copies of e                            (mhc_init)
+//     X = block_il(X)  for il < n_layers                                    (glm_layer_decode)
+//     h = rms_norm(mean_i X[i]) * output_norm                               (h_nextn: what the MTP block reads)
+//     logits = output . h
+//
+// and the MTP block (the one after the main layers), which drafts the token after `token` from the h of the token
+// before it - the main model's h_nextn, or the MTP block's own when drafting a chain:
+//
+//     x = eh_proj . [rms_norm(embed[token]) * enorm ; rms_norm(h) * hnorm]
+//     x = mtp_block(x)                                                      (glm_mtp_layer_decode: no mHC)
+//     h' = rms_norm(x) * head_norm;  logits = head . h'
+//
+// embed, head and head_norm are the MTP block's own (nextn.embed_tokens, shared_head_head, shared_head_norm) where
+// the file has them, else the model's.
+//
+// What this is not yet: one token a call (no prompt path), the experts all on the device (the real file is 157 GB),
+// nothing captured (the step is on the device; mla_kv_store's row is still a host argument), and no loader.
+#pragma once
+
+#include "strata/core/geometry_glm5_next.hpp"
+#include "strata/glm/glm_layer.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace strata::glm {
+
+/// A GGUF token-embedding table on the device: n_vocab rows of n_embd values, `row_bytes` a row, any type
+/// iq_embed_rows reads (kernels::embed_type_supported).
+struct GlmEmbedding {
+    int type = -1;
+    const void* data = nullptr;
+    size_t row_bytes = 0;
+};
+
+struct GlmModelWeights {
+    GlmEmbedding tok_embd;
+    const float* output_norm = nullptr;
+    GlmLinear output;                        ///< n_embd -> n_vocab
+    std::vector<GlmLayerWeights> blocks;     ///< n_blocks(): the main layers, then the MTP block's
+
+    // the MTP block's own: none of it is needed unless mtp_decode is called (eh_proj.data null = no MTP)
+    GlmLinear eh_proj;                       ///< nextn.eh_proj: 2 n_embd -> n_embd
+    const float *enorm = nullptr, *hnorm = nullptr;
+    GlmEmbedding mtp_embd;                   ///< nextn.embed_tokens; data null = tok_embd
+    GlmLinear mtp_head;                      ///< nextn.shared_head_head; data null = output
+    const float* mtp_head_norm = nullptr;    ///< nextn.shared_head_norm; null = output_norm
+};
+
+/// The model's state (every block's caches and recurrent state) and buffers for a context of max_ctx cells.
+class GlmModel {
+public:
+    GlmModel() = default;
+    ~GlmModel();
+    GlmModel(const GlmModel&) = delete;
+    GlmModel& operator=(const GlmModel&) = delete;
+
+    /// Checks every weight against the geometry (glm_layer_check) and allocates; the weights must outlive the model.
+    bool init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err);
+    /// A new sequence: the KDA conv histories and recurrent states zeroed (the caches are written before read).
+    void reset(void* stream);
+
+    /// The token at `pos` through the model: logits() and h_nextn() hold the result when the stream gets there.
+    bool decode(int32_t token, int64_t pos, void* stream, std::string& err);
+    bool has_mtp() const { return has_mtp_; }
+    /// The MTP block for `token` at `pos`, reading h [n_embd] (device; h_nextn() of the token before, or mtp_h() to
+    /// draft on): mtp_logits() and mtp_h() hold the result.  The block keeps its own caches by `pos`.
+    bool mtp_decode(int32_t token, int64_t pos, const float* h, void* stream, std::string& err);
+
+    const float* logits() const { return logits_; }          ///< device [n_vocab]
+    const float* h_nextn() const { return h_; }               ///< device [n_embd]
+    const float* mtp_logits() const { return mtp_logits_; }  ///< device [n_vocab]
+    const float* mtp_h() const { return mtp_h_; }             ///< device [n_embd]
+
+    int64_t max_ctx() const { return max_ctx_; }
+    const GlmLayerState& state(int64_t il) const { return states_[(size_t) il]; }
+    const GlmContext& context() const { return ctx_; }
+    /// A test's view: when set, decode copies the streams X to taps [n_layers + 1][4][n_embd] (device) after
+    /// mhc_init and after every main block.
+    void set_taps(float* taps) { taps_ = taps; }
+
+private:
+    core::Glm5NextGeometry g_;
+    GlmModelWeights w_;
+    GlmContext ctx_;
+    std::vector<GlmLayerState> states_;
+    bool has_mtp_ = false;
+    int64_t max_ctx_ = 0;
+    void* state_arena_ = nullptr;
+    void* buf_arena_ = nullptr;
+    int32_t* tok_ = nullptr;
+    float *e_ = nullptr, *x_ = nullptr, *h_ = nullptr, *logits_ = nullptr;
+    float *xm_ = nullptr, *mtp_h_ = nullptr, *mtp_logits_ = nullptr;
+    float* taps_ = nullptr;
+
+    bool start(int32_t token, int64_t pos, const char* who, void* stream, std::string& err);
+};
+
+}  // namespace strata::glm
