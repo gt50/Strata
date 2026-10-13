@@ -160,6 +160,8 @@ int bench_file(const char* shard, int64_t slots) {
 /// Teacher-forced instead, when PROMPT_IDS has a second line P (the format OUT_PREFIX.ids has): the first P ids through
 /// prompt(), then every later id through decode() whatever the model would have chosen, a row of logits before each -
 /// a text's per-position predictions (perplexity) on the path serving takes.  N_NEW is then not used.
+/// STRATA_GLM_TOP_K=N replaces the indexer's top_k (cells; a multiple of 4): one above the context reads every cell,
+/// for how much the sparse selection changes a long text's logits.
 int logits_real(const char* shard, const char* ids_path, const std::string& out, int n_new, int64_t slots) {
     try {
         std::vector<int32_t> ids, forced;
@@ -198,6 +200,10 @@ int logits_real(const char* shard, const char* ids_path, const std::string& out,
         if (const std::string e = strata::read_geometry(m.meta(), g); !e.empty()) {
             std::fprintf(stderr, "geometry: %s\n", e.c_str());
             return 1;
+        }
+        if (const char* e = std::getenv("STRATA_GLM_TOP_K")) {
+            g.idx_top_k = std::atoll(e);
+            std::printf("indexer top_k %lld (STRATA_GLM_TOP_K)\n", (long long) g.idx_top_k);
         }
         glm::GlmLoadOptions opt;
         opt.expert_cache_slots = slots;

@@ -296,6 +296,26 @@ llama.cpp's own two paths as much as for Strata. One position is further apart t
 the digit after "Q2_0 用的是引擎 " in the Chinese README (a version number), where Strata puts `2` first (0.374) and
 llama.cpp `57` (0.249); 99% of positions are under KL 0.14.
 
+**Past the indexer's 2,048 cells.** Two texts of 4,096 tokens, English prose (docs/DETAILS.md) and Python
+(serve/server.py), P = 3,712: each of the 768 scored queries has 3,712 to 4,095 cells and reads 2,048 of them (the best
+512 pools of 4) and the tail. llama.cpp's `glm5-next` makes the same selection. `STRATA_GLM_TOP_K=8192` makes
+Strata read every cell instead, to see whether the comparison notices the selection at all:
+
+| | Same top token | KL mean | KL median | KL max | Perplexity English / Python / both |
+| --- | --- | --- | --- | --- | --- |
+| Strata against llama.cpp, one batch | 726 of 768 (94.5%) | 0.0184 | 0.0101 | 0.456 | 14.203 / 3.895 / 7.438 |
+| Strata reading every cell, against llama.cpp | 710 of 768 (92.4%) | 0.0248 | 0.0145 | 0.594 | 14.258 / 3.830 / 7.390 |
+| llama.cpp, one batch | | | | | 14.260 / 3.932 / 7.488 |
+
+Past 2,048 cells Strata is as close to llama.cpp as on the short texts. Reading every cell moves it away: with the
+selection Strata is closer to llama.cpp at 519 of 768 positions, by KL 0.0065 on average (95% bootstrap interval
+0.0040-0.0089). So the comparison sees the selection, and Strata's matches llama.cpp's. Reading every cell is not
+better text prediction either: lower perplexity on the Python, higher on the English.
+
+Each text took Strata 934-943 s on the 8060S after loading: about 720 s for the 3,712-token prompt (in 256-token
+chunks, each reading most of the experts from the SSD again), then 1.8 tokens/s through decode. llama.cpp's CPU build
+took 270-280 s for the whole 4,096 as one batch, loading included, reading each expert once.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -318,8 +338,8 @@ python tools/test_setup_glm.py
 
 - Per-layer slot shares (prompt misses 60% -> 48% in the replay above, decode 18.3% -> 17.6%): they need a
   per-layer table measured on the model; the shares were not learned well online.
-- Quality on long contexts (the comparison above is 450 tokens; the MLA indexer selects from 2,048 cells only past
-  that), and with thinking on.
+- Quality with thinking on, and on contexts much longer than 4,096 tokens (where the selection keeps a smaller share).
+- Long prompts: 3,712 tokens take about 12 minutes, the experts read again for every 256-token chunk.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
   lines while a prompt is read.
