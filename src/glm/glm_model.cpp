@@ -46,7 +46,22 @@ bool launched(const char* who, std::string& err) {
 
 }  // namespace
 
+void GlmModel::drop_graph() {
+    if (graph_exec_) cudaGraphExecDestroy((cudaGraphExec_t) graph_exec_);
+    if (graph_) cudaGraphDestroy((cudaGraph_t) graph_);
+    graph_exec_ = graph_ = nullptr;
+    graph_warm_ = false;
+}
+
+void GlmModel::set_decode_graph(bool on) {
+    graph_on_ = on;
+    if (!on) drop_graph();
+}
+
 GlmModel::~GlmModel() {
+    drop_graph();
+    if (pinned_) cudaFreeHost(pinned_);
+    if (staged_) cudaEventDestroy((cudaEvent_t) staged_);
     if (state_arena_) cudaFree(state_arena_);
     if (buf_arena_) cudaFree(buf_arena_);
 }
@@ -173,7 +188,66 @@ void GlmModel::tap_main(int64_t n, void* stream) {
 
 bool GlmModel::decode(int32_t token, int64_t pos, void* stream, std::string& err) {
     pending_pos_ = -1;   // the caller drafts on from here (mtp_decode fills the MTP block's rows)
-    if (!start(token, pos, "GlmModel::decode", stream, err)) return false;
+    const bool graph = graph_on_ && graph_warm_ && !ctx_.expert_provider && stream;
+    if (!graph) {
+        if (!start(token, pos, "GlmModel::decode", stream, err)) return false;
+        if (graph_on_) graph_warm_ = true;   // the next decode may capture
+        return decode_body(stream, err);
+    }
+    if (pos < 0 || pos >= max_ctx_ || token < 0 || token >= g_.n_vocab) {
+        err = "GlmModel::decode: token " + std::to_string(token) + " at " + std::to_string(pos) +
+              ", outside the vocabulary or the context of " + std::to_string(max_ctx_);
+        return false;
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (!pinned_) {
+        if (cudaHostAlloc((void**) &pinned_, 64 * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess ||
+            cudaEventCreateWithFlags((cudaEvent_t*) &staged_, cudaEventDisableTiming) != cudaSuccess) {
+            cudaGetLastError();
+            err = "GlmModel::decode: the graph's pinned staging";
+            return false;
+        }
+    } else {
+        cudaEventSynchronize((cudaEvent_t) staged_);   // the last token's copies have read the staging
+    }
+    // the token and its step: copied on the stream ahead of the graph, no host wait
+    pinned_[0] = token;
+    cudaMemcpyAsync(tok_, pinned_, sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    ctx_.stage_pos(pos, pinned_ + 1, stream);
+    cudaEventRecord((cudaEvent_t) staged_, s);
+    ctx_.sel_valid = false;
+    if (graph_exec_ && graph_stream_ != stream) drop_graph();
+    if (!graph_exec_) {
+        cudaGraph_t gr = nullptr;
+        if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            cudaGetLastError();
+            err = "GlmModel::decode: the capture would not start";
+            return false;
+        }
+        const bool ok = decode_body(stream, err);
+        const cudaError_t e = cudaStreamEndCapture(s, &gr);
+        if (!ok || e != cudaSuccess) {
+            if (gr) cudaGraphDestroy(gr);
+            cudaGetLastError();
+            if (ok) err = std::string("GlmModel::decode: the capture: ") + cudaGetErrorString(e);
+            return false;
+        }
+        cudaGraphExec_t ex = nullptr;
+        if (cudaGraphInstantiate(&ex, gr, 0) != cudaSuccess) {
+            cudaGraphDestroy(gr);
+            cudaGetLastError();
+            err = "GlmModel::decode: the graph would not instantiate";
+            return false;
+        }
+        graph_ = gr;
+        graph_exec_ = ex;
+        graph_stream_ = stream;
+    }
+    if (cudaGraphLaunch((cudaGraphExec_t) graph_exec_, s) != cudaSuccess) return launched("GlmModel::decode", err);
+    return true;
+}
+
+bool GlmModel::decode_body(void* stream, std::string& err) {
     const int D = (int) g_.n_embd;
     const size_t xb = (size_t) 4 * D * sizeof(float);
     const cudaStream_t s = (cudaStream_t) stream;

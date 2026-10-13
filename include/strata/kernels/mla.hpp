@@ -46,8 +46,10 @@ void mla_head_gemv(const float* x, const uint16_t* w, float* y, int heads, int n
 /// latent = rms_norm(kv) * gamma for n_tok tokens, stored as FP16 bits into cache rows row0 .. row0 + n_tok - 1.
 /// kv [n_tok][L] FP32 (x @ wkv_a_mqa), gamma (L,) = attn_kv_a_norm.  The norm is FP32 like build_norm's; the cache
 /// keeps the rounded row, which is what the attention then reads, the current token's included.
+/// With `step` (device, one token) the row is step[kStepPos] instead of row0, so a captured decode step writes the
+/// token's row at every replay.
 void mla_kv_store(const float* kv, const float* gamma, float eps, uint16_t* cache, int64_t row0, int n_tok,
-                  void* stream);
+                  void* stream, const int32_t* step = nullptr);
 
 /// Scratch floats mla_decode_attn needs for up to `max_sel` selected positions.
 uint64_t mla_decode_attn_scratch_floats(int heads, int64_t max_sel);

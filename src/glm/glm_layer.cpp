@@ -119,6 +119,13 @@ bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::str
     return true;
 }
 
+void GlmContext::stage_pos(int64_t pos, int32_t* pinned, void* stream) {
+    k::kpool_step(pos, top_k_, select_tail_, pinned);
+    cudaMemcpyAsync(step, pinned, k::kStepCount * sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    pos_ = pos;
+    n_ = 1;
+}
+
 void GlmContext::set_positions(int64_t pos0, int64_t n, void* stream) {
     std::vector<int32_t> st((size_t) (n * k::kStepCount));
     for (int64_t t = 0; t < n; ++t) k::kpool_step(pos0 + t, top_k_, select_tail_, &st[(size_t) (t * k::kStepCount)]);
@@ -241,8 +248,8 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
     k::rms_norm_weighted(ctx.qr, w.q_a_norm, n, g.q_lora_rank, rms_eps, stream);
     lin(w.wq_b, ctx.qr, ctx.q);
     lin(w.wkv_a, ctx.h, ctx.kv);
-    // (the one argument that still comes from the host: mla_kv_store's row)
-    k::mla_kv_store(ctx.kv, w.kv_a_norm, rms_eps, st.latent, ctx.pos_, n, stream);
+    // one token: the row from the device step (a captured decode step writes the right one at every replay)
+    k::mla_kv_store(ctx.kv, w.kv_a_norm, rms_eps, st.latent, ctx.pos_, n, stream, n == 1 ? ctx.step : nullptr);
     k::mla_head_gemv(ctx.q, w.k_b, ctx.q_abs, H, DK, L, n, stream);
     if (full_indexer(g, il)) {
         lin(w.idx_q_b, ctx.qr, ctx.iq);

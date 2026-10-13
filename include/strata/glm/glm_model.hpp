@@ -81,6 +81,19 @@ public:
 
     /// The token at `pos` through the model: logits() and h_nextn() hold the result when the stream gets there.
     bool decode(int32_t token, int64_t pos, void* stream, std::string& err);
+    /// Decode as one captured graph: the token and its step are staged through pinned memory and copied without a
+    /// host wait, and the step itself - the embedding, every main block, the head - replays as one launch.  The
+    /// first decode after this runs as it always does (any first-use setup outside the capture); the second is
+    /// captured; the rest replay.  The same results bit for bit.  Not with an expert provider (a cache answers on the
+    /// host in the middle of the step: those decodes run as before); a stream of the caller's own (not the default
+    /// one).  Changing the taps drops the graph.
+    ///
+    /// Measured on the Radeon 8060S (glm_graph_parity --bench 45: GLM-5.3-Flash's shapes, 45 layers, 8 resident
+    /// IQ4_XS experts a layer): 72.5-74.5 ms a token either way - the step reads 9.6 GB of weights (131 GB/s), and the
+    /// ~2000 launches hide under that.  The graph is for the steps the host must not wait on (a verify window, a
+    /// faster card), not for this one.
+    void set_decode_graph(bool on);
+    bool decode_graph_ready() const { return graph_exec_ != nullptr; }
     /// The n tokens at pos0 .. pos0 + n - 1 (a prompt, or its next part) through the main layers, max_chunk tokens a
     /// call: every block's state and caches advance as n decode() calls would advance them, by the prompt kernels;
     /// logits() and h_nextn() hold the last token's.
@@ -106,7 +119,10 @@ public:
     const GlmLayerState& state(int64_t il) const { return states_[(size_t) il]; }
     const GlmContext& context() const { return ctx_; }
     /// A test's view of the calls (GlmTaps); null stops it.
-    void set_taps(GlmTaps* taps) { taps_ = taps; }
+    void set_taps(GlmTaps* taps) {
+        taps_ = taps;
+        drop_graph();
+    }
 
 private:
     core::Glm5NextGeometry g_;
@@ -121,6 +137,15 @@ private:
     float *e_ = nullptr, *x_ = nullptr, *h_ = nullptr, *logits_ = nullptr;
     float *xm_ = nullptr, *mtp_h_ = nullptr, *mtp_logits_ = nullptr;
     GlmTaps* taps_ = nullptr;
+    // the captured decode step
+    bool graph_on_ = false, graph_warm_ = false;
+    void* graph_ = nullptr;        ///< cudaGraph_t
+    void* graph_exec_ = nullptr;   ///< cudaGraphExec_t
+    void* graph_stream_ = nullptr;
+    int32_t* pinned_ = nullptr;    ///< the token and the step, staged
+    void* staged_ = nullptr;       ///< cudaEvent_t: the staging copies have run
+    void drop_graph();
+    bool decode_body(void* stream, std::string& err);   ///< the step once tok_ and the step are on the device
     bool mtp_prompt_ = true;
     int64_t pending_pos_ = -1;   ///< a prompt's last position, its MTP row waiting for the next token
     float *hall_ = nullptr, *eb_ = nullptr, *h_pending_ = nullptr;

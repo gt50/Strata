@@ -11,10 +11,10 @@
 // The MTP block (after the main layers) is the same two sublayers around a plain residual instead of the mHC
 // (glm_mtp_layer_decode); glm_model.hpp runs the whole model around these.
 //
-// What it is not yet: one token (decode), one layer a call, the weights already on the device in their GGUF form
-// (GlmLinear) with the small exceptions listed on GlmLayerWeights.  No loader, no prompt path, no capture: the
-// per-token values are in the step (GlmContext::set_pos), so the kernels' argument lists are constant across tokens
-// except mla_kv_store's row, but nothing here captures yet.
+// The weights are on the device in their GGUF form (GlmLinear) with the small exceptions listed on GlmLayerWeights
+// (glm_loader.hpp puts them there).  A decode step's per-token values are in the device step (GlmContext::set_pos /
+// stage_pos), so its kernels' argument lists are the same at every token and it can be captured
+// (GlmModel::set_decode_graph).
 #pragma once
 
 #include "strata/core/geometry_glm5_next.hpp"
@@ -116,6 +116,9 @@ public:
     /// `stream`: the tokens the next layer calls run.  n <= max_tokens; set_pos is the one-token case.
     void set_positions(int64_t pos0, int64_t n, void* stream);
     void set_pos(int64_t pos, void* stream) { set_positions(pos, 1, stream); }
+    /// The one-token step for `pos` written to `pinned` (page-locked host memory, kStepCount values) and copied from
+    /// there on `stream` without waiting: the caller keeps `pinned` until the copy has run (a captured decode).
+    void stage_pos(int64_t pos, int32_t* pinned, void* stream);
     int64_t max_ctx() const { return max_ctx_; }
     int64_t max_tokens() const { return max_tokens_; }
     int64_t tokens() const { return n_; }

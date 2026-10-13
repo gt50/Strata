@@ -64,7 +64,9 @@ __global__ void __launch_bounds__(256) mla_head_gemv_kernel(const float* __restr
 
 /// A block per token: the row's RMS (FP32, over L), then the scaled row rounded to FP16 into the cache.
 __global__ void __launch_bounds__(256) mla_kv_store_kernel(const float* __restrict__ kv, const float* __restrict__ gamma,
-                                                           float eps, uint16_t* __restrict__ cache, int64_t row0) {
+                                                           float eps, uint16_t* __restrict__ cache, int64_t row0,
+                                                           const int32_t* __restrict__ step) {
+    if (step) row0 = step[kStepPos];
     __shared__ float part[8];
     const int t = blockIdx.x, tid = threadIdx.x;
     const float2 v = reinterpret_cast<const float2*>(kv + (size_t) t * L)[tid];
@@ -301,12 +303,12 @@ void mla_head_gemv(const float* x, const uint16_t* w, float* y, int heads, int n
 }
 
 void mla_kv_store(const float* kv, const float* gamma, float eps, uint16_t* cache, int64_t row0, int n_tok,
-                  void* stream) {
-    if (!kv || !gamma || !cache || row0 < 0 || n_tok <= 0) {
+                  void* stream, const int32_t* step) {
+    if (!kv || !gamma || !cache || row0 < 0 || n_tok <= 0 || (step && n_tok != 1)) {
         std::fprintf(stderr, "mla_kv_store: invalid arguments\n");
         std::exit(1);
     }
-    mla_kv_store_kernel<<<(unsigned) n_tok, 256, 0, (cudaStream_t) stream>>>(kv, gamma, eps, cache, row0);
+    mla_kv_store_kernel<<<(unsigned) n_tok, 256, 0, (cudaStream_t) stream>>>(kv, gamma, eps, cache, row0, step);
     check_launch("mla_kv_store");
 }
 
