@@ -1,8 +1,8 @@
 // include/strata/kernels/glm_linear.hpp - one GLM-5.3-Flash projection on its GGUF weight as it is, whatever the
 // type, and the small pieces of glue the GLM layer needs between kernels.
 //
-// The type picks the kernel: F32 a warp per output row (glm_linear's own); BF16 bf16_gemv_fp32_mmvf_cols (FP32
-// activations); the types native_mmvq takes (Q4_0, Q5_0, Q8_0, Q2_0, Q3_K .. Q6_K, IQ4_NL, IQ4_XS) on q8_1
+// The type picks the kernel: F32 a block per output row (glm_linear's own); BF16 bf16_gemv_fp32_mmvf_cols (FP32
+// activations), or for one token on rows of at most 2048 (a multiple of 128) glm_linear's own, 16 lanes a row; the types native_mmvq takes (Q4_0, Q5_0, Q8_0, Q2_0, Q3_K .. Q6_K, IQ4_NL, IQ4_XS) on q8_1
 // activations, llama.cpp's CUDA contract; the other i-quants through iq_mmvq, also on q8_1.  Which one a type takes is
 // glm_linear_kind, so a loader can refuse a file before allocating anything.
 #pragma once

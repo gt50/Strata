@@ -55,6 +55,51 @@ __global__ void __launch_bounds__(256) f32_gemv_kernel(const float* __restrict__
     }
 }
 
+/// v from lane (lane ^ M), M < 16: within a row of 16 lanes - on AMD a DPP row_xmask move, elsewhere a shuffle.
+template <int M> __device__ __forceinline__ float lane_xor16(float v) {
+    static_assert(M > 0 && M < 16, "within a row of 16 lanes");
+#if defined(__HIP_PLATFORM_AMD__) && defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x160 + M, 0xf, 0xf,
+                                                                 false));
+#else
+    return __shfl_xor_sync(0xffffffffu, v, M);
+#endif
+}
+
+__device__ __forceinline__ float bf16_lo(uint32_t v) { return __uint_as_float(v << 16); }
+__device__ __forceinline__ float bf16_hi(uint32_t v) { return __uint_as_float(v & 0xffff0000u); }
+
+/// One token through BF16 rows of a few hundred values (KDA's f_b and g_b: 8192 rows of 128): 16 lanes a row, 8
+/// values (16 bytes) a lane a step, 16 rows a block of 256.  bf16_gemv_fp32_mmvf's block of 64 a row ran 8192 blocks
+/// of 256 bytes each: 14 us for the 2 MB on the 8060S.
+constexpr int kBf16RowLanes = 16;
+__global__ void __launch_bounds__(256) bf16_short_rows_kernel(const uint16_t* __restrict__ w,
+                                                              const float* __restrict__ x, float* __restrict__ y,
+                                                              int n_in, int64_t n_out) {
+    const int sub = threadIdx.x & (kBf16RowLanes - 1);
+    const int64_t row = (int64_t) blockIdx.x * (256 / kBf16RowLanes) + (threadIdx.x / kBf16RowLanes);
+    const int64_t r = row < n_out ? row : n_out - 1;   // every lane takes part in the exchanges
+    const uint16_t* wr = w + r * n_in;
+    float acc = 0.0f;
+    for (int c = sub * 8; c < n_in; c += kBf16RowLanes * 8) {
+        const uint4 wv = *reinterpret_cast<const uint4*>(wr + c);
+        const float4 x0 = *reinterpret_cast<const float4*>(x + c), x1 = *reinterpret_cast<const float4*>(x + c + 4);
+        acc = fmaf(bf16_lo(wv.x), x0.x, acc);
+        acc = fmaf(bf16_hi(wv.x), x0.y, acc);
+        acc = fmaf(bf16_lo(wv.y), x0.z, acc);
+        acc = fmaf(bf16_hi(wv.y), x0.w, acc);
+        acc = fmaf(bf16_lo(wv.z), x1.x, acc);
+        acc = fmaf(bf16_hi(wv.z), x1.y, acc);
+        acc = fmaf(bf16_lo(wv.w), x1.z, acc);
+        acc = fmaf(bf16_hi(wv.w), x1.w, acc);
+    }
+    acc += lane_xor16<8>(acc);
+    acc += lane_xor16<4>(acc);
+    acc += lane_xor16<2>(acc);
+    acc += lane_xor16<1>(acc);
+    if (sub == 0 && row < n_out) y[row] = acc;
+}
+
 /// A block of 256 per row: the squares summed, then x = x w / rms in place (each thread its own values).
 __global__ void __launch_bounds__(256) glm_rms_norm_kernel(float* __restrict__ x, const float* __restrict__ w,
                                                            int64_t cols, float eps) {
@@ -135,6 +180,13 @@ void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* s
             check_launch("glm_linear (F32)");
             break;
         case kLinearBf16:
+            if (n_tok == 1 && w.n_in % (kBf16RowLanes * 8) == 0 && w.n_in <= 2048 &&
+                ((uintptr_t) w.data & 15) == 0 && ((uintptr_t) x & 15) == 0) {   // short rows, 16-byte loads
+                bf16_short_rows_kernel<<<(unsigned) ((w.n_out + 15) / 16), 256, 0, s>>>(
+                    (const uint16_t*) w.data, x, y, (int) w.n_in, w.n_out);
+                check_launch("glm_linear (BF16, short rows)");
+                break;
+            }
             for (int t0 = 0; t0 < n_tok; t0 += kNativeCols) {
                 const int nc = std::min(kNativeCols, n_tok - t0);
                 bf16_gemv_fp32_mmvf_cols(x + (int64_t) t0 * w.n_in, (const uint16_t*) w.data, y + (int64_t) t0 * w.n_out,
