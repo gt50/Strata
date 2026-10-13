@@ -43,47 +43,14 @@ int main(int argc, char** argv) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
         else { std::fprintf(stderr, "usage: glm_model_parity [--selftest]\n"); return 2; }
     }
-    Glm5NextGeometry g;
-    g.n_layers = 5; g.n_nextn = 1; g.n_embd = 1024; g.n_vocab = 2048; g.n_ctx_train = MAX_CTX;
-    g.rms_eps = 1e-5; g.norm_eps = 1e-6;
-    g.is_mla = {0, 1, 0, 1, 0, 1};
-    g.n_head = 8;
-    g.kda_head_dim = 128; g.ssm_d_conv = 4; g.has_kda_gate_lower_bound = true; g.kda_gate_lower_bound = -5;
-    g.q_lora_rank = 512; g.kv_lora_rank = 512; g.n_rot = 0; g.head_dim_k = 256; g.head_dim_v = 256;
-    g.idx_heads = 32; g.idx_key_dim = 128; g.idx_top_k = 2048; g.idx_kpool = 4; g.idx_kpool_select_tail = true;
-    g.idx_full = {1, 1, 1, 0, 1};
-    g.hc = 4; g.hc_sinkhorn_iters = 20; g.hc_eps = 1e-6;
-    g.n_dense_lead = 1; g.n_ff_dense = 512; g.n_expert = 16; g.n_expert_used = 4; g.n_expert_shared = 1;
-    g.n_ff_exp = 256; g.n_ff_shexp = 256; g.expert_gating = 2; g.expert_weights_scale = 2.5;
-    g.expert_weights_norm = true; g.swiglu_clamp_exp = 10; g.swiglu_clamp_shexp = 10;
+    TestModel tm = build_test_model(MAX_CTX);
+    const Glm5NextGeometry& g = tm.g;
+    vector<Block>& blocks = tm.blocks;
+    const Lin &tok = tm.tok, &out = tm.out, &eh = tm.eh;
+    const vector<float> &out_norm = tm.out_norm, &enorm = tm.enorm, &hnorm = tm.hnorm, &head_norm = tm.head_norm;
+    const glm::GlmModelWeights& w = tm.w;
     const int D = (int) g.n_embd, V = (int) g.n_vocab;
     const int64_t NL = g.n_layers, MTP = g.n_layers;
-
-    vector<Block> blocks((size_t) g.n_blocks());
-    for (int64_t il = 0; il < g.n_blocks(); ++il) {
-        Block& b = blocks[(size_t) il];
-        build_mhc(b, D, il < NL);
-        if (g.is_mla[(size_t) il]) build_mla_attn(b, g, full_idx(g, il));
-        else build_kda_attn(b, g);
-        if (il < g.n_dense_lead) build_dense_ffn(b, g);
-        else build_moe(b, g);
-        ref_state_zero(b, g, il, MAX_CTX);
-    }
-    // the model's own weights
-    const Lin tok = make_lin(23, D, V, std::sqrt((float) D));   // V rows of D: an embedding table, std ~1
-    const Lin out = make_lin(8, D, V);
-    const Lin eh = make_lin(30, 2 * D, D);
-    const vector<float> out_norm = gvec((size_t) D, 0.1f, 1.0f), enorm = gvec((size_t) D, 0.1f, 1.0f),
-                        hnorm = gvec((size_t) D, 0.1f, 1.0f), head_norm = gvec((size_t) D, 0.1f, 1.0f);
-    glm::GlmModelWeights w;
-    w.tok_embd = {23, tok.dev.data, k::iq_row_bytes(23, D)};
-    w.output_norm = up_f(out_norm);
-    w.output = out.dev;
-    for (const Block& b : blocks) w.blocks.push_back(b.w);
-    w.eh_proj = eh.dev;
-    w.enorm = up_f(enorm);
-    w.hnorm = up_f(hnorm);
-    w.mtp_head_norm = up_f(head_norm);
 
     int bad = 0;
     // the checks before anything is allocated: a weight missing, a projection of the wrong shape

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "strata/glm/glm_layer.hpp"
+#include "strata/glm/glm_model.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/kpool.hpp"
@@ -32,6 +33,12 @@ namespace k = strata::kernels;
 namespace glm = strata::glm;
 using strata::core::Glm5NextGeometry;
 using std::vector;
+
+// each test uses its own part of what follows
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
 
 namespace {
 
@@ -764,4 +771,69 @@ bool verify(const char* what, int64_t pos, long long il, Run run, Undo undo) {
     return good(f);
 }
 
+/// glm_model_parity's model, which glm_loader_parity writes to a GGUF: five layers (0 KDA + dense FFN, 1 MLA with its
+/// own indexer, 2 KDA, 3 MLA sharing 1's selection, 4 KDA; MoE from 1) and an MTP block, at n_embd 1024 with a
+/// vocabulary of 2048; an IQ4_XS embedding, a Q8_0 head, a BF16 eh_proj, the MTP block's own head norm.  Built in one
+/// fixed order from g_rng, so both tests get the same numbers.
+struct TestModel {
+    Glm5NextGeometry g;
+    vector<Block> blocks;
+    Lin tok, out, eh;
+    vector<float> out_norm, enorm, hnorm, head_norm;
+    glm::GlmModelWeights w;
+};
+[[maybe_unused]] TestModel build_test_model(int64_t max_ctx) {
+    TestModel tm;
+    Glm5NextGeometry& g = tm.g;
+    vector<Block>& blocks = tm.blocks;
+    g.n_layers = 5; g.n_nextn = 1; g.n_embd = 1024; g.n_vocab = 2048; g.n_ctx_train = max_ctx;
+    g.rms_eps = 1e-5; g.norm_eps = 1e-6;
+    g.is_mla = {0, 1, 0, 1, 0, 1};
+    g.n_head = 8;
+    g.kda_head_dim = 128; g.ssm_d_conv = 4; g.has_kda_gate_lower_bound = true; g.kda_gate_lower_bound = -5;
+    g.q_lora_rank = 512; g.kv_lora_rank = 512; g.n_rot = 0; g.head_dim_k = 256; g.head_dim_v = 256;
+    g.idx_heads = 32; g.idx_key_dim = 128; g.idx_top_k = 2048; g.idx_kpool = 4; g.idx_kpool_select_tail = true;
+    g.idx_full = {1, 1, 1, 0, 1};
+    g.hc = 4; g.hc_sinkhorn_iters = 20; g.hc_eps = 1e-6;
+    g.n_dense_lead = 1; g.n_ff_dense = 512; g.n_expert = 16; g.n_expert_used = 4; g.n_expert_shared = 1;
+    g.n_ff_exp = 256; g.n_ff_shexp = 256; g.expert_gating = 2; g.expert_weights_scale = 2.5;
+    g.expert_weights_norm = true; g.swiglu_clamp_exp = 10; g.swiglu_clamp_shexp = 10;
+    const int D = (int) g.n_embd, V = (int) g.n_vocab;
+    const int64_t NL = g.n_layers;
+
+    blocks.resize((size_t) g.n_blocks());
+    for (int64_t il = 0; il < g.n_blocks(); ++il) {
+        Block& b = blocks[(size_t) il];
+        build_mhc(b, D, il < NL);
+        if (g.is_mla[(size_t) il]) build_mla_attn(b, g, full_idx(g, il));
+        else build_kda_attn(b, g);
+        if (il < g.n_dense_lead) build_dense_ffn(b, g);
+        else build_moe(b, g);
+        ref_state_zero(b, g, il, max_ctx);
+    }
+    // the model's own weights
+    tm.tok = make_lin(23, D, V, std::sqrt((float) D));   // V rows of D: an embedding table, std ~1
+    tm.out = make_lin(8, D, V);
+    tm.eh = make_lin(30, 2 * D, D);
+    tm.out_norm = gvec((size_t) D, 0.1f, 1.0f);
+    tm.enorm = gvec((size_t) D, 0.1f, 1.0f);
+    tm.hnorm = gvec((size_t) D, 0.1f, 1.0f);
+    tm.head_norm = gvec((size_t) D, 0.1f, 1.0f);
+    const Lin &tok = tm.tok, &out = tm.out, &eh = tm.eh;
+    glm::GlmModelWeights& w = tm.w;
+    w.tok_embd = {23, tok.dev.data, k::iq_row_bytes(23, D)};
+    w.output_norm = up_f(tm.out_norm);
+    w.output = out.dev;
+    for (const Block& b : blocks) w.blocks.push_back(b.w);
+    w.eh_proj = eh.dev;
+    w.enorm = up_f(tm.enorm);
+    w.hnorm = up_f(tm.hnorm);
+    w.mtp_head_norm = up_f(tm.head_norm);
+    return tm;
+}
+
 }  // namespace
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
