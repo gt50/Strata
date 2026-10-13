@@ -30,7 +30,7 @@ uint64_t mhc_pre_scratch_floats(int n_tok, int n_embd);
 
 /// The pre half for n_tok tokens: h [n_tok][n_embd] = sum_i pre_i X[i], and the post weights [n_tok][4] and comb
 /// [n_tok][16] (comb[src * 4 + dst]) that mhc_post needs; pre [n_tok][4] too when non-null.  hc_scale (3,),
-/// hc_base (24,).  n_embd a multiple of 32.
+/// hc_base (24,).  n_embd a multiple of 32, at most 8192.
 ///
 /// norm_w (n_embd,), when set: the sublayer's own norm too, h = rms_norm(h) * norm_w with norm_eps - what
 /// rms_norm_weighted would do after it, (h w) / rms(h), in the same kernel (a GLM layer's attn_norm / ffn_norm; one
