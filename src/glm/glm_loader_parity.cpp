@@ -151,6 +151,77 @@ int bench_file(const char* shard, int64_t slots) {
     }
 }
 
+/// `--logits SHARD PROMPT_IDS OUT_PREFIX N_NEW [slots]`: the real model as serving runs it - the prompt's ids (a text
+/// file of integers) through prompt(), then N_NEW greedy tokens through decode() (stopping at an end token) - writing
+/// OUT_PREFIX.ids (every id, prompt and answer, as text) and OUT_PREFIX.logits (float32 [answer tokens][n_vocab]: row r
+/// the logits that chose answer token r).  For comparing with another implementation on the same ids
+/// (tools/glm_compare_logits.py).
+int logits_real(const char* shard, const char* ids_path, const std::string& out, int n_new, int64_t slots) {
+    try {
+        std::vector<int32_t> ids;
+        {
+            std::FILE* f = std::fopen(ids_path, "r");
+            if (!f) { std::fprintf(stderr, "%s: cannot open\n", ids_path); return 1; }
+            int v;
+            while (std::fscanf(f, "%d", &v) == 1) ids.push_back(v);
+            std::fclose(f);
+        }
+        const strata::GgufModel m = strata::GgufModel::open(shard);
+        Glm5NextGeometry g;
+        if (const std::string e = strata::read_geometry(m.meta(), g); !e.empty()) {
+            std::fprintf(stderr, "geometry: %s\n", e.c_str());
+            return 1;
+        }
+        glm::GlmLoadOptions opt;
+        opt.expert_cache_slots = slots;
+        glm::GlmLoadedWeights lw;
+        std::string err;
+        if (!lw.load(m, g, opt, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        glm::GlmModel model;
+        const int64_t n_prompt = (int64_t) ids.size();
+        if (!model.init(g, lw.weights(), n_prompt + n_new + 16, err, lw.expert_cache(), 256)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        model.set_mtp_over_prompt(false);
+        cudaStream_t s;
+        check(cudaStreamCreate(&s), "stream");
+        model.reset(s);
+        const size_t V = (size_t) g.n_vocab;
+        std::vector<float> row(V);
+        std::FILE* fl = std::fopen((out + ".logits").c_str(), "wb");
+        if (!fl) { std::fprintf(stderr, "%s.logits: cannot write\n", out.c_str()); return 1; }
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!model.prompt(ids.data(), n_prompt, 0, s, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        const std::vector<int32_t> ends = {154820, 154827, 154829};   // <|endoftext|> <|user|> <|observation|>
+        for (int t = 0; t < n_new; ++t) {
+            check(cudaMemcpyAsync(row.data(), model.logits(), V * 4, cudaMemcpyDeviceToHost, s), "logits");
+            check(cudaStreamSynchronize(s), "sync");
+            std::fwrite(row.data(), 4, V, fl);
+            const int32_t next = (int32_t) (std::max_element(row.begin(), row.end()) - row.begin());
+            ids.push_back(next);
+            if (std::find(ends.begin(), ends.end(), next) != ends.end() || t + 1 == n_new) break;
+            if (!model.decode(next, (int64_t) ids.size() - 1, s, err)) {
+                std::fprintf(stderr, "%s\n", err.c_str());
+                return 1;
+            }
+        }
+        std::fclose(fl);
+        std::FILE* fi = std::fopen((out + ".ids").c_str(), "w");
+        for (size_t i = 0; i < ids.size(); ++i) std::fprintf(fi, "%d%c", ids[i], i + 1 < ids.size() ? ' ' : '\n');
+        std::fprintf(fi, "%lld\n", (long long) n_prompt);   // second line: the prompt's length
+        std::fclose(fi);
+        std::printf("%lld prompt ids, %lld answer tokens in %.1f s\n", (long long) n_prompt,
+                    (long long) ids.size() - n_prompt,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        cudaStreamDestroy(s);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "%s\n", ex.what());
+        return 1;
+    }
+}
+
 /// `--bench`: GlmExpertCache at GLM-5.3-Flash's expert size (n_embd 4096, n_ff 2048, IQ4_XS: 13.4 MB a blob), one
 /// layer of 32 experts written to a GGUF and mapped (its pages are in the OS cache after the write: a warm file).
 /// The copy of a call's 8 misses into device or mapped host slots by 1, 4 and 8 threads, and a call whose 8 experts
@@ -303,11 +374,17 @@ int main(int argc, char** argv) {
         if (a == "--selftest") selftest = true;
         else if (a == "--plan" && i + 1 < argc) return plan_real(argv[++i]);
         else if (a == "--bench") return bench();
-        else if (a == "--bench-file" && i + 1 < argc) {
+        else if (a == "--logits" && i + 4 < argc) {
+            const char* shard = argv[i + 1];
+            const char* ids = argv[i + 2];
+            const std::string out = argv[i + 3];
+            const int n_new = std::atoi(argv[i + 4]);
+            return logits_real(shard, ids, out, n_new, i + 5 < argc ? std::atoll(argv[i + 5]) : 4000);
+        } else if (a == "--bench-file" && i + 1 < argc) {
             const char* shard = argv[++i];
             return bench_file(shard, i + 1 < argc ? std::atoll(argv[i + 1]) : 1024);
         } else {
-            std::fprintf(stderr, "usage: glm_loader_parity [--selftest] | --plan SHARD | --bench | --bench-file SHARD [slots]\n");
+            std::fprintf(stderr, "usage: glm_loader_parity [--selftest] | --plan SHARD | --bench | --bench-file SHARD [slots] | --logits SHARD PROMPT_IDS OUT N_NEW [slots]\n");
             return 2;
         }
     }

@@ -16,7 +16,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 
 | | |
 | --- | --- |
-| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s and 4-12 s for a 20-token prompt, bound by reading experts from the SSD |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s and 4-12 s for a 20-token prompt, bound by reading experts from the SSD; its next-token choices match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)) |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
@@ -245,6 +245,34 @@ the MTP block over every prompt even without drafts (`--spec 0`), reading its ex
 with drafts. Measured on trace B's requests: prompt misses 14,943 -> 14,248, prompt time about 5% less, an answer's
 misses 18,880 -> 18,364.
 
+## Against llama.cpp on the same file
+
+Upstream llama.cpp (commit 1b70350, which has `glm5-next`; `third_party/llama.cpp` predates it), built for the CPU
+- the reference, no GPU kernels - against Strata on the same UD-IQ4_XS file and the same token ids:
+
+1. `glm_loader_parity --logits SHARD PROMPT OUT 48` runs a prompt as serving does (the prompt path, then 48 greedy
+   tokens through decode) and writes the ids and every answer position's logits.
+2. `tools/glm_compare/llama_logits` (build it with `tools/glm_compare/CMakeLists.txt` against a llama.cpp checkout)
+   runs the same ids teacher-forced: the whole sequence as one batch, or with `ubatch` 1 one token at a time, as
+   decoding does.
+3. `tools/glm_compare_logits.py` compares the rows: the same top token, KL(llama.cpp || Strata), the top-5 overlap.
+
+Four prompts, thinking off (the capital of France, a French translation, three sentences on the Great Wall in Chinese,
+a SQL query), 152 answer positions:
+
+| | Same top token | KL mean | KL median | KL max |
+| --- | --- | --- | --- | --- |
+| Strata against llama.cpp, one token at a time | 151 of 152 (99.3%) | 0.0041 | 0.0001 | 0.132 |
+| Strata against llama.cpp, one batch | 149 of 152 (98.0%) | 0.0101 | 0.0000 | 0.826 |
+| llama.cpp one token at a time against llama.cpp one batch | 149 of 152 (98.0%) | 0.0103 | 0.0001 | 0.843 |
+
+So Strata differs from llama.cpp's batch exactly as much as llama.cpp's own two paths differ from each other, and is
+closer than that to llama.cpp's decoding. The differences are at near ties (the one disagreement left: a Chinese word,
+0.289 against 0.264) and at one knife-edge position: after `GROUP BY c.id, c.name` in the SQL answer the model picks
+a second `GROUP` - Strata decoding 0.536, llama.cpp decoding 0.745, while llama.cpp's batch puts `JOIN` first (0.572)
+and Strata's prompt path `GROUP` (0.564). The doubled `GROUP BY` that answer shows is the model's own choice when
+decoding, not Strata's.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -267,7 +295,7 @@ python tools/test_setup_glm.py
 
 - Per-layer slot shares (prompt misses 60% -> 48% in the replay above, decode 18.3% -> 17.6%): they need a
   per-layer table measured on the model; the shares were not learned well online.
-- Quality against llama.cpp on the same file.
+- A longer quality comparison (perplexity over a text, more prompts) than the 152 positions above.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
   lines while a prompt is read.
