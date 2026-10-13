@@ -68,6 +68,7 @@ HF_REVISIONS = {
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "b22d729eae29b5796f76fb70f91aef549b9fc52c",   # 2026-09-24
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    "unsloth/GLM-5.3-Flash-GGUF": "a38483c8cd5df544f53d70fb281afe97369d5ab6",                        # 2026-10-05
 }
 
 
@@ -252,6 +253,24 @@ UNSLOTH_IQ4_XS_SHARDS = {
     "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf":
         (43836407744, "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"),
 }
+# EXPERIMENTAL: Z.ai's GLM-5.3-Flash (llama.cpp's architecture glm5-next), Unsloth's UD-IQ4_XS: five shards at the pinned
+# revision (sizes and SHA-256: the Hub's LFS pointers).  It runs on its own engine path (install_glm, src/glm).
+GLM_SHARDS = {
+    "GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf":
+        (9429984, "c2f3b6ab98d3df844f322ea376059202d2eaeedcee1f0eff455345b86a137dbd"),
+    "GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf":
+        (49989334176, "7d64cf0395672c4322012841abec502ea7e20518299bb5e3069003f06f9e6de9"),
+    "GLM-5.3-Flash-UD-IQ4_XS-00003-of-00005.gguf":
+        (49607025280, "7c2c63c9c30f8060428fdf2ac935dbf2ee9ad8f771d62b6ae47a7f7f2c1520e7"),
+    "GLM-5.3-Flash-UD-IQ4_XS-00004-of-00005.gguf":
+        (49486530144, "06c90f191871317c92dd9d25a353b687aed44c50f3ac6c713e9fe410bc2d26dd"),
+    "GLM-5.3-Flash-UD-IQ4_XS-00005-of-00005.gguf":
+        (7729791616, "66ebf9ec85e04d3f44af674ae4f694acbc89cc53db75e42f2f4d3646bf321c0d"),
+}
+GLM_ENGINE_MARK = b"arch=glm5-next"    # in every engine that serves GLM (the format string of its INFO line)
+GLM_TRAINED_CTX = 1048576              # glm5-next.context_length
+GLM_CONTEXTS = [8192, 32768, 65536, 131072, 262144]
+GLM_CONTEXT_DEFAULT = 32768            # the GLM engine's own --max-context default
 UNSLOTH_ENGINE = (0, 1, 32)     # the first engine setup configures for UD-Q4_K_XL (0.1.31 ran it by hand)
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
 # Contexts past 262144 (the model's trained length) extend it by rope scaling: for the context it will
@@ -297,6 +316,15 @@ FAMILIES = {
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
+    # EXPERIMENTAL: another model on its own engine path (install_glm): none of the questions below apply, and its
+    # sizes are its own ("models"), not MODELS' (its UD-IQ4_XS is not the Qwen one)
+    "glm": {"title": "GLM-5.3-Flash", "by": "Z.ai; Unsloth's ~4-bit quantization",
+            "about": "another model (288 experts, 1M-token context), a 157 GB download; not run whole on Strata yet",
+            "hf": hf("unsloth/GLM-5.3-Flash-GGUF") + "{q}/", "file": "GLM-5.3-Flash-{q}-0000{i}-of-00005.gguf",
+            "shards": 5, "tag": "glm-", "name": "glm-5.3-flash", "experimental": True,
+            "license": "MIT (the GGUF's general.license): https://huggingface.co/zai-org/GLM-5.3-Flash",
+            "sha256": GLM_SHARDS,
+            "models": {"UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic)", "download_gb": 156.8}}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -4336,6 +4364,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             "api key" if k == "api_key" else ("the browser opens" if v else "no browser") if k == "open_browser"
             else f"{k.replace('_', ' ')} {v}" for k, v in keep.items()))
     cfg_path.touch()                                     # the most recently used model
+    if is_glm_config(cfg) and isinstance(gpu, list):
+        fail("GLM-5.3-Flash runs on one GPU so far", "start it on one card: --gpu N")
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
@@ -4420,7 +4450,15 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     say("  " + "-" * 100)
     size = f'about {gb:.0f} GB' if gb >= 1 else '34-55 GB'
     a_ = cfg["args"]
-    if "--mmap-experts" in a_ and "--resident-budget-gib" not in a_ and "--resident-experts" not in a_:
+    if is_glm_config(cfg) and "--native" in a_[:-1]:     # every shard of the model, mapped
+        first = Path(a_[a_.index("--native") + 1])
+        m = SHARD_NAME.search(first.name)
+        files = sorted(first.parent.glob(first.name[:m.start()] + "-*-of-*.gguf")) if m else [first]
+        gb = sum(f.stat().st_size for f in files if f.is_file()) / 1e9
+        say(f"  Starting {cfg.get('model_name', 'the model')}: it maps the model files (about {gb:.0f} GB), copies its "
+            "other weights and as many experts as fit to the GPU, and reads the rest of the experts from the files as "
+            "it answers.")
+    elif "--mmap-experts" in a_ and "--resident-budget-gib" not in a_ and "--resident-experts" not in a_:
         # #505: the mapped low-RAM mode loads nothing into RAM up front (the server's narrator says the same)
         say(f"  Starting {cfg.get('model_name', 'the model')}: it maps {size} of experts from the model files (the OS "
             "file cache reads them).")
@@ -4824,9 +4862,217 @@ def sycl_setup(argv) -> int:
     return subprocess.call([sys.executable, str(script), *rest])
 
 
+def get_engine(a, gpu, hip, amd, vision, cuda_tk):
+    """Step 4: the engine - the ready-made one (NVIDIA; AMD on Windows), else compiled here.  Returns (its folder, the
+    GPU as the engine sees it, the image choice it allows, llama.cpp's folder, its BUILD.json, its library folders,
+    its version as numbers)."""
+    llama = get_llama_cpp()
+    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
+    if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
+        eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
+        if eng is None:
+            fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
+                 "compiling it on Windows: tools\\hip\\build_windows.bat makes strata-windows-x64-hip.zip, then run "
+                 "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
+        gpu = hip_card(eng, gpu, amd)
+        a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
+    else:
+        eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
+                                                                                    else {}))
+    if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
+        pip_cuda_libs(cuda_tk)
+        if vision != "none" and not (eng / VEXE).exists():
+            warn("the ready-made engine has no image encoder: compiling it")
+            eng = None
+        else:
+            vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text(encoding="utf-8")), gpu, vision)
+    if eng is None:
+        eng = build_engine_hip(gpu, llama, vision) if hip else build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk)
+    meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    if hip and WIN:                                    # the ready-made engine's rocm/bin, first on the engine's PATH
+        lib_dirs = [str(d) for d in hip_lib_dirs(eng)]
+    else:
+        lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(cuda_tk)
+    engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
+    return eng, gpu, vision, llama, meta, lib_dirs, engine_ver
+
+
+# ------------------------------------------------------------------------------------------------ GLM-5.3-Flash
+def glm_engine(exe) -> bool:
+    """An engine binary that serves GLM-5.3-Flash: the format string of its GLM INFO line is in it.  Read from the file
+    without running it, as binary_engine_version reads the version; the version alone cannot tell (a build with the
+    GLM path and a release without it can carry the same number)."""
+    try:
+        return GLM_ENGINE_MARK in Path(exe).read_bytes()
+    except OSError:
+        return False
+
+
+def is_glm_config(cfg: dict) -> bool:
+    """A run config written by install_glm (its engine path has no layer split, calibration or draft subset)."""
+    return cfg.get("arch") == "glm5-next"
+
+
+def glm_unused_flags(a) -> list[str]:
+    """The setup flags the GLM path has nothing to apply to (its engine has none of these options yet)."""
+    off = ("off", "no", "n", "0")
+    return [flag for flag, given in (
+        ("--kv", a.kv), ("--vision", a.vision not in (None, "no", "none")), ("--vision-tokens", a.vision_tokens),
+        ("--rope-scaling", a.rope_scaling), ("--rope-scale", a.rope_scale),
+        ("--experimental-speed-projection", (a.experimental_speed_projection or "off").lower() not in off),
+        ("--low-ram", a.low_ram != "auto"), ("--resident-budget-gib", a.resident_budget_gib is not None),
+        ("--draft-vocab", a.draft_vocab), ("--parallel", a.parallel not in (None, 1)), ("--replicas", a.replicas),
+        ("--kv-streaming", a.kv_streaming != "auto"), ("--vram-reserve-mib", a.vram_reserve_mib is not None),
+        ("--layer-split", a.layer_split)) if given]
+
+
+def install_glm(a, gpu, hip, amd, ram, multi, roots, port, cuda_tk, elsewhere) -> int:
+    """Steps 2-7 for GLM-5.3-Flash (EXPERIMENTAL): another architecture on its own engine path (src/glm), run straight
+    from the GGUF - no pack, no n-gram table, no MTP download (its draft layer is in the GGUF) and none of the Qwen
+    models' memory modes: the engine keeps the experts the GPU has room for and reads the others from the mapped model
+    files.  What setup does: one size, the context, the download (pinned, SHA-256 checked), the tokenizer, the config."""
+    fam = FAMILIES["glm"]
+    warn("GLM-5.3-Flash is EXPERIMENTAL in Strata: its engine path matches reference code on small synthetic models of "
+         "its shapes (on an AMD Radeon 8060S), but the real model has not been run whole on Strata yet - please report "
+         "how it runs")
+    say()
+    sizes = fam["models"]
+    names = list(sizes)
+    if a.model and a.model not in sizes:
+        fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
+    for i, m in enumerate(names, 1):
+        say(f"  {i}) {m} {sizes[m]['about']}; download {sizes[m]['download_gb']:.0f} GB")
+    model = a.model or (names[0] if len(names) == 1 else
+                        names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1])
+    ok(f"size: {model}")
+    tag = fam["tag"] + model
+    if multi:
+        warn(f"{fam['title']} runs on one GPU so far: {gpu_name(gpu)} only")
+    unused = glm_unused_flags(a)
+    if unused:
+        warn(f"{', '.join(unused)}: not used for {fam['title']} (its engine has none of these options yet): left out")
+    if a.context:
+        ctx = a.context
+        if not 64 <= ctx <= GLM_TRAINED_CTX:
+            fail(f"--context {ctx}: {fam['title']} takes 64 to {GLM_TRAINED_CTX} tokens (its trained length; its "
+                 "engine has no rope scaling)")
+    else:
+        say()
+        say("  Context length = how much text the model can see at once (your chat, files, tool output).")
+        say(f"  The model is trained for {GLM_TRAINED_CTX // 1024}K tokens; Strata's GLM tests use a few thousand, so the "
+            "longer ones are untested:")
+        for i, c in enumerate(GLM_CONTEXTS, 1):
+            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended: the engine's default)" if c == GLM_CONTEXT_DEFAULT
+                                               else ""))
+        ctx = GLM_CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(GLM_CONTEXTS) + 1)],
+                                   str(GLM_CONTEXTS.index(GLM_CONTEXT_DEFAULT) + 1), a.yes)) - 1]
+    ok(f"context: {ctx} tokens")
+    models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
+    shards = [models_dir / fam["file"].format(q=model, i=i) for i in range(1, fam["shards"] + 1)]
+    if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
+        for r in elsewhere:                            # already downloaded in a Strata folder on another drive
+            cand = [r / "models" / tag / sh.name for sh in shards]
+            if all(c.exists() and done(c) for c in cand):
+                models_dir, shards = cand[0].parent, cand
+                ok(f"model files found in {models_dir}")
+                break
+    for s in shards:                                   # #173: a whole file copied in by hand has no finish mark
+        if s.exists() and not done(s) and whole_shard(s):
+            try:
+                mark(s, "whole (checked against its own tensor directory)")
+            except OSError as e:
+                warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
+    have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
+    on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
+    need = (0 if a.gguf_dir or have_model else max(sizes[model]["download_gb"] - on_disk, 0)) + 1
+    if free_gb(models_dir) < need:
+        fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB" +
+             (f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1 and not have_model else ""),
+             "use --models-dir on a bigger drive")
+
+    step(3, "Python packages")
+    pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
+                "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+
+    step(4, "the Strata engine")
+    eng, gpu, _, llama, meta, lib_dirs, _ = get_engine(a, gpu, hip, amd, "none", cuda_tk)
+    if not glm_engine(eng / EXE):                      # checked before the 157 GB download
+        fail(f"this engine ({meta.get('version', '?')}) has no {fam['title']} path",
+             "the GLM engine is not in a ready-made release yet: compile it from a checkout with src/glm "
+             + ("(tools\\hip\\build_windows.bat, then --prebuilt <its dist folder>, docs/AMD_HIP.md)" if hip and WIN
+                else "(--build)"))
+    ok(f"engine: {eng / EXE}")
+
+    step(5, f"downloading {fam['title']} {model}")
+    if not a.gguf_dir:
+        missing = [s.name for s in shards if not (s.exists() and done(s))]
+        if missing:
+            say(f"  The model files go in {models_dir}")
+            say(f"  Files you already have: put them here with their original names ({', '.join(missing)}), or use "
+                "--gguf-dir <their folder>.")
+        for s in shards:
+            if s.exists() and done(s):
+                ok(f"{s.name} already downloaded")
+                continue
+            download(fam["hf"].format(q=model) + s.name, s)
+    check_shards(shards)
+    for s in shards:                                   # pinned sizes and SHA-256
+        verify_sha256(s, *fam["sha256"][s.name])
+    ok("model files present")
+
+    step(6, "preparing the model for Strata")
+    pack = find_in(roots, f"packs/{tag.lower()}") or roots[0] / "packs" / tag.lower()
+    tok = pack / "tokenizer"
+    try:
+        pre = json.loads((tok / "tokenizer.json").read_text(encoding="utf-8")).get("pre")
+    except (OSError, ValueError):
+        pre = None
+    if not (tok / "vocab.json").exists() or pre != "glm4":   # a tokenizer.json with "pre" tells the server its split
+        run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]), "--out", str(pack),
+             "--check"], env=dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py")))
+    ok(f"tokenizer: {tok}")
+
+    step(7, "writing the start script")
+    cfg = {"exe": str(eng / EXE), "args": ["--native", str(shards[0]), "--max-context", str(ctx)], "cwd": str(ROOT),
+           "tokenizer": str(tok), "model_name": f"{fam['name']}-{model.lower()}",
+           "log": str(ROOT / f"strata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port,
+           "arch": "glm5-next", "gpus_asked": True}   # one GPU: start() offers no layer split
+    if cuda_tk == 12:
+        cfg["cuda"] = 12
+    if hip:
+        cfg["backend"] = "hip"
+    if gpu["count"] > 1 or a.gpu is not None:
+        cfg["gpu"] = gpu["index"]
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if a.browser is not None:
+        cfg["open_browser"] = a.browser
+    cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    write_setup_config(cfg_path, cfg)
+    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    ok(f"start script: {script.name}")
+
+    say()
+    say("All set.")
+    say(f"  API (OpenAI):     http://127.0.0.1:{port}/v1   (any API key; model name: anything)")
+    say(f"  API (Anthropic):  http://127.0.0.1:{port}/v1/messages")
+    if a.host and a.host not in ("127.0.0.1", "localhost"):
+        say(f"  Other devices:    the server window prints this PC's address (http://<IP>:{port}/)"
+            + ("" if a.api_key else " - no API key set: anyone on your network can use it"))
+    say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
+    say("  Drafts:           the model's own draft layer (speculative decoding) is off: \"--spec\", \"2\" in the "
+        "config's args turns it on (not measured on the real model yet)")
+    if a.no_start:
+        return 0
+    return start(cfg_path, port)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=list(FAMILIES),
+                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, glm = GLM-5.3-Flash (EXPERIMENTAL)")
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
@@ -5003,6 +5249,15 @@ def main() -> int:
             names = ", ".join(sorted({choices_from_config(c)["model"] or c.stem for c in have}))
             fail(f"--calibrate: {a.model or a.family} is not installed (installed: {names})",
                  "calibrate an installed model, or set this one up first without --calibrate")
+        glm = [c for c in targets if is_glm_config(json.loads(c.read_text(encoding="utf-8-sig")))]
+        if glm:                                        # its engine has none of the settings the tuning measures
+            warn("--calibrate: " + ", ".join(c.stem[len("strata-"):] for c in glm) + " (GLM-5.3-Flash) has no tuning "
+                 "yet: left out")
+            targets = [c for c in targets if c not in glm]
+            if not targets:
+                return 0 if a.no_start else start(glm[0], a.port, run_gpu, yes=a.yes,
+                                                  keep={"host": a.host, "api_key": a.api_key,
+                                                        "open_browser": a.browser})
         have = targets
         if not a.build:
             update_installed_engine(a.prebuilt)
@@ -5231,6 +5486,8 @@ def main() -> int:
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
+    if family == "glm":                                # its own engine path: none of the questions below apply
+        return install_glm(a, gpu, hip, amd, ram, multi, roots, port, cuda_tk, elsewhere)
     say()
     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
@@ -5480,34 +5737,7 @@ def main() -> int:
 
     # ---- 4. the engine
     step(4, "the Strata engine")
-    llama = get_llama_cpp()
-    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
-        eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
-        if eng is None:
-            fail("no ready-made AMD engine for this Strata version" + (" (--build)" if a.build else ""),
-                 "compiling it on Windows: tools\\hip\\build_windows.bat makes strata-windows-x64-hip.zip, then run "
-                 "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
-        gpu = hip_card(eng, gpu, amd)
-        a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
-    else:
-        eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
-                                                                                    else {}))
-    if eng is not None and not hip and json.loads((eng / "BUILD.json").read_text(encoding="utf-8")).get("source") != "local":
-        pip_cuda_libs(cuda_tk)
-        if vision != "none" and not (eng / VEXE).exists():
-            warn("the ready-made engine has no image encoder: compiling it")
-            eng = None
-        else:
-            vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text(encoding="utf-8")), gpu, vision)
-    if eng is None:
-        eng = build_engine_hip(gpu, llama, vision) if hip else build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk)
-    meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
-    if hip and WIN:                                    # the ready-made engine's rocm/bin, first on the engine's PATH
-        lib_dirs = [str(d) for d in hip_lib_dirs(eng)]
-    else:
-        lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(cuda_tk)
-    engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
+    eng, gpu, vision, llama, meta, lib_dirs, engine_ver = get_engine(a, gpu, hip, amd, vision, cuda_tk)
     need_engine = MODELS[model].get("engine", UNSLOTH_ENGINE)
     if budget is not None and engine_ver < need_engine:      # checked before the 94-111 GB download
         fail(f"{model} needs engine {'.'.join(map(str, need_engine))} or newer; this one is {meta.get('version')}",
