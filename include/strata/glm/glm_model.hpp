@@ -23,6 +23,7 @@
 
 #include "strata/core/geometry_glm5_next.hpp"
 #include "strata/glm/glm_layer.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -119,10 +120,12 @@ public:
     int max_verify() const { return max_t_; }
     /// A verify window: tokens[0..T) at pos0 .. pos0 + T - 1 - the last token kept and T - 1 drafts - through the
     /// main layers by the decode kernels, every token's arithmetic a decode step's (glm_layer.hpp: GlmContext::exact),
-    /// so picks[t] (host) is bitwise the greedy pick decode() gives after token t.  The positions' caches are written
-    /// (a later token at a position rewrites them before anything reads them); the KDA conv histories and states are
-    /// left as they were until commit().  Synchronizes the stream.
-    bool verify(const int32_t* tokens, int T, int64_t pos0, int32_t* picks, void* stream, std::string& err);
+    /// so picks[t] (host; pick() with the window as its tokens and tail[0..n_tail) the ones before it) is the token
+    /// decoding a token at a time would pick after token t - bitwise its logits, and the same draw.  The positions'
+    /// caches are written (a later token at a position rewrites them before anything reads them); the KDA conv
+    /// histories and states are left as they were until commit().  Synchronizes the stream.
+    bool verify(const int32_t* tokens, int T, int64_t pos0, int32_t* picks, void* stream, std::string& err,
+                const int32_t* tail = nullptr, int64_t n_tail = 0);
     /// Row t of the last window's logits (device [n_vocab]).
     const float* window_logits(int t) const { return wlogits_ + (size_t) t * (size_t) g_.n_vocab; }
     /// Keeps the last window's first n_keep tokens (1..T): the KDA histories and states advance over them (bitwise
@@ -134,6 +137,19 @@ public:
     /// The greedy picks of `rows` device logit rows of n_vocab (glm_argmax_rows: ties to the lowest index) into host
     /// `out`; synchronizes the stream.
     bool argmax(const float* logits, int rows, int32_t* out, void* stream, std::string& err);
+    /// How pick() and verify() choose: greedy (the default: glm_argmax_rows) or sample_tokens' chain (penalties,
+    /// top_k, top_p, min_p, temperature).  The token after position q draws Philox(seed, q) - its draw depends on its
+    /// position alone, so a verify window's row picks what decoding a token at a time picks, and a draft is kept when
+    /// it equals that.  p.counter is set per call; p.logit_bias (device) stays the caller's.  Penalty windows up to
+    /// kPickHistory tokens.
+    static constexpr int kPickHistory = 1024;
+    void set_sampling(const kernels::SamplerParams& p) { sp_ = p; }
+    const kernels::SamplerParams& sampling() const { return sp_; }
+    /// The tokens after window[r] (at position pos + r) for the rows r < rows of `logits` (device, n_vocab a row),
+    /// into host `out`: row r draws Philox(seed, pos + r), and the penalties count tail[0..n_tail) then window[0..r]
+    /// (the tokens before the window, then its own).  Synchronizes the stream.
+    bool pick(const float* logits, int rows, int64_t pos, const int32_t* tail, int64_t n_tail, const int32_t* window,
+              int32_t* out, void* stream, std::string& err);
 
     const float* logits() const { return logits_; }          ///< device [n_vocab]
     const float* h_nextn() const { return h_; }               ///< device [n_embd]
@@ -177,6 +193,12 @@ private:
     void* win_arena_ = nullptr;
     float *wlogits_ = nullptr, *whall_ = nullptr;
     int32_t *wpick_ = nullptr, *pick_host_ = nullptr;
+    int32_t *hist_dev_ = nullptr, *hist_host_ = nullptr;   ///< pick()'s penalty rows [max_t][kPickHistory]
+    kernels::SamplerParams sp_ = [] {
+        kernels::SamplerParams p;
+        p.greedy = true;
+        return p;
+    }();
     std::vector<float*> win_kda_;           ///< per block: its window storage (KDA blocks), else null
     std::vector<int32_t> win_tokens_;       ///< the last window's tokens, until commit
     int64_t win_pos0_ = -1;

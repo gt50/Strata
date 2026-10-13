@@ -67,6 +67,7 @@ GlmModel::~GlmModel() {
     if (buf_arena_) cudaFree(buf_arena_);
     if (win_arena_) cudaFree(win_arena_);
     if (pick_host_) cudaFreeHost(pick_host_);
+    if (hist_host_) cudaFreeHost(hist_host_);
 }
 
 namespace {
@@ -92,11 +93,13 @@ bool GlmModel::init_verify(int max_t, std::string& err) {
     const size_t per_kda = (size_t) kda_window_floats(g_) * T * sizeof(float);
     int64_t n_kda = 0;
     for (int64_t il = 0; il < g_.n_layers; ++il) n_kda += g_.is_mla[(size_t) il] ? 0 : 1;
-    const size_t sizes[] = {T * V * sizeof(float), T * D * sizeof(float), T * sizeof(int32_t), per_kda * (size_t) n_kda};
+    const size_t sizes[] = {T * V * sizeof(float), T * D * sizeof(float), T * sizeof(int32_t), per_kda * (size_t) n_kda,
+                            T * kPickHistory * sizeof(int32_t)};
     size_t total = 0;
     for (size_t sz : sizes) total += align256(sz);
     if (cudaMalloc(&win_arena_, total) != cudaSuccess ||
-        cudaHostAlloc((void**) &pick_host_, T * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
+        cudaHostAlloc((void**) &pick_host_, T * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess ||
+        cudaHostAlloc((void**) &hist_host_, T * kPickHistory * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
         cudaGetLastError();
         err = "GlmModel::init_verify: " + std::to_string(total) + " bytes for the windows";
         return false;
@@ -108,6 +111,7 @@ bool GlmModel::init_verify(int max_t, std::string& err) {
     whall_ = (float*) take(1);
     wpick_ = (int32_t*) take(2);
     float* kda = (float*) take(3);
+    hist_dev_ = (int32_t*) take(4);
     win_kda_.assign((size_t) g_.n_layers, nullptr);
     for (int64_t il = 0; il < g_.n_layers; ++il)
         if (!g_.is_mla[(size_t) il]) {
@@ -136,7 +140,39 @@ bool GlmModel::argmax(const float* logits, int rows, int32_t* out, void* stream,
     return true;
 }
 
-bool GlmModel::verify(const int32_t* tokens, int T, int64_t pos0, int32_t* picks, void* stream, std::string& err) {
+bool GlmModel::pick(const float* logits, int rows, int64_t pos, const int32_t* tail, int64_t n_tail,
+                    const int32_t* window, int32_t* out, void* stream, std::string& err) {
+    if (!wpick_ || rows < 1 || rows > max_t_ || !logits || !window || !out || pos < 0 || n_tail < 0 ||
+        (n_tail > 0 && !tail)) {
+        err = "GlmModel::pick: no verify buffers (init_verify), " + std::to_string(rows) + " rows, or no tokens";
+        return false;
+    }
+    const bool greedy = sp_.greedy || sp_.temperature <= 0.0f;
+    const bool pen = sp_.penalty_last_n > 0 &&
+                     (sp_.penalty_repeat != 1.0f || sp_.penalty_freq != 0.0f || sp_.penalty_present != 0.0f);
+    if (greedy && !pen && !sp_.logit_bias) return argmax(logits, rows, out, stream, err);
+    if (pen && sp_.penalty_last_n > kPickHistory) {
+        err = "GlmModel::pick: a penalty window of " + std::to_string(sp_.penalty_last_n) + " tokens (at most " +
+              std::to_string(kPickHistory) + ")";
+        return false;
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int h = pen ? sp_.penalty_last_n : 0;
+    if (pen) {   // row r's history: tail, then window[0..r] (pinned: the copy runs before the sync below)
+        k::penalty_rows(tail, n_tail, window, rows, h, hist_host_);
+        cudaMemcpyAsync(hist_dev_, hist_host_, (size_t) rows * h * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    }
+    k::SamplerParams p = sp_;
+    p.counter = (uint64_t) pos;   // row r: Philox(seed, pos + r)
+    k::sample_tokens(logits, rows, (int) g_.n_vocab, pen ? hist_dev_ : nullptr, h, p, wpick_, stream);
+    cudaMemcpyAsync(pick_host_, wpick_, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) return launched("GlmModel::pick", err);
+    std::copy(pick_host_, pick_host_ + rows, out);
+    return true;
+}
+
+bool GlmModel::verify(const int32_t* tokens, int T, int64_t pos0, int32_t* picks, void* stream, std::string& err,
+                      const int32_t* tail, int64_t n_tail) {
     if (!win_arena_ || !tokens || !picks || T < 1 || T > max_t_ || pos0 < 0 || pos0 + T > max_ctx_) {
         err = "GlmModel::verify: no window buffers (init_verify), or " + std::to_string(T) + " tokens at " +
               std::to_string(pos0) + " outside the window or the context";
@@ -176,7 +212,7 @@ bool GlmModel::verify(const int32_t* tokens, int T, int64_t pos0, int32_t* picks
     k::mhc_mean(x_, whall_, T, D, stream);
     k::glm_rms_norm(whall_, w_.output_norm, T, D, (float) g_.rms_eps, stream);
     k::glm_linear(w_.output, whall_, wlogits_, T, ctx_.q8, stream);
-    if (!argmax(wlogits_, T, picks, stream, err)) return false;
+    if (!pick(wlogits_, T, pos0, tail, n_tail, tokens, picks, stream, err)) return false;
     win_tokens_.assign(tokens, tokens + T);
     win_pos0_ = pos0;
     return true;

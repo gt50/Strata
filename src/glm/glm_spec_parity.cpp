@@ -197,6 +197,64 @@ int main(int argc, char** argv) {
         expect(got == greedy && accepted * 2 > drafted, what);
     }
 
+    // 5. sampled: plain and speculative with the same seed give the same tokens (and not greedy's)
+    for (const bool pen : {false, true}) {
+        k::SamplerParams sp;
+        sp.temperature = 0.9f;
+        sp.top_k = 40;
+        sp.top_p = 0.9f;
+        sp.seed = 1234;
+        if (pen) {
+            sp.penalty_last_n = 16;
+            sp.penalty_repeat = 1.3f;
+            sp.penalty_present = 0.2f;
+        }
+        a.set_sampling(sp);
+        b.set_sampling(sp);
+        vector<int32_t> plain, spec;
+        glm::GlmSpecStats st;
+        if (!glm::glm_generate(a, prompt.data(), 12, N, 0, plain, s, err) ||
+            !glm::glm_generate(b, prompt.data(), 12, N, 5, spec, s, err, &st))
+            die(err);
+        char what[200];
+        std::snprintf(what, sizeof what,
+                      "5. sampled (T 0.9, top_k 40, top_p 0.9%s): MTP drafts 5 a round give plain sampling's %lld "
+                      "tokens (%lld of %lld drafts kept)",
+                      pen ? ", penalties over 16" : "", (long long) N, (long long) st.accepted, (long long) st.drafted);
+        expect(spec == plain && plain != greedy, what);
+
+        // 6. oracle drafts under the same sampling: the plain run's tokens as drafts, every third round one wrong
+        b.reset(s);
+        if (!b.prompt(prompt.data(), 12, 0, s, err)) die(err);
+        vector<int32_t> seq(prompt.begin(), prompt.end()), got;
+        int64_t pos = 12, drafted = 0, accepted = 0;
+        int32_t t = plain[0];
+        for (int round = 0; (int64_t) got.size() < N; ++round) {
+            const int64_t i = (int64_t) got.size();
+            const int k = (int) std::min<int64_t>(5, N - i - 1);
+            vector<int32_t> win = {t};
+            for (int j = 1; j <= k; ++j) win.push_back(plain[(size_t) (i + j)]);
+            if (round % 3 == 2 && k >= 2) win[2] = (win[2] + 1) % V;
+            int32_t picks[8];
+            if (!b.verify(win.data(), k + 1, pos, picks, s, err, seq.data(), (int64_t) seq.size())) die(err);
+            int acc = 0;
+            while (acc < k && win[(size_t) acc + 1] == picks[acc]) ++acc;
+            for (int j = 0; j <= acc; ++j) {
+                got.push_back(win[(size_t) j]);
+                seq.push_back(win[(size_t) j]);
+            }
+            drafted += k;
+            accepted += acc;
+            if (!b.commit(1 + acc, picks[acc], s, err)) die(err);
+            pos += 1 + acc;
+            t = picks[acc];
+        }
+        got.resize((size_t) N);
+        std::snprintf(what, sizeof what, "6. oracle drafts under it (every third round one wrong): plain sampling's "
+                      "tokens (%lld of %lld drafts kept)", (long long) accepted, (long long) drafted);
+        expect(got == plain && accepted * 2 > drafted, what);
+    }
+
     std::printf("\nglm_spec: %d failures\n", g_bad);
     cudaStreamDestroy(s);
     for (void* p : g_free) cudaFree(p);
