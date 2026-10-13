@@ -46,7 +46,11 @@
 // these scattered reads (2.4 GB/s in decode's pattern, 2.5-5.4 GB/s in rounds of 64, glm_loader_parity --bench-file):
 // decode 1.76 tokens/s without, 1.31-1.43 with (one to four blocks on).  So it is off by default.
 //
-// What it is not yet: no CPU compute of misses, LRU only (no frequency profile for the fill).
+// STRATA_GLM_EXPERT_TRACE=FILE appends every call (block, kind: 0 decode / 1 a prompt round, k, the ids) for replaying
+// slot policies offline (tools/glm_trace_replay.py).  On the real file one LRU over all slots was within 1-4 points of
+// every practical policy tried for decode (docs/GLM.md); Belady's optimum would halve the misses.
+//
+// What it is not yet: no CPU compute of misses; LRU only.
 #pragma once
 
 #include "strata/glm/glm_layer.hpp"
@@ -54,6 +58,7 @@
 #include "strata/platform/direct_file.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -162,6 +167,7 @@ private:
     bool pf_stop_ = false;
     std::string pf_err_;
     std::atomic<uint64_t> pf_bytes_{0};
+    std::FILE* trace_ = nullptr;             ///< STRATA_GLM_EXPERT_TRACE: every call's block, kind and ids
 
     void unlink(int32_t s);
     void push_back(int32_t s);

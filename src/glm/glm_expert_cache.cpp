@@ -90,6 +90,8 @@ void GlmExpertCache::release() {
     prefetch_mode_ = 0;
     close_path(ahead_);
     close_path(demand_);
+    if (trace_) std::fclose(trace_);
+    trace_ = nullptr;
     if (guess_host_) cudaFreeHost(guess_host_);
     guess_host_ = nullptr;
     if (host_) cudaFreeHost(host_);
@@ -148,6 +150,9 @@ bool GlmExpertCache::init(std::vector<GlmExpertSource> sources, int64_t n_expert
     for (int32_t s = 0; s < (int32_t) slots; ++s) push_back(s);
     call_ = 0;
     stats_ = Stats{};
+    // STRATA_GLM_EXPERT_TRACE=path: each call appended as int32 block, int32 kind (0 decode, 1 a prompt round), int32 k,
+    // k int32 ids - for replaying slot policies offline
+    if (const char* tp = std::getenv("STRATA_GLM_EXPERT_TRACE"); tp && *tp) trace_ = std::fopen(tp, "ab");
     dirty_.assign(nb, 0);
     ahead_filled_.assign((size_t) slots, 0);
     pending_.assign((size_t) slots, 0);
@@ -514,6 +519,11 @@ const unsigned long long* GlmExpertCache::experts(int64_t il, const int32_t* ids
         !cuda_ok(cudaStreamSynchronize(st), "the router", err))
         return nullptr;
     stats_.sync_ms += ms_since(t0);
+    if (trace_) {
+        const int32_t head[3] = {(int32_t) il, 0, k};
+        std::fwrite(head, 4, 3, trace_);
+        std::fwrite(ids_host_, 4, (size_t) k, trace_);
+    }
     const unsigned long long* t = admit(il, ids_host_, k, stream, err);
     if (t && gb >= 0) {   // scored at the next block's call; read ahead now, while this block computes
         last_guess_[(size_t) gb].assign(guess_host_, guess_host_ + gk);
@@ -533,6 +543,11 @@ const unsigned long long* GlmExpertCache::resident(int64_t il, const int32_t* ex
     const auto t0 = std::chrono::steady_clock::now();
     if (!cuda_ok(cudaStreamSynchronize((cudaStream_t) stream), "the round before", err)) return nullptr;
     stats_.sync_ms += ms_since(t0);
+    if (trace_) {
+        const int32_t head[3] = {(int32_t) il, 1, n};
+        std::fwrite(head, 4, 3, trace_);
+        std::fwrite(experts, 4, (size_t) n, trace_);
+    }
     return admit(il, experts, n, stream, err);
 }
 

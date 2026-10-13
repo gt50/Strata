@@ -278,6 +278,9 @@ bool GlmServer::load(const GlmServeOptions& o, std::string& err, const std::func
     if (!p.model.init(p.g, p.weights.weights(), o.max_ctx, err, p.weights.expert_cache(), chunk) ||
         !p.model.init_verify(max_t, err))
         return false;
+    // the MTP block over a prompt only fills what drafting reads: without drafts (--spec 0) it would read its experts
+    // for nothing and push cached ones out (on the real file: ~3% of an answer's misses, ~5% of a prompt's)
+    p.model.set_mtp_over_prompt(o.n_draft > 0);
     if (cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking) != cudaSuccess) {
         cudaGetLastError();
         err = "GLM: a stream";

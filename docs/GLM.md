@@ -225,6 +225,26 @@ automatic count above), the RAM Windows had available once loaded:
 The 180-token prompt with a tool: 39.2 s, then 2.25 tokens/s (43.8 s and 1.86 with 3,000 slots). The fill reads the
 slots' experts at start (an equal share of every layer), so loading takes 39-46 s instead of 20-26.
 
+**Which experts the slots keep.** `STRATA_GLM_EXPERT_TRACE=FILE` has the engine write every expert-cache call (its
+block, decode or prompt round, the ids), and `tools/glm_trace_replay.py` replays a trace through slot policies. Two
+traces of six short requests each (code, arithmetic, a translation, Chinese, an explanation; 60 answer tokens, thinking
+off) on the 8060S with 4,874 slots; trace B replayed, A as the profile:
+
+| Policy | Decode misses | Prompt misses |
+| --- | --- | --- |
+| one LRU over all slots, an equal fill (the cache) | 18.3% | 60.0% |
+| the same, without the MTP block over prompts | 17.8% | 57.2% |
+| an LRU per layer, equal shares | 19.6% | 48.6% |
+| an LRU per layer, shares sized from trace A | 17.6% | 48.3% |
+| filled with trace A's most used experts, then LRU | 25.9% overall | (26.4% overall now) |
+| Belady's optimum (knows the future: the bound) | 8.3% | 29.8% |
+
+The experts are used broadly: trace A's 4,874 most used cover 59% of trace B's lookups. No policy that does not know
+the future comes close to the bound for decode; per-layer shares help prompts most. One change was free: the engine ran
+the MTP block over every prompt even without drafts (`--spec 0`), reading its experts for nothing - it now does so only
+with drafts. Measured on trace B's requests: prompt misses 14,943 -> 14,248, prompt time about 5% less, an answer's
+misses 18,880 -> 18,364.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -245,8 +265,8 @@ python tools/test_setup_glm.py
 
 ## Not done yet
 
-- A better choice of what the slots hold: LRU only, and the start fill takes an equal share of every layer in expert
-  order (no frequency profile, as the Qwen models have).
+- Per-layer slot shares (prompt misses 60% -> 48% in the replay above, decode 18.3% -> 17.6%): they need a
+  per-layer table measured on the model; the shares were not learned well online.
 - Quality against llama.cpp on the same file.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
