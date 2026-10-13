@@ -147,8 +147,8 @@ struct GlmLayerImpl {
                       const char* who, std::string& err);
     static bool attention(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w,
                           const GlmLayerState& st, GlmContext& ctx, void* stream, std::string& err);
-    static void ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, GlmContext& ctx,
-                    void* stream);
+    static bool ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, GlmContext& ctx,
+                    void* stream, std::string& err);
 };
 
 bool GlmLayerImpl::ready(const core::Glm5NextGeometry& g, int64_t il, const GlmContext& ctx, const float* x,
@@ -219,8 +219,8 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
     return true;
 }
 
-void GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, GlmContext& ctx,
-                       void* stream) {
+bool GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, GlmContext& ctx,
+                       void* stream, std::string& err) {
     const int D = (int) g.n_embd;
     void* q8 = ctx.q8;
     auto lin = [&](const GlmLinear& m, const float* in, float* out) { k::glm_linear(m, in, out, 1, q8, stream); };
@@ -229,13 +229,22 @@ void GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLay
         lin(w.ffn_up, ctx.h, ctx.fu);
         k::swiglu_clamp(ctx.fg, ctx.fu, ctx.fh, g.n_ff_dense, (float) g.swiglu_clamp_shexp, stream);
         lin(w.ffn_down, ctx.fh, ctx.f);
-        return;
+        return true;
     }
     const int kU = (int) g.n_expert_used;
     lin(w.gate_inp, ctx.h, ctx.logits);
     k::glm_router(ctx.logits, w.exp_probs_b, 1, (int) g.n_expert, kU, (int) g.expert_gating, g.expert_weights_norm,
                   (float) g.expert_weights_scale, ctx.eids, ctx.ew, stream);
-    k::glm_expert_groups_decode(ctx.eids, w.expert_ptrs, kU, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
+    const unsigned long long* ptrs = w.expert_ptrs;
+    if (!ptrs) {
+        if (!ctx.expert_provider) {
+            err = "block " + std::to_string(il) + ": no expert addresses and no provider";
+            return false;
+        }
+        ptrs = ctx.expert_provider->experts(il, ctx.eids, kU, stream, err);
+        if (!ptrs) return false;
+    }
+    k::glm_expert_groups_decode(ctx.eids, ptrs, kU, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
                                 ctx.ent_tok, stream);
     k::quantize_q8_1_rows(ctx.h, 1, D, ctx.xq, stream);
     k::native_expert_grouped_clamped(w.expert_layout, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
@@ -246,6 +255,7 @@ void GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLay
     k::swiglu_clamp(ctx.fg, ctx.fu, ctx.fh, g.n_ff_shexp, (float) g.swiglu_clamp_shexp, stream);
     lin(w.sh_down, ctx.fh, ctx.shared);
     k::native_moe_combine(ctx.parts, ctx.ew, ctx.shared, ctx.f, D, kU, stream);
+    return true;
 }
 
 namespace {
@@ -259,7 +269,8 @@ bool launched(const char* who, std::string& err) {
 }
 }  // namespace
 
-bool glm_layer_check(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, std::string& err) {
+bool glm_layer_check(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, std::string& err,
+                     bool provided) {
     const int64_t D = g.n_embd, H = g.n_head, Dh = g.kda_head_dim, di = H * Dh;
     const std::string at = "block " + std::to_string(il) + ": ";
     auto lin = [&](const char* name, const GlmLinear& m, int64_t n_in, int64_t n_out) {
@@ -321,7 +332,7 @@ bool glm_layer_check(const core::Glm5NextGeometry& g, int64_t il, const GlmLayer
         return lin("ffn_gate", w.ffn_gate, D, g.n_ff_dense) && lin("ffn_up", w.ffn_up, D, g.n_ff_dense) &&
                lin("ffn_down", w.ffn_down, g.n_ff_dense, D);
     if (!(lin("ffn_gate_inp", w.gate_inp, D, g.n_expert) && have("exp_probs_b", w.exp_probs_b) &&
-          have("the experts' device addresses", w.expert_ptrs) && lin("ffn_gate_shexp", w.sh_gate, D, g.n_ff_shexp) &&
+          (provided || have("the experts' device addresses", w.expert_ptrs)) && lin("ffn_gate_shexp", w.sh_gate, D, g.n_ff_shexp) &&
           lin("ffn_up_shexp", w.sh_up, D, g.n_ff_shexp) && lin("ffn_down_shexp", w.sh_down, g.n_ff_shexp, D)))
         return false;
     const k::NativeExpertLayout& el = w.expert_layout;
@@ -354,7 +365,7 @@ bool glm_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const GlmLaye
     k::mhc_pre(x, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, 1, D, rms_eps, hc_eps, iters, ctx.mhc_scr, ctx.h,
                ctx.post, ctx.comb, nullptr, stream);
     k::rms_norm_weighted(ctx.h, w.ffn_norm, 1, D, rms_eps, stream);
-    GlmLayerImpl::ffn(g, il, w, ctx, stream);
+    if (!GlmLayerImpl::ffn(g, il, w, ctx, stream, err)) return false;
     k::mhc_post(ctx.f, ctx.post, ctx.comb, x, 1, D, stream);
     return launched("glm_layer_decode", err);
 }
@@ -375,7 +386,7 @@ bool glm_mtp_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const Glm
     k::add_inplace(x, ctx.f, D, stream);
     cudaMemcpyAsync(ctx.h, x, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
     k::rms_norm_weighted(ctx.h, w.ffn_norm, 1, D, rms_eps, stream);
-    GlmLayerImpl::ffn(g, il, w, ctx, stream);
+    if (!GlmLayerImpl::ffn(g, il, w, ctx, stream, err)) return false;
     k::add_inplace(x, ctx.f, D, stream);
     return launched("glm_mtp_layer_decode", err);
 }

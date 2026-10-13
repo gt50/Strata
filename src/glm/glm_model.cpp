@@ -48,7 +48,8 @@ GlmModel::~GlmModel() {
     if (buf_arena_) cudaFree(buf_arena_);
 }
 
-bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err) {
+bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err,
+                    GlmExpertProvider* experts) {
     if (buf_arena_) { err = "GlmModel::init: already initialized"; return false; }
     const int64_t D = g.n_embd;
     if ((int64_t) w.blocks.size() != g.n_blocks() || (int64_t) g.is_mla.size() != g.n_blocks()) {
@@ -60,10 +61,10 @@ bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, i
         return false;
     if (!w.output_norm) { err = "GlmModel: output_norm is missing"; return false; }
     for (int64_t il = 0; il < g.n_layers; ++il)
-        if (!glm_layer_check(g, il, w.blocks[(size_t) il], err)) return false;
+        if (!glm_layer_check(g, il, w.blocks[(size_t) il], err, experts != nullptr)) return false;
     has_mtp_ = g.n_nextn > 0 && w.eh_proj.data != nullptr;
     if (has_mtp_) {
-        if (!glm_layer_check(g, g.n_layers, w.blocks[(size_t) g.n_layers], err) ||
+        if (!glm_layer_check(g, g.n_layers, w.blocks[(size_t) g.n_layers], err, experts != nullptr) ||
             !head_ok(w.eh_proj, 2 * D, D, "nextn.eh_proj", err) ||
             (w.mtp_embd.data && !embedding_ok(w.mtp_embd, D, "nextn.embed_tokens", err)) ||
             (w.mtp_head.data && !head_ok(w.mtp_head, D, g.n_vocab, "nextn.shared_head_head", err)))
@@ -71,6 +72,7 @@ bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, i
         if (!w.enorm || !w.hnorm) { err = "GlmModel: nextn.enorm / nextn.hnorm missing"; return false; }
     }
     if (!ctx_.init(g, max_ctx, err)) return false;
+    ctx_.expert_provider = experts;
     g_ = g;
     w_ = w;
     max_ctx_ = max_ctx;

@@ -72,6 +72,18 @@ struct GlmLayerState {
     float* pooled = nullptr;      ///< MLA + indexer: [max_ctx / 4][128]
 };
 
+/// Where a MoE layer's experts are when they are not all resident (GlmLayerWeights::expert_ptrs null): asked after
+/// the router, before the experts run.
+class GlmExpertProvider {
+public:
+    virtual ~GlmExpertProvider() = default;
+    /// The device array of layer il's n_expert blob addresses, in which the k experts the router chose (`ids`,
+    /// device, written on `stream`) are resident until the next call; the others may hold anything.  May synchronize
+    /// the stream.  Null on failure, with `err` set.
+    virtual const unsigned long long* experts(int64_t il, const int32_t* ids, int k, void* stream,
+                                              std::string& err) = 0;
+};
+
 /// The per-token values and the scratch every layer shares: one per model (and stream).
 class GlmContext {
 public:
@@ -85,6 +97,8 @@ public:
     void set_pos(int64_t pos, void* stream);
     int64_t max_ctx() const { return max_ctx_; }
 
+    /// the experts of a layer whose expert_ptrs are null (a cache), else unused
+    GlmExpertProvider* expert_provider = nullptr;
     // the step, and the selection a full-indexer layer leaves for the shared ones after it
     int32_t* step = nullptr;
     int32_t* sel_ids = nullptr;
@@ -114,7 +128,9 @@ private:
 
 /// Whether block `il`'s weights are all there, in the shapes the geometry gives and types the kernels take: what a
 /// loader checks before it allocates anything.  The MTP block (il >= n_layers) has no mHC weights and a full indexer.
-bool glm_layer_check(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, std::string& err);
+/// `provided`: the experts come from a GlmExpertProvider, so expert_ptrs may be null.
+bool glm_layer_check(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, std::string& err,
+                     bool provided = false);
 
 /// Bytes of state one block needs (KDA: conv history and state; MLA: latent, indexer cache, pooled keys).
 size_t glm_layer_state_bytes(const core::Glm5NextGeometry& g, int64_t il, int64_t max_ctx);

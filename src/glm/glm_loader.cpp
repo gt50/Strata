@@ -8,6 +8,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <map>
 
@@ -279,6 +280,7 @@ GlmLoadedWeights::~GlmLoadedWeights() { release(); }
 void GlmLoadedWeights::release() {
     for (void* p : device_) cudaFree(p);
     for (void* p : host_) cudaFreeHost(p);
+    cache_.reset();
     device_.clear();
     host_.clear();
     w_ = GlmModelWeights{};
@@ -299,7 +301,20 @@ bool GlmLoadedWeights::load(const GgufModel& m, const core::Glm5NextGeometry& g,
     // before a byte is copied: does it fit (a 157 GB file should fail here, not after an hour of copying)
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
-        const uint64_t need = plan_.device_bytes + (opt.experts == GlmExpertHome::Device ? plan_.expert_bytes : 0);
+        uint64_t experts = plan_.expert_bytes;
+        if (opt.expert_cache_slots > 0) {   // the cache's slots, of the largest blob
+            uint64_t slot = 0;
+            for (const Need& n : ns)
+                if (n.kind == Kind::ExpGate && n.t) {
+                    const Need* dn = nullptr;
+                    for (const Need& d : ns)
+                        if (d.kind == Kind::ExpDown && d.il == n.il) dn = &d;
+                    slot = std::max<uint64_t>(slot, align256(k::native_expert_layout((int) n.t->type, (int) dn->t->type,
+                                                                                     g.n_embd, g.n_ff_exp).bytes));
+                }
+            experts = slot * (uint64_t) opt.expert_cache_slots;
+        }
+        const uint64_t need = plan_.device_bytes + (opt.experts == GlmExpertHome::Device ? experts : 0);
         if (need > free_b) {
             err = "GlmLoadedWeights: the weights need " + std::to_string(need >> 20) + " MiB of device memory" +
                   (opt.experts == GlmExpertHome::Device ? " (the experts included)" : "") + ", " +
@@ -377,8 +392,29 @@ bool GlmLoadedWeights::load(const GgufModel& m, const core::Glm5NextGeometry& g,
         }
     }
 
-    // the experts: per layer, one allocation of n_expert blobs [gate rows | up rows | down rows]
     const int64_t NE = g.n_expert;
+    // streamed: the experts stay in the file, the cache reads them
+    if (opt.expert_cache_slots > 0) {
+        std::vector<GlmExpertSource> src((size_t) g.n_blocks());
+        for (const auto& [il, gn] : gate) {
+            const Need* un = up[il];
+            const Need* dn = down[il];
+            GlmExpertSource& s = src[(size_t) il];
+            s.gate = m.shard(gn->shard).tensor_data(*gn->t);
+            s.up = m.shard(un->shard).tensor_data(*un->t);
+            s.down = m.shard(dn->shard).tensor_data(*dn->t);
+            s.layout = k::native_expert_layout((int) gn->t->type, (int) dn->t->type, g.n_embd, g.n_ff_exp);
+            w_.blocks[(size_t) il].expert_layout = s.layout;
+            w_.blocks[(size_t) il].expert_ptrs = nullptr;
+        }
+        cache_ = std::make_unique<GlmExpertCache>();
+        if (!cache_->init(std::move(src), NE, opt.expert_cache_slots, opt.experts == GlmExpertHome::MappedHost,
+                          opt.cache_threads, err) ||
+            (opt.cache_fill && !cache_->fill_all(err)))
+            return fail();
+        return true;
+    }
+    // the experts: per layer, one allocation of n_expert blobs [gate rows | up rows | down rows]
     for (const auto& [il, gn] : gate) {
         const Need* un = up[il];
         const Need* dn = down[il];

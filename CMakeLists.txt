@@ -902,7 +902,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # GLM-5.3-Flash's layer glue and model loop at decode from the kernels above (src/glm), and their tests against a
   # double transcription of the glm5-next graph (src/glm/glm_ref.hpp): three blocks, and a five-layer model with MTP
-  add_library(strata_glm STATIC src/glm/glm_layer.cpp src/glm/glm_model.cpp src/glm/glm_loader.cpp)
+  add_library(strata_glm STATIC src/glm/glm_layer.cpp src/glm/glm_model.cpp src/glm/glm_loader.cpp
+              src/glm/glm_expert_cache.cpp)
   target_include_directories(strata_glm PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_glm PUBLIC strata_kernels ${_strata_gpu_runtime_target})
   add_executable(glm_layer_parity src/glm/glm_layer_parity.cpp)

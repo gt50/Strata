@@ -18,15 +18,16 @@
 // shape, a type the kernels take, its bytes inside the file - before anything is allocated, and counts the bytes.
 // The MTP block (blk.<n_layers>) is loaded when the geometry has one and the options ask for it.
 //
-// What it is not yet: the experts all resident (device or host), so a model larger than memory does not load; no
-// streaming from the file.
+// Experts larger than memory stream from the file through a GlmExpertCache (GlmLoadOptions::expert_cache_slots).
 #pragma once
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/geometry_glm5_next.hpp"
+#include "strata/glm/glm_expert_cache.hpp"
 #include "strata/glm/glm_model.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,12 @@ enum class GlmExpertHome {
 struct GlmLoadOptions {
     GlmExpertHome experts = GlmExpertHome::Device;
     bool mtp = true;   ///< load the MTP block when the geometry has one
+    /// > 0: the experts are not loaded but streamed from the file through a GlmExpertCache of this many blobs in
+    /// `experts`' home (the GgufModel must then outlive the loaded weights); filled before the first token when
+    /// `cache_fill`, copying with `cache_threads` threads
+    int64_t expert_cache_slots = 0;
+    bool cache_fill = true;
+    int cache_threads = 8;
 };
 
 /// What glm_plan found: the bytes each home needs, and the types the file uses per role (for a report).
@@ -67,12 +74,15 @@ public:
     /// Plans, allocates and copies.  On failure nothing stays allocated and `err` names the problem.
     bool load(const GgufModel& m, const core::Glm5NextGeometry& g, const GlmLoadOptions& opt, std::string& err);
     const GlmModelWeights& weights() const { return w_; }
+    /// The expert cache when the options streamed the experts (pass it to GlmModel::init), else null.
+    GlmExpertCache* expert_cache() const { return cache_.get(); }
     const GlmPlan& plan() const { return plan_; }
 
 private:
     GlmModelWeights w_;
     GlmPlan plan_;
     std::vector<void*> device_, host_;
+    std::unique_ptr<GlmExpertCache> cache_;
     void release();
 };
 

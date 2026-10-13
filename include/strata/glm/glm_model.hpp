@@ -61,7 +61,10 @@ public:
     GlmModel& operator=(const GlmModel&) = delete;
 
     /// Checks every weight against the geometry (glm_layer_check) and allocates; the weights must outlive the model.
-    bool init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err);
+    /// `experts`: where the MoE layers' experts are when their expert_ptrs are null (a cache; it must outlive the
+    /// model too).
+    bool init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err,
+              GlmExpertProvider* experts = nullptr);
     /// A new sequence: the KDA conv histories and recurrent states zeroed (the caches are written before read).
     void reset(void* stream);
 
