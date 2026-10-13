@@ -142,6 +142,18 @@ NVIDIA GPU (no images yet). Details and measurements: [UD-Q4_K_XL](UNSLOTH_Q4.md
 START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 ```
 
+### GLM-5.3-Flash (experimental)
+
+**[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** by Z.ai is another model, not a version of the one
+above: 288 experts per layer, a 1M-token context, MIT license. Setup offers Unsloth's UD-IQ4_XS of it (`--family
+glm`, a 157 GB download), which Strata runs on its own engine path. It is experimental: the path is checked piece by
+piece on an AMD Radeon 8060S, but the real model has not been run whole on Strata yet, the ready-made engines do not
+have it, and it has no images. Details, what is measured and what is not: [GLM-5.3-Flash](GLM.md).
+
+```
+START-HERE.bat --setup --family glm
+```
+
 **Unsloth's 6-bit UD-Q6_K_XL** (experimental, not in setup's menu) trades more bytes per expert for less precision
 loss against the same files: 169.2 GB together, its PLE table Q8_0 (read by the engine since 0.1.38). High RAM
 machines run it without a RAM budget. Manual workflow: [UD-Q6_K_XL](UNSLOTH_Q6.md).
