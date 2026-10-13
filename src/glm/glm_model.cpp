@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::glm {
@@ -455,9 +456,17 @@ bool GlmModel::decode_body(void* stream, std::string& err) {
     k::mhc_init(e_, x_, 1, D, stream);
     float* tx = taps_ ? taps_->x : nullptr;
     if (tx) cudaMemcpyAsync(tx, x_, xb, cudaMemcpyDeviceToDevice, s);
+    static const int64_t ahead = [] {   // how many blocks on the expert prefetch guesses
+        const char* v = std::getenv("STRATA_GLM_PREFETCH_AHEAD");
+        return v && std::atoi(v) > 0 ? (int64_t) std::atoi(v) : (int64_t) 1;
+    }();
     for (int64_t il = 0; il < g_.n_layers; ++il) {
-        if (!glm_layer_decode(g_, il, w_.blocks[(size_t) il], states_[(size_t) il], ctx_, x_, stream, err))
-            return false;
+        ctx_.next_block_il = il + ahead;
+        ctx_.next_block = il + ahead < g_.n_layers ? &w_.blocks[(size_t) (il + ahead)] : nullptr;
+        const bool ok = glm_layer_decode(g_, il, w_.blocks[(size_t) il], states_[(size_t) il], ctx_, x_, stream, err);
+        ctx_.next_block = nullptr;
+        ctx_.next_block_il = -1;
+        if (!ok) return false;
         if (tx) cudaMemcpyAsync((uint8_t*) tx + (size_t) (il + 1) * xb, x_, xb, cudaMemcpyDeviceToDevice, s);
     }
     tap_main(1, stream);

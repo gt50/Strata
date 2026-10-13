@@ -185,6 +185,25 @@ experts (1 GB), about 2 per layer, one layer after another: the reads wait for e
 touches about 3,600 different experts, more than the 3,000 slots, so the same prompt again is no faster. The engine
 prints these lines per request in its log; `STRATA_GLM_MAPPED_READS=1` reads through the mapping as before.
 
+**Prefetching experts (opt-in, off by default: slower here).** With `STRATA_GLM_PREFETCH=1`, a decode step guesses a
+later block's experts (that block's router on this block's FFN input) and a thread of its own reads the guessed ones
+that are not cached while this block computes; `STRATA_GLM_PREFETCH=measure` only counts the guesses, and
+`STRATA_GLM_PREFETCH_AHEAD=N` guesses N blocks on. Same PC, same requests (24-token and 21-token prompts, 9 and 22
+answer tokens):
+
+| | Guesses right | An answer's misses (9 tokens) | Bytes read (9 tokens) | Decode |
+| --- | --- | --- | --- | --- |
+| off | - | 788 | 9.4 GB | 1.60-1.92 tokens/s |
+| 1 block on | 75% | 316 + 772 read ahead (518 then hit) | 13.0 GB | 1.40 tokens/s |
+| 2 blocks on | 64-68% | 435 + 767 read ahead (415 then hit) | 14.3 GB | 1.35 tokens/s |
+| 4 blocks on | 55-59% | 552 + 710 read ahead (303 then hit) | 15.1 GB | 1.31 tokens/s |
+
+The guesses are good, but every wrong one is a read, and it pushes a cached expert out; the drive is already the
+limit for these scattered reads, so 38-60% more bytes cost more time than the overlap saves. `glm_loader_parity
+--bench-file SHARD` times the cache's reads on a real file alone: 2.5-5.4 GB/s in rounds of 64 experts of one layer
+(it differs by layer, within one shard), 2.4 GB/s in decode's pattern (8 experts a layer, layer after layer). The
+default speed also varies from run to run with the drive: 4.0-4.5 s to read the same 9.4 GB.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -205,8 +224,8 @@ python tools/test_setup_glm.py
 
 ## Not done yet
 
-- Prefetching experts (a token's reads now wait for each layer's router in turn), and an automatic slot count
-  for APUs, whose reported free GPU memory includes shared system RAM (on the 8060S 115 GB: the automatic count did
+- More expert slots: the misses are the cost, and the drive is the limit, so a larger cache (on an APU, in shared
+  memory) should pay where prefetching did not; and an automatic slot count for APUs, whose reported free GPU memory includes shared system RAM (on the 8060S 115 GB: the automatic count did
   not fit; the run above set `--glm-expert-cache 3000`).
 - Quality against llama.cpp on the same file.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.

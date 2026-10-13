@@ -82,6 +82,75 @@ int plan_real(const char* shard) {
     }
 }
 
+/// `--bench-file SHARD [slots]`: the expert cache's reads on a real model's file, the cache empty at start (its own
+/// slots only; the weights loaded as for serving).  Rounds of 64 different experts of one layer (resident(), a prompt's
+/// pattern), then decode's pattern: 8 experts a MoE layer, layer after layer (experts(), the ids on the device), for
+/// 3 tokens of random choices.  STRATA_GLM_MAPPED_READS=1 times the mapped path instead.
+int bench_file(const char* shard, int64_t slots) {
+    try {
+        const strata::GgufModel m = strata::GgufModel::open(shard);
+        Glm5NextGeometry g;
+        if (const std::string e = strata::read_geometry(m.meta(), g); !e.empty()) {
+            std::fprintf(stderr, "geometry: %s\n", e.c_str());
+            return 1;
+        }
+        glm::GlmLoadOptions opt;
+        opt.expert_cache_slots = slots;
+        opt.cache_fill = false;
+        glm::GlmLoadedWeights lw;
+        std::string err;
+        if (!lw.load(m, g, opt, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 1;
+        }
+        glm::GlmExpertCache& c = *lw.expert_cache();
+        std::printf("%s: %lld slots of %.1f MB, %s reads\n", shard, (long long) c.slots(), c.slot_bytes() / 1e6,
+                    c.direct() ? "unbuffered" : "mapped");
+        cudaStream_t s;
+        check(cudaStreamCreate(&s), "stream");
+        std::mt19937 rng(7);
+        const int64_t l0 = g.n_dense_lead, nl = g.n_layers - g.n_dense_lead;
+        std::vector<int32_t> all((size_t) g.n_expert);
+        for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) all[(size_t) e] = e;
+        for (int round = 0; round < 6; ++round) {   // a prompt round: 64 different experts of one layer
+            const int64_t il = l0 + (int64_t) (rng() % (uint32_t) nl);
+            std::shuffle(all.begin(), all.end(), rng);
+            const auto st0 = c.stats();
+            const auto t0 = std::chrono::steady_clock::now();
+            if (!c.resident(il, all.data(), 64, s, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            check(cudaStreamSynchronize(s), "sync");
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const auto st1 = c.stats();
+            std::printf("  64 experts of layer %2lld: %llu misses, %.2f GB in %6.0f ms = %.2f GB/s\n", (long long) il,
+                        (unsigned long long) (st1.misses - st0.misses), (st1.bytes - st0.bytes) / 1e9, ms,
+                        (st1.bytes - st0.bytes) / 1e6 / ms);
+        }
+        int32_t* d_ids = nullptr;
+        check(cudaMalloc(&d_ids, 64), "ids");
+        for (int tok = 0; tok < 3; ++tok) {   // decode: 8 a layer, one layer after another
+            const auto st0 = c.stats();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int64_t il = l0; il < g.n_layers; ++il) {
+                std::shuffle(all.begin(), all.end(), rng);
+                check(cudaMemcpy(d_ids, all.data(), 8 * sizeof(int32_t), cudaMemcpyHostToDevice), "ids");
+                if (!c.experts(il, d_ids, 8, s, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+            }
+            check(cudaStreamSynchronize(s), "sync");
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const auto st1 = c.stats();
+            std::printf("  a token, 8 experts x %lld layers: %llu misses, %.2f GB in %6.0f ms = %.2f GB/s, %.1f ms a layer\n",
+                        (long long) nl, (unsigned long long) (st1.misses - st0.misses), (st1.bytes - st0.bytes) / 1e9, ms,
+                        (st1.bytes - st0.bytes) / 1e6 / ms, ms / (double) nl);
+        }
+        cudaFree(d_ids);
+        cudaStreamDestroy(s);
+        return 0;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "%s\n", ex.what());
+        return 1;
+    }
+}
+
 /// `--bench`: GlmExpertCache at GLM-5.3-Flash's expert size (n_embd 4096, n_ff 2048, IQ4_XS: 13.4 MB a blob), one
 /// layer of 32 experts written to a GGUF and mapped (its pages are in the OS cache after the write: a warm file).
 /// The copy of a call's 8 misses into device or mapped host slots by 1, 4 and 8 threads, and a call whose 8 experts
@@ -234,7 +303,13 @@ int main(int argc, char** argv) {
         if (a == "--selftest") selftest = true;
         else if (a == "--plan" && i + 1 < argc) return plan_real(argv[++i]);
         else if (a == "--bench") return bench();
-        else { std::fprintf(stderr, "usage: glm_loader_parity [--selftest] | --plan SHARD | --bench\n"); return 2; }
+        else if (a == "--bench-file" && i + 1 < argc) {
+            const char* shard = argv[++i];
+            return bench_file(shard, i + 1 < argc ? std::atoll(argv[i + 1]) : 1024);
+        } else {
+            std::fprintf(stderr, "usage: glm_loader_parity [--selftest] | --plan SHARD | --bench | --bench-file SHARD [slots]\n");
+            return 2;
+        }
     }
     TestModel tm = build_test_model(MAX_CTX);
     const Glm5NextGeometry& g0 = tm.g;
@@ -284,8 +359,11 @@ int main(int argc, char** argv) {
     for (const CacheCase& c0 : {CacheCase{24, false, false, "a cache of 24 slots in device memory, empty at start"},
                                 CacheCase{4, false, true, "a cache of 4 slots (one layer's k) in mapped host memory"},
                                 CacheCase{40, true, false, "a cache of 40 slots filled before the first token"}})
-    for (const bool direct_reads : {true, false}) {
-        const std::string label = std::string(c0.what) + (direct_reads ? ", unbuffered reads" : ", through the mapping");
+    for (const int how : {0, 1, 2}) {   // unbuffered reads, through the mapping, unbuffered and reading ahead
+        const bool direct_reads = how != 1, ahead = how == 2;
+        if (ahead && c0.slots < 8) continue;   // 4 slots: one layer's k, none to spare for a guess
+        const std::string label = std::string(c0.what) +
+                                  (ahead ? ", reading ahead" : direct_reads ? ", unbuffered reads" : ", through the mapping");
         const CacheCase c{c0.slots, c0.fill, c0.mapped, label.c_str()};
         const strata::GgufModel m({path.string()});
         glm::GlmLoadedWeights lw;
@@ -294,6 +372,7 @@ int main(int argc, char** argv) {
         opt.expert_cache_slots = c.slots;
         opt.cache_fill = c.fill;
         opt.direct_reads = direct_reads;
+        opt.prefetch = ahead ? 2 : 0;
         if (!lw.load(m, g, opt, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
         expect(lw.expert_cache()->direct() == direct_reads, label + ": the read path asked for");
         glm::GlmModel loaded;
@@ -309,6 +388,13 @@ int main(int argc, char** argv) {
                     (unsigned long long) st.misses, (double) st.bytes / 1e6);
         expect(st.misses > 0 && (c.fill ? st.hits > 0 : true) && resident0 == (c.fill ? 40 : 0),
                std::string(c.what) + ": misses were served" + (c.fill ? ", and the fill gave hits" : ""));
+        if (ahead) {
+            std::printf("    guesses %llu of %llu right; %llu read ahead, %llu of them then hit\n",
+                        (unsigned long long) st.guessed_right, (unsigned long long) st.guessed,
+                        (unsigned long long) st.prefetched, (unsigned long long) st.prefetch_hits);
+            expect(lw.expert_cache()->prefetching() && st.guessed > 0 && st.prefetched > 0 && st.prefetch_hits > 0,
+                   std::string(c.what) + ": guesses were made, read ahead and then hit");
+        }
     }
     {   // fewer slots than one layer's experts: refused at the first MoE layer, by name
         const strata::GgufModel m({path.string()});

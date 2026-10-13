@@ -50,6 +50,9 @@ struct GlmLoadOptions {
     /// the cache reads misses unbuffered from the shard files (not through the mapping); STRATA_GLM_MAPPED_READS=1
     /// turns it off at load
     bool direct_reads = true;
+    /// with direct reads, decode's expert prefetch (glm_expert_cache.hpp): 0 off, 1 guesses counted only, 2 guesses read
+    /// ahead; -1: STRATA_GLM_PREFETCH (0 / measure / 1), off when unset - on the 990 EVO Plus it was slower (docs/GLM.md)
+    int prefetch = -1;
 };
 
 /// What glm_plan found: the bytes each home needs, and the types the file uses per role (for a report).

@@ -115,6 +115,8 @@ bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::str
         parts = c.take<float>(T * kU * D); shared = c.take<float>(T * D);
         fg = c.take<float>(T * ff); fu = c.take<float>(T * ff); fh = c.take<float>(T * ff);
         eids = c.take<int32_t>(T * kU);
+        pred_logits = c.take<float>(std::max<int64_t>(g.n_expert, 1)); pred_w = c.take<float>(kU);
+        pred_ids = c.take<int32_t>(kU);
         grp_ptr = c.take<unsigned long long>(groups);
         grp_start = c.take<int32_t>(groups + 1); n_groups = c.take<int32_t>(1);
         ent_dst = c.take<int32_t>(T * kU); ent_tok = c.take<int32_t>(T * kU);
@@ -491,6 +493,14 @@ bool GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLay
     if (n == 1 || ctx.exact) {   // grouped on the device: a decode step's a group an expert; a verify window's by
                                  // expert, each read once for its tokens (each entry's sums still a decode step's)
         const unsigned long long* ptrs = w.expert_ptrs;
+        const GlmLayerWeights* nb = ctx.next_block;
+        if (!ptrs && n == 1 && !ctx.exact && nb && nb->gate_inp.data && nb->exp_probs_b && !nb->expert_ptrs &&
+            ctx.expert_provider->wants_prediction()) {   // the next block's guess, before this block's sync
+            lin(nb->gate_inp, ctx.h, ctx.pred_logits);
+            k::glm_router(ctx.pred_logits, nb->exp_probs_b, 1, (int) g.n_expert, kU, (int) g.expert_gating,
+                          g.expert_weights_norm, (float) g.expert_weights_scale, ctx.pred_ids, ctx.pred_w, stream);
+            ctx.expert_provider->predict(ctx.next_block_il, ctx.pred_ids, kU);
+        }
         if (!ptrs) {
             ptrs = ctx.expert_provider->experts(il, ctx.eids, n * kU, stream, err);
             if (!ptrs) return false;

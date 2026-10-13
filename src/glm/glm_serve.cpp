@@ -333,8 +333,16 @@ int GlmServer::run(const std::function<bool(std::string&)>& next_line, std::atom
         if (cache) {   // where a streamed request's time went: the experts read from the file per phase
             const GlmExpertCache::Stats c2 = cache->stats();
             auto phase = [](const GlmExpertCache::Stats& a, const GlmExpertCache::Stats& b) {
-                return fmt("%llu hits, %llu misses (%.2f GB, %.0f ms copying)", (unsigned long long) (b.hits - a.hits),
-                           (unsigned long long) (b.misses - a.misses), (b.bytes - a.bytes) / 1e9, b.fetch_ms - a.fetch_ms);
+                std::string r = fmt("%llu hits, %llu misses (%.2f GB, %.0f ms copying)", (unsigned long long) (b.hits - a.hits),
+                                    (unsigned long long) (b.misses - a.misses), (b.bytes - a.bytes) / 1e9,
+                                    b.fetch_ms - a.fetch_ms);
+                if (b.guessed > a.guessed)   // the prefetch's guesses, and what reading ahead gave
+                    r += fmt(", guesses %llu of %llu right, %llu read ahead (%.2f GB, %llu then hit, %.0f ms waited)",
+                             (unsigned long long) (b.guessed_right - a.guessed_right),
+                             (unsigned long long) (b.guessed - a.guessed), (unsigned long long) (b.prefetched - a.prefetched),
+                             (b.prefetch_bytes - a.prefetch_bytes) / 1e9,
+                             (unsigned long long) (b.prefetch_hits - a.prefetch_hits), b.wait_ms - a.wait_ms);
+                return r;
             };
             std::fprintf(stderr, "strata serve (GLM): prompt %lld tokens %.0f ms, experts %s; %lld tokens %.0f ms, experts %s\n",
                          (long long) n, std::chrono::duration<double, std::milli>(t1 - t0).count(), phase(c0, c1).c_str(),

@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -36,15 +37,61 @@ bool cuda_ok(cudaError_t e, const char* what, std::string& err) {
 
 GlmExpertCache::~GlmExpertCache() { release(); }
 
-void GlmExpertCache::release() {
-    for (void* e : stage_events_)
+void GlmExpertCache::close_path(ReadPath& rp) {
+    for (void* e : rp.events)
         if (e) cudaEventDestroy((cudaEvent_t) e);
-    stage_events_.clear();
-    if (copy_stream_) cudaStreamDestroy((cudaStream_t) copy_stream_);
-    copy_stream_ = nullptr;
-    if (staging_) cudaFreeHost(staging_);
-    staging_ = nullptr;
-    files_.clear();
+    rp.events.clear();
+    if (rp.stream) cudaStreamDestroy((cudaStream_t) rp.stream);
+    rp.stream = nullptr;
+    if (rp.staging) cudaFreeHost(rp.staging);
+    rp.staging = nullptr;
+    rp.files.clear();
+}
+
+bool GlmExpertCache::open_path(ReadPath& rp, const std::vector<std::string>& files, std::string& err) {
+    for (const std::string& p : files) {
+        auto f = std::make_unique<platform::DirectFile>();
+        if (!f->open(p, err)) {
+            err = "GlmExpertCache: " + p + ": " + err;
+            return false;
+        }
+        rp.files.push_back(std::move(f));
+    }
+    cudaStream_t cs = nullptr;
+    if (!cuda_ok(cudaHostAlloc((void**) &rp.staging, stage_bytes_ * kStages, cudaHostAllocDefault), "staging", err) ||
+        !cuda_ok(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking), "a copy stream", err))
+        return false;
+    rp.stream = cs;
+    for (int i = 0; i < kStages; ++i) {
+        cudaEvent_t ev = nullptr;
+        if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "an event", err)) return false;
+        rp.events.push_back(ev);
+    }
+    return true;
+}
+
+GlmExpertCache::Stats GlmExpertCache::stats() const {
+    Stats s = stats_;
+    s.prefetch_bytes = pf_bytes_.load();
+    return s;
+}
+
+void GlmExpertCache::release() {
+    if (pf_thread_.joinable()) {   // the prefetch thread first: it reads into the slots and the staging below
+        {
+            std::lock_guard<std::mutex> lk(pf_mu_);
+            pf_stop_ = true;
+        }
+        pf_cv_.notify_all();
+        pf_thread_.join();
+    }
+    pf_stop_ = false;
+    pf_queue_.clear();
+    prefetch_mode_ = 0;
+    close_path(ahead_);
+    close_path(demand_);
+    if (guess_host_) cudaFreeHost(guess_host_);
+    guess_host_ = nullptr;
     if (host_) cudaFreeHost(host_);
     else if (blobs_) cudaFree(blobs_);
     if (tables_) cudaFree(tables_);
@@ -55,7 +102,7 @@ void GlmExpertCache::release() {
 }
 
 bool GlmExpertCache::init(std::vector<GlmExpertSource> sources, int64_t n_expert, int64_t slots, bool mapped_host,
-                          int threads, std::string& err, const std::vector<std::string>& files) {
+                          int threads, std::string& err, const std::vector<std::string>& files, int prefetch) {
     release();
     src_ = std::move(sources);
     n_expert_ = n_expert;
@@ -101,36 +148,36 @@ bool GlmExpertCache::init(std::vector<GlmExpertSource> sources, int64_t n_expert
     for (int32_t s = 0; s < (int32_t) slots; ++s) push_back(s);
     call_ = 0;
     stats_ = Stats{};
+    dirty_.assign(nb, 0);
+    ahead_filled_.assign((size_t) slots, 0);
+    pending_.assign((size_t) slots, 0);
+    last_guess_.assign(nb, {});
+    pf_bytes_ = 0;
+    pf_err_.clear();
     // unbuffered reads, when every MoE block names its files
     bool named = !files.empty();
     for (const GlmExpertSource& s : src_)
         if (s.gate)
             for (const int f : {s.gate_file, s.up_file, s.down_file}) named = named && f >= 0 && f < (int) files.size();
     if (named) {
-        for (const std::string& p : files) {
-            auto f = std::make_unique<platform::DirectFile>();
-            if (!f->open(p, err)) {
-                err = "GlmExpertCache: " + p + ": " + err;
-                release();
-                return false;
-            }
-            files_.push_back(std::move(f));
-        }
         stage_bytes_ = align_up(slot_bytes_ + 6 * kAlign, kAlign);   // each slab widened by up to 2 x 4 KB
-        cudaStream_t cs = nullptr;
-        if (!cuda_ok(cudaHostAlloc((void**) &staging_, stage_bytes_ * kStages, cudaHostAllocDefault), "staging", err) ||
-            !cuda_ok(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking), "the copy stream", err)) {
+        if (!open_path(demand_, files, err)) {
             release();
             return false;
         }
-        copy_stream_ = cs;
-        for (int i = 0; i < kStages; ++i) {
-            cudaEvent_t ev = nullptr;
-            if (!cuda_ok(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "an event", err)) {
+        // the prefetch reads ahead through its own handles (their completions must not reach the demand reads)
+        prefetch_mode_ = std::clamp(prefetch, 0, 2);
+        if (prefetch_mode_ != 0 &&
+            !cuda_ok(cudaHostAlloc((void**) &guess_host_, 1024 * sizeof(int32_t), cudaHostAllocDefault), "guesses", err)) {
+            release();
+            return false;
+        }
+        if (prefetch_mode_ == 2) {
+            if (!open_path(ahead_, files, err)) {
                 release();
                 return false;
             }
-            stage_events_.push_back(ev);
+            pf_thread_ = std::thread([this] { prefetch_loop(); });
         }
     }
     return true;
@@ -160,7 +207,11 @@ void GlmExpertCache::push_back(int32_t s) {
 /// slabs of the stacked tensors, the jobs spread over threads_ threads.
 bool GlmExpertCache::fetch(const std::vector<std::pair<int64_t, int32_t>>& jobs, std::string& err) {
     if (jobs.empty()) return true;
-    if (!files_.empty()) return fetch_direct(jobs, err);
+    if (!demand_.files.empty()) {
+        if (!fetch_direct(jobs, demand_, err)) return false;
+        for (const auto& [owner, slot] : jobs) stats_.bytes += src_[(size_t) (owner / n_expert_)].layout.bytes;
+        return true;
+    }
     std::atomic<size_t> next{0};
     std::atomic<bool> failed{false};
     std::string first_err;
@@ -206,22 +257,23 @@ bool GlmExpertCache::fetch(const std::vector<std::pair<int64_t, int32_t>>& jobs,
 /// fetch through unbuffered reads: each job's three slabs (widened to 4 KB boundaries) into a staging buffer of the
 /// ring, then to its slot (the copy stream for device slots, a memcpy for mapped host ones) while later jobs read.
 /// The jobs go in file order, so a call's reads of one tensor run close to sequentially.
-bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>& jobs_in, std::string& err) {
+bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>& jobs_in, ReadPath& rp,
+                                  std::string& err, const std::function<void(int32_t)>& done_slot) const {
     std::vector<std::pair<int64_t, int32_t>> jobs = jobs_in;
     std::sort(jobs.begin(), jobs.end());   // block, then expert: file order within a tensor
     struct Part { int file; uint64_t start, buf, skip, bytes, dst; uint32_t len; };
-    const int ns = (int) stage_events_.size();
+    const int ns = (int) rp.events.size();
     std::vector<std::array<Part, 3>> part((size_t) ns);
     std::vector<int> pending((size_t) ns, 0), job_of((size_t) ns, -1);
     std::vector<char> copying((size_t) ns, 0);
     std::vector<int> free_stages;
     for (int s = ns - 1; s >= 0; --s) free_stages.push_back(s);
-    std::vector<int> in_flight(files_.size(), 0);
+    std::vector<int> in_flight(rp.files.size(), 0);
     int reads = 0;
     size_t next = 0, done = 0;
     bool failed = false;
     std::string why;
-    const cudaStream_t cs = (cudaStream_t) copy_stream_;
+    const cudaStream_t cs = (cudaStream_t) rp.stream;
 
     auto submit = [&](int s, size_t j) {
         const int64_t block = jobs[j].first / n_expert_, e = jobs[j].first % n_expert_;
@@ -243,7 +295,7 @@ bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>
         for (int k = 0; k < 3; ++k) {
             const Part& p = part[(size_t) s][(size_t) k];
             std::string e2;
-            if (!files_[(size_t) p.file]->submit(p.start, staging_ + stage_bytes_ * (uint64_t) s + p.buf, p.len,
+            if (!rp.files[(size_t) p.file]->submit(p.start, rp.staging + stage_bytes_ * (uint64_t) s + p.buf, p.len,
                                                  (uint64_t) (s * 3 + k), e2)) {
                 if (!failed) why = "GlmExpertCache: a read could not be queued: " + e2;
                 failed = true;
@@ -257,7 +309,7 @@ bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>
     // a stage whose three reads are in: to its slot
     auto place = [&](int s) {
         const int64_t slot = jobs[(size_t) job_of[(size_t) s]].second;
-        const uint8_t* buf = staging_ + stage_bytes_ * (uint64_t) s;
+        const uint8_t* buf = rp.staging + stage_bytes_ * (uint64_t) s;
         for (const Part& p : part[(size_t) s]) {
             if (host_) std::memcpy(host_ + slot_bytes_ * (uint64_t) slot + p.dst, buf + p.buf + p.skip, p.bytes);
             else if (cudaMemcpyAsync(blobs_ + slot_bytes_ * (uint64_t) slot + p.dst, buf + p.buf + p.skip, p.bytes,
@@ -270,8 +322,9 @@ bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>
         if (host_) {
             free_stages.push_back(s);
             ++done;
+            if (done_slot && !failed) done_slot(jobs[(size_t) job_of[(size_t) s]].second);
         } else {
-            cudaEventRecord((cudaEvent_t) stage_events_[(size_t) s], cs);
+            cudaEventRecord((cudaEvent_t) rp.events[(size_t) s], cs);
             copying[(size_t) s] = 1;
         }
     };
@@ -286,9 +339,9 @@ bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>
         if (failed && reads == 0) break;
         if (reads > 0) {   // block on one file with reads in flight, then take what the others have
             bool blocked = false;
-            for (size_t f = 0; f < files_.size(); ++f) {
+            for (size_t f = 0; f < rp.files.size(); ++f) {
                 if (in_flight[f] == 0) continue;
-                const int n = files_[f]->wait(comps, 64, blocked ? 0 : -1);
+                const int n = rp.files[f]->wait(comps, 64, blocked ? 0 : -1);
                 blocked = true;
                 for (int i = 0; i < n; ++i) {
                     const platform::Completion& c = comps[i];
@@ -310,15 +363,16 @@ bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>
         } else {   // only copies left: wait for one
             for (int s = 0; s < ns; ++s)
                 if (copying[(size_t) s]) {
-                    cudaEventSynchronize((cudaEvent_t) stage_events_[(size_t) s]);
+                    cudaEventSynchronize((cudaEvent_t) rp.events[(size_t) s]);
                     break;
                 }
         }
         for (int s = 0; s < ns; ++s)   // finished copies free their stage
-            if (copying[(size_t) s] && cudaEventQuery((cudaEvent_t) stage_events_[(size_t) s]) == cudaSuccess) {
+            if (copying[(size_t) s] && cudaEventQuery((cudaEvent_t) rp.events[(size_t) s]) == cudaSuccess) {
                 copying[(size_t) s] = 0;
                 free_stages.push_back(s);
                 ++done;
+                if (done_slot && !failed) done_slot(jobs[(size_t) job_of[(size_t) s]].second);
             }
         if (failed && reads == 0 && std::none_of(copying.begin(), copying.end(), [](char c) { return c != 0; })) break;
     }
@@ -327,8 +381,92 @@ bool GlmExpertCache::fetch_direct(const std::vector<std::pair<int64_t, int32_t>>
         err = why;
         return false;
     }
-    for (const auto& [owner, slot] : jobs) stats_.bytes += src_[(size_t) (owner / n_expert_)].layout.bytes;
     return true;
+}
+
+/// The prefetch thread: each batch the decode loop queued, read through the ahead path; its slots stop being pending.
+void GlmExpertCache::prefetch_loop() {
+    for (;;) {
+        std::vector<std::pair<int64_t, int32_t>> batch;
+        {
+            std::unique_lock<std::mutex> lk(pf_mu_);
+            pf_cv_.wait(lk, [this] { return pf_stop_ || !pf_queue_.empty(); });
+            if (pf_stop_ && pf_queue_.empty()) return;
+            batch.assign(pf_queue_.begin(), pf_queue_.end());
+            pf_queue_.clear();
+        }
+        std::string e;
+        // each expert is released as it lands: a call waiting for one does not wait for the batch's wrong guesses
+        const bool ok = fetch_direct(batch, ahead_, e, [this](int32_t slot) {
+            {
+                std::lock_guard<std::mutex> lk(pf_mu_);
+                pending_[(size_t) slot] = 0;
+            }
+            ready_cv_.notify_all();
+        });
+        uint64_t bytes = 0;
+        for (const auto& [owner, slot] : batch) bytes += src_[(size_t) (owner / n_expert_)].layout.bytes;
+        pf_bytes_ += bytes;
+        {
+            std::lock_guard<std::mutex> lk(pf_mu_);
+            for (const auto& [owner, slot] : batch) pending_[(size_t) slot] = 0;
+            if (!ok && pf_err_.empty()) pf_err_ = e;
+        }
+        ready_cv_.notify_all();
+    }
+}
+
+bool GlmExpertCache::wait_ready(int32_t s, std::string& err) {
+    std::unique_lock<std::mutex> lk(pf_mu_);
+    if (!pending_[(size_t) s] && pf_err_.empty()) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    ready_cv_.wait(lk, [&] { return !pending_[(size_t) s] || !pf_err_.empty(); });
+    stats_.wait_ms += ms_since(t0);
+    if (!pf_err_.empty()) {
+        err = "GlmExpertCache: reading ahead: " + pf_err_;
+        return false;
+    }
+    return true;
+}
+
+void GlmExpertCache::predict(int64_t il_next, const int32_t* ids, int k) {
+    if (prefetch_mode_ == 0 || il_next < 0 || il_next >= (int64_t) src_.size() || !src_[(size_t) il_next].gate ||
+        k <= 0 || k > 1024)
+        return;
+    guess_block_ = il_next;
+    guess_dev_ = ids;
+    guess_k_ = k;
+}
+
+/// Slots for the guessed experts of block il that are not resident - the least recent ones that this call does not
+/// use and that are not still filling - and their reads queued for the prefetch thread.
+void GlmExpertCache::prefetch(int64_t il, const int32_t* ids, int k) {
+    std::vector<std::pair<int64_t, int32_t>> jobs;
+    {
+        std::lock_guard<std::mutex> lk(pf_mu_);
+        for (int i = 0; i < k; ++i) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= n_expert_) continue;
+            const int64_t o = il * n_expert_ + e;
+            if (slot_of_[(size_t) o] >= 0) continue;
+            int32_t s = head_;
+            while (s >= 0 && (used_[(size_t) s] == call_ || pending_[(size_t) s])) s = next_[(size_t) s];
+            if (s < 0) break;
+            if (owner_[(size_t) s] >= 0) slot_of_[(size_t) owner_[(size_t) s]] = -1;
+            owner_[(size_t) s] = o;
+            slot_of_[(size_t) o] = s;
+            host_tables_[(size_t) o] = (unsigned long long) (uintptr_t) (blobs_ + slot_bytes_ * (uint64_t) s);
+            dirty_[(size_t) il] = 1;
+            pending_[(size_t) s] = 1;
+            ahead_filled_[(size_t) s] = 1;
+            unlink(s);
+            push_back(s);
+            jobs.emplace_back(o, s);
+        }
+        pf_queue_.insert(pf_queue_.end(), jobs.begin(), jobs.end());
+    }
+    stats_.prefetched += jobs.size();
+    if (!jobs.empty()) pf_cv_.notify_one();
 }
 
 bool GlmExpertCache::fill_all(std::string& err) {
@@ -366,12 +504,22 @@ const unsigned long long* GlmExpertCache::experts(int64_t il, const int32_t* ids
     const cudaStream_t st = (cudaStream_t) stream;
     const auto t0 = std::chrono::steady_clock::now();
     // the router's choice; the synchronization also means no kernel before it still reads a slot
+    const int64_t gb = guess_block_;
+    const int gk = guess_k_;
+    guess_block_ = -1;
     if (!cuda_ok(cudaMemcpyAsync(ids_host_, ids, (size_t) k * sizeof(int32_t), cudaMemcpyDeviceToHost, st), "ids",
                  err) ||
+        (gb >= 0 && !cuda_ok(cudaMemcpyAsync(guess_host_, guess_dev_, (size_t) gk * sizeof(int32_t),
+                                             cudaMemcpyDeviceToHost, st), "the guess", err)) ||
         !cuda_ok(cudaStreamSynchronize(st), "the router", err))
         return nullptr;
     stats_.sync_ms += ms_since(t0);
-    return admit(il, ids_host_, k, stream, err);
+    const unsigned long long* t = admit(il, ids_host_, k, stream, err);
+    if (t && gb >= 0) {   // scored at the next block's call; read ahead now, while this block computes
+        last_guess_[(size_t) gb].assign(guess_host_, guess_host_ + gk);
+        if (prefetch_mode_ == 2) prefetch(gb, guess_host_, gk);
+    }
+    return t;
 }
 
 const unsigned long long* GlmExpertCache::resident(int64_t il, const int32_t* experts, int n, void* stream,
@@ -394,6 +542,13 @@ const unsigned long long* GlmExpertCache::admit(int64_t il, const int32_t* ids_h
     const auto t0 = std::chrono::steady_clock::now();
     ++stats_.calls;
     const uint64_t call = ++call_;
+    std::vector<int32_t>& guess = last_guess_[(size_t) il];
+    if (!guess.empty()) {
+        stats_.guessed += guess.size();
+        for (int i = 0; i < k; ++i)
+            stats_.guessed_right += std::find(guess.begin(), guess.end(), ids_host[i]) != guess.end();
+        guess.clear();
+    }
     std::vector<int64_t> missing;
     for (int i = 0; i < k; ++i) {
         const int32_t e = ids_host[i];
@@ -405,6 +560,11 @@ const unsigned long long* GlmExpertCache::admit(int64_t il, const int32_t* ids_h
         const int32_t s = slot_of_[(size_t) o];
         if (s >= 0) {
             ++stats_.hits;
+            if (!wait_ready(s, err)) return nullptr;
+            if (ahead_filled_[(size_t) s]) {
+                ++stats_.prefetch_hits;
+                ahead_filled_[(size_t) s] = 0;
+            }
             used_[(size_t) s] = call;
             unlink(s);
             push_back(s);
@@ -412,11 +572,14 @@ const unsigned long long* GlmExpertCache::admit(int64_t il, const int32_t* ids_h
             missing.push_back(o);
         }
     }
-    if (missing.empty()) return tables_ + (size_t) il * (size_t) n_expert_;
+    if (missing.empty() && !dirty_[(size_t) il]) return tables_ + (size_t) il * (size_t) n_expert_;
     std::vector<std::pair<int64_t, int32_t>> jobs;
     for (int64_t o : missing) {
-        int32_t s = head_;   // the least recent slot this call does not hold
-        while (s >= 0 && used_[(size_t) s] == call) s = next_[(size_t) s];
+        int32_t s = head_;   // the least recent slot this call does not hold, and not one still being read ahead
+        {
+            std::lock_guard<std::mutex> lk(pf_mu_);
+            while (s >= 0 && (used_[(size_t) s] == call || pending_[(size_t) s])) s = next_[(size_t) s];
+        }
         if (s < 0) {
             err = "GlmExpertCache: " + std::to_string(owner_.size()) + " slots cannot hold one layer's " +
                   std::to_string(k) + " experts";
@@ -426,11 +589,13 @@ const unsigned long long* GlmExpertCache::admit(int64_t il, const int32_t* ids_h
         owner_[(size_t) s] = o;
         slot_of_[(size_t) o] = s;
         used_[(size_t) s] = call;
+        ahead_filled_[(size_t) s] = 0;
         unlink(s);
         push_back(s);
         host_tables_[(size_t) o] = (unsigned long long) (uintptr_t) (blobs_ + slot_bytes_ * (uint64_t) s);
         jobs.emplace_back(o, s);
     }
+    dirty_[(size_t) il] = 0;
     stats_.misses += jobs.size();
     if (!fetch(jobs, err)) return nullptr;
     // the block's table, from a pageable vector: staged before the call returns, so the next change cannot race it

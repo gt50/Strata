@@ -31,17 +31,37 @@
 // warm file the mapping is faster (13 GB/s into device slots against 5.5 for unbuffered reads, --bench), but the
 // model's experts are three times this PC's RAM.
 //
-// What it is not yet: no prefetch (a miss waits for the file), no CPU compute of misses, LRU only (no frequency
-// profile for the fill).
+// Prefetch (decode, with unbuffered reads): before a decode step's experts() for block il, the layer hands over a guess
+// at block il + 1's experts - the next block's router applied to this block's FFN input (predict()).  It comes to the
+// host in the same synchronization as the router's ids; after this block's own misses are in, the guessed experts that
+// are not resident get slots (never one this call uses, never one still filling) and a thread of their own reads them
+// (a second set of file handles, staging buffers and copy stream) while this block computes.  A slot being filled is
+// pending: a call that needs it waits for it, and no eviction takes it; each expert is released as it lands.
+// init's `prefetch`: 0 off, 1 the guesses counted without fetching, 2 read ahead.  STRATA_GLM_PREFETCH_AHEAD=N
+// guesses N blocks on instead of the next one.
+//
+// Measured on the real UD-IQ4_XS file (Radeon 8060S, Samsung 990 EVO Plus, 3,000 slots): the guess one block on is
+// right for 67-75% of the experts, two on 64-68%, four on 55-59%; reading ahead cut an answer's misses (788 -> 316 for
+// 9 tokens) but read 38% more bytes (wrong guesses, and the experts they push out), and the drive is the limit for
+// these scattered reads (2.4 GB/s in decode's pattern, 2.5-5.4 GB/s in rounds of 64, glm_loader_parity --bench-file):
+// decode 1.76 tokens/s without, 1.31-1.43 with (one to four blocks on).  So it is off by default.
+//
+// What it is not yet: no CPU compute of misses, LRU only (no frequency profile for the fill).
 #pragma once
 
 #include "strata/glm/glm_layer.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/platform/direct_file.hpp"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::glm {
@@ -61,6 +81,9 @@ public:
         uint64_t calls = 0, hits = 0, misses = 0, bytes = 0;
         double sync_ms = 0;    ///< waiting for the router's ids
         double fetch_ms = 0;   ///< copying misses into slots, the table upload included
+        uint64_t guessed = 0, guessed_right = 0;   ///< experts guessed for a block, and those its router then chose
+        uint64_t prefetched = 0, prefetch_hits = 0, prefetch_bytes = 0;   ///< read ahead, and of those then chosen
+        double wait_ms = 0;    ///< waiting for a slot still being read ahead
     };
 
     GlmExpertCache() = default;
@@ -72,7 +95,7 @@ public:
     /// host memory (`mapped_host`); `threads` copies at once.  The mapped file must outlive the cache.  `files`: the
     /// paths the sources' file indices name; when given (and every source has its files), misses are read unbuffered.
     bool init(std::vector<GlmExpertSource> sources, int64_t n_expert, int64_t slots, bool mapped_host, int threads,
-              std::string& err, const std::vector<std::string>& files = {});
+              std::string& err, const std::vector<std::string>& files = {}, int prefetch = 0);
     /// Fills the free slots with experts of every MoE block, an equal share each, in expert order.
     bool fill_all(std::string& err);
 
@@ -84,12 +107,15 @@ public:
     uint64_t slot_stride() const override { return slot_bytes_; }
     int32_t slot_of(int64_t il, int32_t e) const override { return slot_of_[(size_t) (il * n_expert_ + e)]; }
 
-    const Stats& stats() const { return stats_; }
+    Stats stats() const;
+    bool wants_prediction() const override { return prefetch_mode_ != 0; }
+    void predict(int64_t il_next, const int32_t* ids, int k) override;
     void reset_stats() { stats_ = Stats{}; }
     int64_t slots() const { return (int64_t) owner_.size(); }
     uint64_t slot_bytes() const { return slot_bytes_; }
     int64_t resident() const;   ///< slots holding an expert
-    bool direct() const { return !files_.empty(); }   ///< misses read unbuffered (not through the mapping)
+    bool direct() const { return !demand_.files.empty(); }   ///< misses read unbuffered (not through the mapping)
+    bool prefetching() const { return prefetch_mode_ == 2; }
 
 private:
     std::vector<GlmExpertSource> src_;
@@ -109,17 +135,45 @@ private:
     std::vector<uint64_t> used_;             ///< slot -> the call that last used it
     uint64_t call_ = 0;
     Stats stats_;
-    // unbuffered reads: the files, a ring of pinned staging buffers (stage_bytes_ each), an event each, a copy stream
-    std::vector<std::unique_ptr<platform::DirectFile>> files_;
-    uint8_t* staging_ = nullptr;
+    // unbuffered reads: the files, a ring of pinned staging buffers (stage_bytes_ each), an event each, a copy stream;
+    // one set for the misses a call waits for, one for the prefetch thread
+    struct ReadPath {
+        std::vector<std::unique_ptr<platform::DirectFile>> files;
+        uint8_t* staging = nullptr;
+        std::vector<void*> events;
+        void* stream = nullptr;
+    };
+    ReadPath demand_, ahead_;
     uint64_t stage_bytes_ = 0;
-    std::vector<void*> stage_events_;
-    void* copy_stream_ = nullptr;
+    // the prefetch: 0 off, 1 guesses counted only, 2 guesses read ahead
+    int prefetch_mode_ = 0;
+    int64_t guess_block_ = -1;               ///< predict()'s block, ids (device) and count, for the next experts()
+    const int32_t* guess_dev_ = nullptr;
+    int guess_k_ = 0;
+    int32_t* guess_host_ = nullptr;          ///< pinned
+    std::vector<std::vector<int32_t>> last_guess_;   ///< per block: the guess its next call is scored against
+    std::vector<char> dirty_;                ///< per block: table entries changed since its last upload
+    std::vector<char> ahead_filled_;         ///< per slot: read ahead and not used yet
+    std::thread pf_thread_;
+    std::mutex pf_mu_;                       ///< guards pending_, pf_queue_, pf_stop_, pf_err_
+    std::condition_variable pf_cv_, ready_cv_;
+    std::deque<std::pair<int64_t, int32_t>> pf_queue_;
+    std::vector<char> pending_;              ///< per slot: being read ahead
+    bool pf_stop_ = false;
+    std::string pf_err_;
+    std::atomic<uint64_t> pf_bytes_{0};
 
     void unlink(int32_t s);
     void push_back(int32_t s);
     bool fetch(const std::vector<std::pair<int64_t, int32_t>>& jobs, std::string& err);   ///< (owner, slot)
-    bool fetch_direct(const std::vector<std::pair<int64_t, int32_t>>& jobs, std::string& err);
+    /// `done(slot)`, when given: called as each job's expert is in its slot (not only at the end)
+    bool fetch_direct(const std::vector<std::pair<int64_t, int32_t>>& jobs, ReadPath& rp, std::string& err,
+                      const std::function<void(int32_t)>& done = {}) const;
+    bool open_path(ReadPath& rp, const std::vector<std::string>& files, std::string& err);
+    void close_path(ReadPath& rp);
+    void prefetch(int64_t il, const int32_t* ids, int k);   ///< slots and reads for a block's guess
+    void prefetch_loop();
+    bool wait_ready(int32_t s, std::string& err);
     /// The hits and misses of host ids[0, k) in block il, the stream synchronized before
     const unsigned long long* admit(int64_t il, const int32_t* ids, int k, void* stream, std::string& err);
     void release();

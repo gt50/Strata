@@ -424,8 +424,13 @@ bool GlmLoadedWeights::load(const GgufModel& m, const core::Glm5NextGeometry& g,
         if (opt.direct_reads && !(mapped && mapped[0] == '1'))
             for (size_t i = 0; i < m.size(); ++i) files.push_back(m.shard(i).path());
         cache_ = std::make_unique<GlmExpertCache>();
+        int prefetch = opt.prefetch;
+        if (prefetch < 0) {
+            const char* pf = std::getenv("STRATA_GLM_PREFETCH");
+            prefetch = !pf ? 0 : std::strcmp(pf, "measure") == 0 ? 1 : std::strcmp(pf, "0") == 0 ? 0 : 2;
+        }
         if (!cache_->init(std::move(src), NE, opt.expert_cache_slots, opt.experts == GlmExpertHome::MappedHost,
-                          opt.cache_threads, err, files) ||
+                          opt.cache_threads, err, files, prefetch) ||
             (opt.cache_fill && !cache_->fill_all(err)))
             return fail();
         return true;

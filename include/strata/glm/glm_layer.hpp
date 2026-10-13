@@ -99,6 +99,11 @@ public:
     virtual uint64_t slot_stride() const { return 0; }
     /// After resident(): the slot expert e of block il is in.
     virtual int32_t slot_of(int64_t il, int32_t e) const { (void) il; (void) e; return -1; }
+    /// Prefetching: a provider that wants them gets, before a decode step's experts() for block il, a guess at block
+    /// il_next's k experts (device ids written on the same stream: the next block's router applied to this block's
+    /// FFN input), to fetch while this block computes.
+    virtual bool wants_prediction() const { return false; }
+    virtual void predict(int64_t il_next, const int32_t* ids, int k) { (void) il_next; (void) ids; (void) k; }
 };
 
 class GlmPromptGemm;
@@ -127,6 +132,10 @@ public:
 
     /// the experts of a layer whose expert_ptrs are null (a cache), else unused
     GlmExpertProvider* expert_provider = nullptr;
+    /// A decode step: a later block's weights and index (GlmModel's loop sets them, STRATA_GLM_PREFETCH_AHEAD blocks
+    /// on, 1 by default), whose router the provider's prediction runs on this block's FFN input; null: no prediction.
+    const GlmLayerWeights* next_block = nullptr;
+    int64_t next_block_il = -1;
     /// A verify window (GlmModel::verify): more than one token through the DECODE kernels - each token's arithmetic a
     /// decode step's, never the prompt kernels' - so its logits are bitwise what decode would give.
     bool exact = false;
@@ -149,6 +158,8 @@ public:
     float *logits = nullptr, *ew = nullptr, *parts = nullptr, *shared = nullptr, *fg = nullptr, *fu = nullptr,
           *fh = nullptr;
     int32_t* eids = nullptr;
+    float *pred_logits = nullptr, *pred_w = nullptr;   ///< the next block's router on this block's input (1 token)
+    int32_t* pred_ids = nullptr;
     unsigned long long* grp_ptr = nullptr;
     int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
     int32_t* grp_expert = nullptr;
