@@ -8,6 +8,12 @@
 
 #include <cuda_runtime.h>
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
@@ -19,6 +25,7 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace strata::glm {
 namespace {
@@ -58,6 +65,58 @@ std::vector<int32_t> gguf_end_tokens(const GgufFile& f) {
             if (std::find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
         }
     return ids;
+}
+
+/// The host RAM the OS can still give (bytes), or 0 when it cannot be told.
+uint64_t host_available_bytes() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (uint64_t) ms.ullAvailPhys : 0;
+#else
+    std::FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    uint64_t kb = 0;
+    while (std::fgets(line, sizeof line, f))
+        if (std::sscanf(line, "MemAvailable: %llu kB", (unsigned long long*) &kb) == 1) break;
+    std::fclose(f);
+    return kb * 1024;
+#endif
+}
+
+/// An integrated GPU's device memory past its carve-out is the host's RAM, and the runtime's free figure counts that
+/// RAM too (the Radeon 8060S with 64 GB carved out of 128: 107.6 GiB "free").  So the room is measured: 4 GiB chunks
+/// are allocated and written until the host's available RAM would fall below `reserve` or an allocation fails, at most
+/// `cap` bytes; they are freed again and their total returned.
+uint64_t probe_device_room(uint64_t cap, uint64_t reserve, uint64_t& host_before, uint64_t& host_after) {
+    const uint64_t step = (uint64_t) 4 << 30;
+    std::vector<void*> chunks;
+    uint64_t got = 0;
+    host_before = host_after = host_available_bytes();
+    while (got + step <= cap) {
+        void* c = nullptr;
+        if (cudaMalloc(&c, step) != cudaSuccess) {
+            cudaGetLastError();
+            break;
+        }
+        if (cudaMemset(c, 0, step) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {   // committed now
+            cudaGetLastError();
+            cudaFree(c);
+            break;
+        }
+        const uint64_t avail = host_available_bytes();
+        if (avail != 0 && avail < reserve) {   // this one took the reserve: not counted
+            cudaFree(c);
+            break;
+        }
+        chunks.push_back(c);
+        got += step;
+        host_after = avail;
+    }
+    for (void* c : chunks) cudaFree(c);
+    cudaDeviceSynchronize();
+    return got;
 }
 
 }  // namespace
@@ -116,6 +175,10 @@ bool glm_serve_options(int argc, char** argv, GlmServeOptions& o, std::string& e
             o.expert_cache_slots = std::atoll(v);
         } else if (a == "--glm-experts-host") {
             o.experts_host = true;
+        } else if (a == "--glm-host-reserve-gb") {
+            const char* v = value("--glm-host-reserve-gb");
+            if (!v) return false;
+            o.host_reserve_gb = std::max(0.0, std::atof(v));
         } else {
             const bool valued = std::find_if(std::begin(kValued), std::end(kValued),
                                              [&](const char* k) { return a == k; }) != std::end(kValued);
@@ -181,6 +244,22 @@ bool GlmServer::load(const GlmServeOptions& o, std::string& err, const std::func
         }
         const uint64_t margin = (uint64_t) 3 << 30;   // the context's state and scratch, the runtime's own
         const uint64_t blob = plan.expert_slot_bytes;   // a slot holds any layer's blob: the largest
+        int dev = 0;
+        cudaDeviceProp prop{};
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess && prop.integrated &&
+            plan.device_bytes + plan.expert_bytes + margin > free_b) {
+            // an APU: the room is what can be allocated while the host keeps its reserve, not the runtime's figure
+            const uint64_t reserve = (uint64_t) (o.host_reserve_gb * 1e9);
+            uint64_t before = 0, after = 0;
+            // the probe keeps more than the reserve: the margin (the context and scratch take it after the probe) and
+            // 4 GB for the engine's own host memory (the runtime, staging buffers, the process: measured ~3.4 GB here)
+            const uint64_t host_own = (uint64_t) 4 << 30;
+            const uint64_t room = probe_device_room(free_b, reserve + margin + host_own, before, after);
+            log(fmt("strata serve (GLM): an integrated GPU: %.1f GB of device memory leave the host %.1f GB of RAM "
+                    "available (%.1f GB before; --glm-host-reserve-gb %.0f), of the runtime's %.1f GB free",
+                    room / 1e9, after / 1e9, before / 1e9, o.host_reserve_gb, free_b / 1e9));
+            free_b = std::min<uint64_t>(free_b, room);
+        }
         if (plan.device_bytes + plan.expert_bytes + margin > free_b && blob > 0) {
             const uint64_t room = free_b > plan.device_bytes + margin ? free_b - plan.device_bytes - margin : 0;
             lo.expert_cache_slots = std::max<int64_t>(64, (int64_t) (room / blob));
@@ -205,6 +284,12 @@ bool GlmServer::load(const GlmServeOptions& o, std::string& err, const std::func
         return false;
     }
     p.eos = o.eos_ids.empty() ? gguf_end_tokens(p.gguf->meta()) : o.eos_ids;
+#if defined(_WIN32)
+    // the dense weights were read through the file's mapping: their pages stay in this process's working set, which
+    // Windows does not count as available RAM (an APU's slots were sized to leave that RAM to the host).  Trimmed,
+    // they go to the standby list - available, and read again from it only if touched.
+    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
+#endif
     log(fmt("strata serve (GLM): loaded in %.1f s; context %lld, MTP %s, %d drafts a round, end tokens %zu",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), (long long) o.max_ctx,
             p.model.has_mtp() ? "yes" : "no", p.model.has_mtp() ? std::min(o.n_draft, max_t - 1) : 0, p.eos.size()));

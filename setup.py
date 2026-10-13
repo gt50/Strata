@@ -4933,7 +4933,7 @@ def install_glm(a, gpu, hip, amd, ram, multi, roots, port, cuda_tk, elsewhere) -
     files.  What setup does: one size, the context, the download (pinned, SHA-256 checked), the tokenizer, the config."""
     fam = FAMILIES["glm"]
     warn("GLM-5.3-Flash is EXPERIMENTAL in Strata: it answers correctly, but on the one PC it has run on (a Radeon 8060S "
-         "with 64 GB of RAM) about 2 tokens per second, because most of its experts are read from the model files as it "
+         "with 64 GB of RAM) 2-3 tokens per second, because many of its experts are read from the model files as it "
          "answers (docs/GLM.md) - please report how it runs")
     say()
     sizes = fam["models"]

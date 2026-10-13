@@ -35,6 +35,8 @@ struct GlmServeOptions {
     int64_t expert_cache_slots = -1;  ///< --glm-expert-cache N: experts streamed through N slots; 0 all resident;
                                       ///< -1 (default) resident when they fit, else as many slots as fit
     bool experts_host = false;        ///< --glm-experts-host: the experts (or their slots) in mapped host memory
+    double host_reserve_gb = 12.0;    ///< --glm-host-reserve-gb: on an integrated GPU the automatic count leaves the
+                                      ///< host this much RAM available (its device memory past the carve-out is RAM)
 };
 
 /// Whether the GGUF at `path` (any shard) is a GLM-5.3-Flash one: what generate.cpp dispatches on.

@@ -1,7 +1,7 @@
 # GLM-5.3-Flash (experimental)
 
-**Experimental: the real model runs and answers correctly on one PC, but slowly (about 2 tokens per second, 14-17 s
-before a short prompt's first token) while most of its experts come from the SSD.** Strata's GLM-5.3-Flash support runs [Z.ai's GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
+**Experimental: the real model runs and answers correctly on one PC, but slowly (2.2-3 tokens per second, 4-12 s
+before a short prompt's first token) while many of its experts come from the SSD.** Strata's GLM-5.3-Flash support runs [Z.ai's GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 from [Unsloth's UD-IQ4_XS GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) on its own engine path (`src/glm`):
 another architecture than Qwen3.8-Flash-Next, with none of the Qwen engine's packs, memory modes or draft layer. Every
 piece below was checked against a double-precision transcription of llama.cpp's `glm5-next` graph on small synthetic
@@ -16,7 +16,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 
 | | |
 | --- | --- |
-| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 1.7-1.9 tokens/s and 13-17 s for a 20-token prompt, bound by reading experts from the SSD |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s and 4-12 s for a 20-token prompt, bound by reading experts from the SSD |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
@@ -67,10 +67,16 @@ Linux: `./setup.sh --setup --family glm`. Setup:
 Setup options made for the Qwen models (`--kv`, `--vision`, `--draft-vocab`, `--parallel`, `--low-ram`,
 `--resident-budget-gib`, `--kv-streaming`, `--vram-reserve-mib`, ...) are said and left out.
 
-**Memory.** The engine puts the weights other than the routed experts on the GPU (their size is not known yet: shard 1
-has no tensors), then all the experts if they fit the free GPU memory beside them and 3 GB of room, else as many
-cache slots as fit (at least 64). Experts not in a slot are copied from the mapped model files when a token chooses
-them, so the OS file cache and the SSD carry the rest. How fast that is with the real file is not measured.
+**Memory.** The engine puts the 10 GB of weights other than the routed experts on the GPU, then all 147 GB of
+experts if they fit the free GPU memory beside them and 3 GB of room, else as many cache slots of 15.8 MB as fit (at
+least 64); experts not in a slot are read from the model files when a token chooses them. On an integrated GPU (an
+APU) the runtime's free figure counts the system RAM the GPU can share (the 8060S with 64 GB carved out of 128
+reports 115 GB free), and memory past the carve-out is taken from Windows' RAM. So there the engine measures the room
+at start: it allocates and writes 4 GB pieces until the RAM Windows has available would fall below the reserve
+(`--glm-host-reserve-gb`, 12 GB, plus 3 GB of room for the context and 4 GB for the engine's own host memory), then
+frees them and sizes the slots to that: on the 8060S 90.2 GB, 4,874 slots, and 12.3 GB of RAM left available once
+loaded. After loading, the engine trims its working set (Windows), so the dense weights' file pages count as
+available again.
 
 ## Engine options
 
@@ -83,6 +89,7 @@ The config's `args`; the server adds `--serve`.
 | `--spec N` | 0 | MTP drafts per round (speculative decoding). Off by default: not measured on the real model, and a window reads more experts, which costs more when they come from the SSD |
 | `--glm-expert-cache N` | auto | `0`: every expert resident; `N`: stream them through N slots; auto: resident when they fit (above) |
 | `--glm-experts-host` | off | the experts (or their slots) in mapped host memory instead of device memory |
+| `--glm-host-reserve-gb N` | 12 | an integrated GPU: the RAM the automatic slot count leaves Windows (or Linux) available |
 | `--glm-chunk N` | 256 | prompt tokens per pass (at least 16) |
 | `--eos-ids a,b,c` | the file's | end tokens; the file's eos, eot and eom: `<|endoftext|>`, `<|user|>`, `<|observation|>` |
 
@@ -204,6 +211,20 @@ limit for these scattered reads, so 38-60% more bytes cost more time than the ov
 (it differs by layer, within one shard), 2.4 GB/s in decode's pattern (8 experts a layer, layer after layer). The
 default speed also varies from run to run with the drive: 4.0-4.5 s to read the same 9.4 GB.
 
+**More slots.** On the APU the slots can go past the carve-out into Windows' RAM, which the unbuffered reads leave
+otherwise idle (no file cache to feed). The same requests, by slot count (`--glm-expert-cache N`; the last row the
+automatic count above), the RAM Windows had available once loaded:
+
+| Slots | RAM available | 24-token prompt | 21-token prompt | Decode (9 / 22 tokens) | An answer's misses (9 tokens) |
+| --- | --- | --- | --- | --- | --- |
+| 3,000 (47 GB) | 31.3 GB | 17.2 s | 13.5 s | 1.83 / 1.73 tokens/s | 788 |
+| 3,800 (60 GB) | 23.4 GB | 15.7 s | 13.1 s | 2.64 / 1.96 tokens/s | 515 |
+| 4,600 (73 GB) | 11.0 GB | 12.7 s | 4.2 s | 2.91 / 2.31 tokens/s | 462 |
+| 4,874 (77 GB, automatic) | 12.3 GB | 11.9 s | 4.2 s | 2.95 / 2.39 tokens/s | 450 |
+
+The 180-token prompt with a tool: 39.2 s, then 2.25 tokens/s (43.8 s and 1.86 with 3,000 slots). The fill reads the
+slots' experts at start (an equal share of every layer), so loading takes 39-46 s instead of 20-26.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -224,9 +245,8 @@ python tools/test_setup_glm.py
 
 ## Not done yet
 
-- More expert slots: the misses are the cost, and the drive is the limit, so a larger cache (on an APU, in shared
-  memory) should pay where prefetching did not; and an automatic slot count for APUs, whose reported free GPU memory includes shared system RAM (on the 8060S 115 GB: the automatic count did
-  not fit; the run above set `--glm-expert-cache 3000`).
+- A better choice of what the slots hold: LRU only, and the start fill takes an equal share of every layer in expert
+  order (no frequency profile, as the Qwen models have).
 - Quality against llama.cpp on the same file.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
