@@ -387,6 +387,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kpool.cu
                           src/kernels/cuda/glm_moe.cu
                           src/kernels/cuda/mhc.cu
+                          src/kernels/cuda/glm_linear.cu
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
@@ -898,6 +899,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(mhc_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(mhc_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME mhc_parity COMMAND mhc_parity --selftest)
+
+  # GLM-5.3-Flash's layer glue: one block at decode from the kernels above (src/glm), and its test through three
+  # synthetic blocks against a double transcription of the glm5-next layer
+  add_library(strata_glm STATIC src/glm/glm_layer.cpp)
+  target_include_directories(strata_glm PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata_glm PUBLIC strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(glm_layer_parity src/glm/glm_layer_parity.cpp)
+  target_include_directories(glm_layer_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_layer_parity PRIVATE strata_glm strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME glm_layer_parity COMMAND glm_layer_parity --selftest)
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${_strata_gpu_include_directories})
