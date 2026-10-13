@@ -36,4 +36,8 @@ void glm_expert_groups_decode(const int32_t* ids, const unsigned long long* expe
                               unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
                               int32_t* ent_tok, void* stream);
 
+/// grp_ptr[g] = table[experts[g]] for g < n: a prompt round's blob addresses from a provider's table (both device).
+void glm_expert_group_ptrs(const unsigned long long* table, const int32_t* experts, int n, unsigned long long* grp_ptr,
+                           void* stream);
+
 }  // namespace strata::kernels

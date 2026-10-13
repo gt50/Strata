@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::glm {
 
@@ -82,6 +83,12 @@ public:
     /// the stream.  Null on failure, with `err` set.
     virtual const unsigned long long* experts(int64_t il, const int32_t* ids, int k, void* stream,
                                               std::string& err) = 0;
+    /// A prompt's experts, a round at a time: the same table with `experts` (host ids, distinct, at most
+    /// capacity()) resident until the next call.  Synchronizes the stream first (the round before may still read).
+    virtual const unsigned long long* resident(int64_t il, const int32_t* experts, int n, void* stream,
+                                               std::string& err) = 0;
+    /// The experts one call can hold.
+    virtual int64_t capacity() const = 0;
 };
 
 /// The per-token values and the scratch every layer shares: one per model (and stream).
@@ -91,15 +98,20 @@ public:
     ~GlmContext();
     GlmContext(const GlmContext&) = delete;
     GlmContext& operator=(const GlmContext&) = delete;
-    /// Allocates for the geometry and a context of max_ctx cells.
-    bool init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::string& err);
-    /// The step for the token at `pos` (kpool_step's, which MLA and the indexer read), uploaded on `stream`.
-    void set_pos(int64_t pos, void* stream);
+    /// Allocates for the geometry, a context of max_ctx cells, and up to max_tokens tokens a call (a prompt's chunk).
+    bool init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::string& err, int64_t max_tokens = 1);
+    /// The steps for the n tokens at pos0 .. pos0 + n - 1 (kpool_step's, which MLA and the indexer read), uploaded on
+    /// `stream`: the tokens the next layer calls run.  n <= max_tokens; set_pos is the one-token case.
+    void set_positions(int64_t pos0, int64_t n, void* stream);
+    void set_pos(int64_t pos, void* stream) { set_positions(pos, 1, stream); }
     int64_t max_ctx() const { return max_ctx_; }
+    int64_t max_tokens() const { return max_tokens_; }
+    int64_t tokens() const { return n_; }
 
     /// the experts of a layer whose expert_ptrs are null (a cache), else unused
     GlmExpertProvider* expert_provider = nullptr;
-    // the step, and the selection a full-indexer layer leaves for the shared ones after it
+    // the steps [tokens][kStepCount], and the selections [tokens][cap] a full-indexer layer leaves for the shared ones
+    // after it
     int32_t* step = nullptr;
     int32_t* sel_ids = nullptr;
     bool sel_valid = false;
@@ -115,11 +127,16 @@ public:
     int32_t* eids = nullptr;
     unsigned long long* grp_ptr = nullptr;
     int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
+    int32_t* grp_expert = nullptr;
     void *q8 = nullptr, *xq = nullptr, *exp_scr = nullptr;
+    float* kda_scr = nullptr;   ///< kda_scan_norm_chunked's, for more than one token
 
 private:
-    int64_t max_ctx_ = 0, cap_ = 0, max_blocks_ = 0;
-    int64_t pos_ = -1;   ///< set_pos's, for mla_kv_store's row
+    int64_t max_ctx_ = 0, cap_ = 0, max_blocks_ = 0, max_tokens_ = 1;
+    int64_t pos_ = -1;   ///< set_positions' first position, for mla_kv_store's row
+    int64_t n_ = 0;      ///< and its token count
+    int32_t* eids_host_ = nullptr;   ///< pinned: a prompt's router choices, grouped on the host
+    std::vector<int32_t> h_expert_, h_start_, h_tok_, h_dst_;
     int64_t top_k_ = 0;
     bool select_tail_ = true;
     void* arena_ = nullptr;
@@ -137,8 +154,11 @@ size_t glm_layer_state_bytes(const core::Glm5NextGeometry& g, int64_t il, int64_
 /// Carves `base` (device, glm_layer_state_bytes of it) into `st`.
 void glm_layer_state_carve(const core::Glm5NextGeometry& g, int64_t il, int64_t max_ctx, void* base, GlmLayerState& st);
 
-/// The token at ctx's position through block `il`: X [4][n_embd] (the four streams) updated in place, the block's
-/// state too.  A shared-indexer MLA layer takes the selection the last full-indexer layer left in ctx.
+/// The tokens of ctx's positions (set_positions: one at decode, a chunk of a prompt) through block `il`: X
+/// [tokens][4][n_embd] (each token's four streams) updated in place, the block's state too.  A shared-indexer MLA layer
+/// takes the selections the last full-indexer layer left in ctx.  One token runs the decode kernels (kda_scan_norm,
+/// mla_decode_attn_step, the experts grouped on the device); more run the prompt ones (kda_scan_norm_chunked,
+/// mla_prompt_attn, the experts grouped on the host, in rounds of what an expert provider holds).
 bool glm_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, const GlmLayerState& st,
                       GlmContext& ctx, float* x, void* stream, std::string& err);
 

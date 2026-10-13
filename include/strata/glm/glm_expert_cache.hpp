@@ -61,6 +61,9 @@ public:
     bool fill_all(std::string& err);
 
     const unsigned long long* experts(int64_t il, const int32_t* ids, int k, void* stream, std::string& err) override;
+    const unsigned long long* resident(int64_t il, const int32_t* experts, int n, void* stream,
+                                       std::string& err) override;
+    int64_t capacity() const override { return (int64_t) owner_.size(); }
 
     const Stats& stats() const { return stats_; }
     void reset_stats() { stats_ = Stats{}; }
@@ -90,6 +93,8 @@ private:
     void unlink(int32_t s);
     void push_back(int32_t s);
     bool fetch(const std::vector<std::pair<int64_t, int32_t>>& jobs, std::string& err);   ///< (owner, slot)
+    /// The hits and misses of host ids[0, k) in block il, the stream synchronized before
+    const unsigned long long* admit(int64_t il, const int32_t* ids, int k, void* stream, std::string& err);
     void release();
 };
 

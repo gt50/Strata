@@ -42,50 +42,57 @@ bool full_indexer(const core::Glm5NextGeometry& g, int64_t il) {
 
 GlmContext::~GlmContext() {
     if (arena_) cudaFree(arena_);
+    if (eids_host_) cudaFreeHost(eids_host_);
 }
 
-bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::string& err) {
+bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::string& err, int64_t max_tokens) {
     if (arena_) { err = "GlmContext::init: already initialized"; return false; }
-    if (max_ctx <= 0 || g.idx_kpool != k::kKpool || g.idx_key_dim != k::kKpoolDim || g.idx_heads != k::kKpoolHeads ||
-        g.kv_lora_rank != k::kMlaLatent || g.kda_head_dim != k::kKdaHeadDim || g.hc != k::kMhcStreams) {
+    if (max_ctx <= 0 || max_tokens <= 0 || g.idx_kpool != k::kKpool || g.idx_key_dim != k::kKpoolDim ||
+        g.idx_heads != k::kKpoolHeads || g.kv_lora_rank != k::kMlaLatent || g.kda_head_dim != k::kKdaHeadDim ||
+        g.hc != k::kMhcStreams) {
         err = "GlmContext::init: a geometry the kernels are not compiled for, or no context";
         return false;
     }
     max_ctx_ = max_ctx;
+    max_tokens_ = max_tokens;
     top_k_ = g.idx_top_k;
     select_tail_ = g.idx_kpool_select_tail;
     cap_ = g.idx_top_k + g.idx_kpool - 1;
     max_blocks_ = max_ctx / g.idx_kpool + 1;
+    const int64_t T = max_tokens;
     const int64_t D = g.n_embd, H = g.n_head, di = g.n_head * g.kda_head_dim, L = g.kv_lora_rank;
-    const int64_t kU = g.n_expert_used, ff = std::max(g.n_ff_dense, g.n_ff_shexp);
+    const int64_t kU = std::max<int64_t>(g.n_expert_used, 1), ff = std::max<int64_t>(std::max(g.n_ff_dense, g.n_ff_shexp), 1);
     const int64_t max_in = std::max({2 * D, di, g.kda_head_dim, g.q_lora_rank, H * g.head_dim_v, ff});
-    const int64_t mix_scr = (int64_t) k::mhc_pre_scratch_floats(1, (int) D);
+    const int64_t mix_scr = (int64_t) k::mhc_pre_scratch_floats((int) T, (int) D);
     const int64_t attn_floats = (int64_t) k::mla_decode_attn_scratch_floats((int) H, cap_);
+    const int64_t groups = std::min<int64_t>(std::max<int64_t>(g.n_expert, 1), T * kU);
     for (int pass = 0; pass < 2; ++pass) {
         Carver c;
         c.base = (uint8_t*) arena_;
-        step = c.take<int32_t>(k::kStepCount);
-        sel_ids = c.take<int32_t>((size_t) cap_);
-        h = c.take<float>(D); f = c.take<float>(D); post = c.take<float>(4); comb = c.take<float>(16);
+        step = c.take<int32_t>(T * k::kStepCount);
+        sel_ids = c.take<int32_t>(T * cap_);
+        h = c.take<float>(T * D); f = c.take<float>(T * D); post = c.take<float>(T * 4); comb = c.take<float>(T * 16);
         mhc_scr = c.take<float>(mix_scr);
-        qkv = c.take<float>(3 * di); qkv_c = c.take<float>(3 * di); raw = c.take<float>(di); gate = c.take<float>(di);
-        beta = c.take<float>(H); z = c.take<float>(di); y = c.take<float>(di); lo = c.take<float>(g.kda_head_dim);
-        qr = c.take<float>(g.q_lora_rank); q = c.take<float>(H * g.head_dim_k); kv = c.take<float>(L);
-        q_abs = c.take<float>(H * L); o_lat = c.take<float>(H * L); o_mla = c.take<float>(H * g.head_dim_v);
+        qkv = c.take<float>(T * 3 * di); qkv_c = c.take<float>(T * 3 * di); raw = c.take<float>(T * di);
+        gate = c.take<float>(T * di); beta = c.take<float>(T * H); z = c.take<float>(T * di); y = c.take<float>(T * di);
+        lo = c.take<float>(T * g.kda_head_dim);
+        qr = c.take<float>(T * g.q_lora_rank); q = c.take<float>(T * H * g.head_dim_k); kv = c.take<float>(T * L);
+        q_abs = c.take<float>(T * H * L); o_lat = c.take<float>(T * H * L); o_mla = c.take<float>(T * H * g.head_dim_v);
         attn_scr = c.take<float>(attn_floats);
-        iq = c.take<float>(g.idx_heads * g.idx_key_dim); ik = c.take<float>(g.idx_key_dim);
-        ig = c.take<float>(g.idx_key_dim); iw = c.take<float>(g.idx_heads); scores = c.take<float>(max_blocks_);
-        logits = c.take<float>(std::max<int64_t>(g.n_expert, 1)); ew = c.take<float>(std::max<int64_t>(kU, 1));
-        parts = c.take<float>(std::max<int64_t>(kU, 1) * D); shared = c.take<float>(D);
-        fg = c.take<float>(std::max<int64_t>(ff, 1)); fu = c.take<float>(std::max<int64_t>(ff, 1));
-        fh = c.take<float>(std::max<int64_t>(ff, 1));
-        eids = c.take<int32_t>(std::max<int64_t>(kU, 1));
-        grp_ptr = c.take<unsigned long long>(std::max<int64_t>(kU, 1));
-        grp_start = c.take<int32_t>(kU + 1); n_groups = c.take<int32_t>(1);
-        ent_dst = c.take<int32_t>(std::max<int64_t>(kU, 1)); ent_tok = c.take<int32_t>(std::max<int64_t>(kU, 1));
-        q8 = c.take<uint8_t>(k::glm_linear_scratch_bytes(max_in, 1));
-        xq = c.take<uint8_t>(k::glm_linear_scratch_bytes(D, 1));
-        exp_scr = c.take<uint8_t>(g.n_expert_used > 0 ? k::native_expert_scratch_bytes(kU, g.n_ff_exp) : 0);
+        iq = c.take<float>(T * g.idx_heads * g.idx_key_dim); ik = c.take<float>(T * g.idx_key_dim);
+        ig = c.take<float>(T * g.idx_key_dim); iw = c.take<float>(T * g.idx_heads); scores = c.take<float>(T * max_blocks_);
+        logits = c.take<float>(T * std::max<int64_t>(g.n_expert, 1)); ew = c.take<float>(T * kU);
+        parts = c.take<float>(T * kU * D); shared = c.take<float>(T * D);
+        fg = c.take<float>(T * ff); fu = c.take<float>(T * ff); fh = c.take<float>(T * ff);
+        eids = c.take<int32_t>(T * kU);
+        grp_ptr = c.take<unsigned long long>(groups);
+        grp_start = c.take<int32_t>(groups + 1); n_groups = c.take<int32_t>(1);
+        ent_dst = c.take<int32_t>(T * kU); ent_tok = c.take<int32_t>(T * kU);
+        grp_expert = c.take<int32_t>(groups);
+        q8 = c.take<uint8_t>(k::glm_linear_scratch_bytes(max_in, (int) T));
+        xq = c.take<uint8_t>(k::glm_linear_scratch_bytes(D, (int) T));
+        exp_scr = c.take<uint8_t>(g.n_expert_used > 0 ? k::native_expert_scratch_bytes(T * kU, g.n_ff_exp) : 0);
+        kda_scr = c.take<float>(T > 1 ? k::kda_chunked_scratch_floats((int) H, (int) T) : 0);
         if (pass == 0) {
             if (cudaMalloc(&arena_, c.off) != cudaSuccess) {
                 cudaGetLastError();
@@ -96,16 +103,23 @@ bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::str
             cudaMemset(arena_, 0, c.off);
         }
     }
+    if (cudaHostAlloc((void**) &eids_host_, (size_t) (T * kU) * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        eids_host_ = nullptr;
+        err = "GlmContext::init: the router's pinned host buffer";
+        return false;
+    }
     return true;
 }
 
-void GlmContext::set_pos(int64_t pos, void* stream) {
-    int32_t st[k::kStepCount];
-    k::kpool_step(pos, top_k_, select_tail_, st);
-    // from the stack: the copy is complete when the call returns (pageable memory), so `st` may go out of scope
-    cudaMemcpyAsync(step, st, sizeof st, cudaMemcpyHostToDevice, (cudaStream_t) stream);
+void GlmContext::set_positions(int64_t pos0, int64_t n, void* stream) {
+    std::vector<int32_t> st((size_t) (n * k::kStepCount));
+    for (int64_t t = 0; t < n; ++t) k::kpool_step(pos0 + t, top_k_, select_tail_, &st[(size_t) (t * k::kStepCount)]);
+    // pageable: the copy is staged when the call returns, so `st` may go out of scope
+    cudaMemcpyAsync(step, st.data(), st.size() * sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) stream);
     cudaStreamSynchronize((cudaStream_t) stream);
-    pos_ = pos;
+    pos_ = pos0;
+    n_ = n;
 }
 
 size_t glm_layer_state_bytes(const core::Glm5NextGeometry& g, int64_t il, int64_t max_ctx) {
@@ -141,7 +155,8 @@ void glm_layer_state_carve(const core::Glm5NextGeometry& g, int64_t il, int64_t 
     }
 }
 
-/// The two sublayers between the mHC (or the MTP block's residual) and the block: ctx.h (normed) in, ctx.f out.
+/// The two sublayers between the mHC (or the MTP block's residual) and the block: ctx.h (normed) in, ctx.f out, for
+/// ctx's n tokens.
 struct GlmLayerImpl {
     static bool ready(const core::Glm5NextGeometry& g, int64_t il, const GlmContext& ctx, const float* x,
                       const char* who, std::string& err);
@@ -149,6 +164,8 @@ struct GlmLayerImpl {
                           const GlmLayerState& st, GlmContext& ctx, void* stream, std::string& err);
     static bool ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, GlmContext& ctx,
                     void* stream, std::string& err);
+    static bool experts_prompt(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, GlmContext& ctx,
+                               void* stream, std::string& err);
 };
 
 bool GlmLayerImpl::ready(const core::Glm5NextGeometry& g, int64_t il, const GlmContext& ctx, const float* x,
@@ -157,8 +174,9 @@ bool GlmLayerImpl::ready(const core::Glm5NextGeometry& g, int64_t il, const GlmC
         err = std::string(who) + ": no context, or block " + std::to_string(il) + " out of range";
         return false;
     }
-    if (ctx.pos_ < 0 || ctx.pos_ >= ctx.max_ctx_) {
-        err = std::string(who) + ": position " + std::to_string(ctx.pos_) + " outside the context";
+    if (ctx.n_ < 1 || ctx.n_ > ctx.max_tokens_ || ctx.pos_ < 0 || ctx.pos_ + ctx.n_ > ctx.max_ctx_) {
+        err = std::string(who) + ": positions " + std::to_string(ctx.pos_) + " + " + std::to_string(ctx.n_) +
+              " outside the context, or more tokens than the context was made for";
         return false;
     }
     return true;
@@ -168,93 +186,194 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
                              const GlmLayerState& st, GlmContext& ctx, void* stream, std::string& err) {
     const int H = (int) g.n_head, L = (int) g.kv_lora_rank, DK = (int) g.head_dim_k, DV = (int) g.head_dim_v;
     const int di = H * (int) g.kda_head_dim;
+    const int n = (int) ctx.n_;
     const float rms_eps = (float) g.rms_eps;
     void* q8 = ctx.q8;
-    auto lin = [&](const GlmLinear& m, const float* in, float* out) { k::glm_linear(m, in, out, 1, q8, stream); };
+    auto lin = [&](const GlmLinear& m, const float* in, float* out) { k::glm_linear(m, in, out, n, q8, stream); };
     if (!g.is_mla[(size_t) il]) {
-        lin(w.wq, ctx.h, ctx.qkv);
-        lin(w.wk, ctx.h, ctx.qkv + di);
-        lin(w.wv, ctx.h, ctx.qkv + 2 * di);
-        k::kda_conv_l2(st.conv_hist, ctx.qkv, w.conv_q, w.conv_k, w.conv_v, ctx.qkv_c, H, 1, 1e-6f, stream);
+        if (n == 1) {
+            lin(w.wq, ctx.h, ctx.qkv);
+            lin(w.wk, ctx.h, ctx.qkv + di);
+            lin(w.wv, ctx.h, ctx.qkv + 2 * di);
+        } else {   // [n][di] each, then interleaved into [n][q | k | v] (y, z and gate are free until later)
+            lin(w.wq, ctx.h, ctx.y);
+            lin(w.wk, ctx.h, ctx.z);
+            lin(w.wv, ctx.h, ctx.gate);
+            const cudaStream_t s = (cudaStream_t) stream;
+            const size_t row = (size_t) di * sizeof(float);
+            cudaMemcpy2DAsync(ctx.qkv, 3 * row, ctx.y, row, row, (size_t) n, cudaMemcpyDeviceToDevice, s);
+            cudaMemcpy2DAsync(ctx.qkv + di, 3 * row, ctx.z, row, row, (size_t) n, cudaMemcpyDeviceToDevice, s);
+            cudaMemcpy2DAsync(ctx.qkv + 2 * di, 3 * row, ctx.gate, row, row, (size_t) n, cudaMemcpyDeviceToDevice, s);
+        }
+        k::kda_conv_l2(st.conv_hist, ctx.qkv, w.conv_q, w.conv_k, w.conv_v, ctx.qkv_c, H, n, 1e-6f, stream);
         lin(w.f_a, ctx.h, ctx.lo);
         lin(w.f_b, ctx.lo, ctx.raw);
-        k::kda_gate(ctx.raw, w.dt_bias, w.ssm_a, ctx.gate, H, 1, g.has_kda_gate_lower_bound,
+        k::kda_gate(ctx.raw, w.dt_bias, w.ssm_a, ctx.gate, H, n, g.has_kda_gate_lower_bound,
                     (float) g.kda_gate_lower_bound, stream);
         lin(w.beta, ctx.h, ctx.beta);
-        k::gdn_beta_gate(ctx.beta, H, stream);
+        k::gdn_beta_gate(ctx.beta, (int64_t) n * H, stream);
         lin(w.g_a, ctx.h, ctx.lo);
         lin(w.g_b, ctx.lo, ctx.z);
-        k::kda_scan_norm(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H, 1, stream);
+        if (n == 1)
+            k::kda_scan_norm(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H, 1, stream);
+        else
+            k::kda_scan_norm_chunked(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H,
+                                     n, ctx.kda_scr, stream);
         lin(w.wo, ctx.y, ctx.f);
         return true;
     }
     lin(w.wq_a, ctx.h, ctx.qr);
-    k::rms_norm_weighted(ctx.qr, w.q_a_norm, 1, g.q_lora_rank, rms_eps, stream);
+    k::rms_norm_weighted(ctx.qr, w.q_a_norm, n, g.q_lora_rank, rms_eps, stream);
     lin(w.wq_b, ctx.qr, ctx.q);
     lin(w.wkv_a, ctx.h, ctx.kv);
     // (the one argument that still comes from the host: mla_kv_store's row)
-    k::mla_kv_store(ctx.kv, w.kv_a_norm, rms_eps, st.latent, ctx.pos_, 1, stream);
-    k::mla_head_gemv(ctx.q, w.k_b, ctx.q_abs, H, DK, L, 1, stream);
+    k::mla_kv_store(ctx.kv, w.kv_a_norm, rms_eps, st.latent, ctx.pos_, n, stream);
+    k::mla_head_gemv(ctx.q, w.k_b, ctx.q_abs, H, DK, L, n, stream);
     if (full_indexer(g, il)) {
         lin(w.idx_q_b, ctx.qr, ctx.iq);
         lin(w.idx_k, ctx.h, ctx.ik);
         lin(w.idx_gate, ctx.h, ctx.ig);
-        k::kpool_key_store(ctx.ik, ctx.ig, w.idx_k_norm, w.idx_k_norm_b, (float) g.norm_eps, st.idx_cache, 0, 1,
-                           ctx.step, stream);
-        k::kpool_pool(st.idx_cache, w.idx_ape, st.pooled, 0, 0, ctx.step, stream);
+        if (n == 1) {   // the decode step's row and pool from the device step (capturable)
+            k::kpool_key_store(ctx.ik, ctx.ig, w.idx_k_norm, w.idx_k_norm_b, (float) g.norm_eps, st.idx_cache, 0, 1,
+                               ctx.step, stream);
+            k::kpool_pool(st.idx_cache, w.idx_ape, st.pooled, 0, 0, ctx.step, stream);
+        } else {   // the chunk's rows, then every pool completed in it (each query reads only the ones before it)
+            k::kpool_key_store(ctx.ik, ctx.ig, w.idx_k_norm, w.idx_k_norm_b, (float) g.norm_eps, st.idx_cache,
+                               ctx.pos_, n, nullptr, stream);
+            const int64_t b0 = ctx.pos_ / g.idx_kpool, b1 = (ctx.pos_ + n) / g.idx_kpool;
+            if (b1 > b0) k::kpool_pool(st.idx_cache, w.idx_ape, st.pooled, b0, b1 - b0, nullptr, stream);
+        }
         lin(w.idx_proj, ctx.h, ctx.iw);
         k::kpool_scores(st.pooled, ctx.iq, ctx.iw, 1.0f / std::sqrt((float) (g.idx_key_dim * g.idx_heads)),
-                        ctx.step, 1, ctx.max_blocks_, ctx.select_tail_, ctx.scores, stream);
-        k::qsa_block_topk(ctx.scores, ctx.step, 1, ctx.max_blocks_, ctx.cap_, k::kpool_topk_shapes(ctx.top_k_),
+                        ctx.step, n, ctx.max_blocks_, ctx.select_tail_, ctx.scores, stream);
+        k::qsa_block_topk(ctx.scores, ctx.step, n, ctx.max_blocks_, ctx.cap_, k::kpool_topk_shapes(ctx.top_k_),
                           ctx.sel_ids, stream);
         ctx.sel_valid = true;
     } else if (!ctx.sel_valid) {
         err = "glm_layer_decode: block " + std::to_string(il) + " shares an indexer no earlier block computed";
         return false;
     }
-    k::mla_decode_attn_step(ctx.q_abs, st.latent, ctx.sel_ids, ctx.step, ctx.cap_, 1.0f / std::sqrt((float) DK),
-                            ctx.attn_scr, ctx.o_lat, H, stream);
-    k::mla_head_gemv(ctx.o_lat, w.v_b, ctx.o_mla, H, L, DV, 1, stream);
+    const float scale = 1.0f / std::sqrt((float) DK);
+    if (n == 1)
+        k::mla_decode_attn_step(ctx.q_abs, st.latent, ctx.sel_ids, ctx.step, ctx.cap_, scale, ctx.attn_scr, ctx.o_lat,
+                                H, stream);
+    else
+        k::mla_prompt_attn(ctx.q_abs, st.latent, ctx.sel_ids, ctx.step, ctx.cap_, n, scale, ctx.o_lat, H, stream);
+    k::mla_head_gemv(ctx.o_lat, w.v_b, ctx.o_mla, H, L, DV, n, stream);
     lin(w.wo, ctx.o_mla, ctx.f);
+    return true;
+}
+
+/// A prompt chunk's routed experts: the router's choices to the host, grouped by expert (entries t * k + j in order),
+/// and run in rounds of what the provider holds (one round when they are all resident).
+bool GlmLayerImpl::experts_prompt(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w,
+                                  GlmContext& ctx, void* stream, std::string& err) {
+    const int n = (int) ctx.n_, kU = (int) g.n_expert_used, NE = (int) g.n_expert;
+    const int entries = n * kU;
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (cudaMemcpyAsync(ctx.eids_host_, ctx.eids, (size_t) entries * sizeof(int32_t), cudaMemcpyDeviceToHost, s) !=
+            cudaSuccess ||
+        cudaStreamSynchronize(s) != cudaSuccess) {
+        err = "block " + std::to_string(il) + ": the router's choices";
+        return false;
+    }
+    std::vector<int32_t> count((size_t) NE, 0);
+    for (int i = 0; i < entries; ++i) {
+        const int32_t e = ctx.eids_host_[i];
+        if (e < 0 || e >= NE) {
+            err = "block " + std::to_string(il) + ": the router chose expert " + std::to_string(e);
+            return false;
+        }
+        ++count[(size_t) e];
+    }
+    std::vector<int32_t> order;   // the experts chosen, ascending
+    for (int e = 0; e < NE; ++e)
+        if (count[(size_t) e]) order.push_back(e);
+    std::vector<int32_t> first((size_t) NE + 1, 0);   // each expert's first entry slot, in expert order
+    for (int e = 0; e < NE; ++e) first[(size_t) e + 1] = first[(size_t) e] + count[(size_t) e];
+    std::vector<int32_t> by_expert((size_t) entries), fill(first.begin(), first.end() - 1);
+    for (int i = 0; i < entries; ++i) by_expert[(size_t) fill[(size_t) ctx.eids_host_[i]]++] = i;
+    const int64_t cap = w.expert_ptrs ? (int64_t) order.size() : ctx.expert_provider->capacity();
+    if (cap < 1) {
+        err = "block " + std::to_string(il) + ": the expert provider holds no expert";
+        return false;
+    }
+    for (size_t r0 = 0; r0 < order.size(); r0 += (size_t) cap) {
+        const size_t r1 = std::min(order.size(), r0 + (size_t) cap);
+        const int ng = (int) (r1 - r0);
+        const unsigned long long* table = w.expert_ptrs;
+        if (!table) {
+            table = ctx.expert_provider->resident(il, order.data() + r0, ng, stream, err);
+            if (!table) return false;
+        }
+        ctx.h_expert_.assign(order.begin() + (ptrdiff_t) r0, order.begin() + (ptrdiff_t) r1);
+        ctx.h_start_.assign(1, 0);
+        ctx.h_tok_.clear();
+        ctx.h_dst_.clear();
+        for (int32_t e : ctx.h_expert_) {
+            for (int32_t j = first[(size_t) e]; j < first[(size_t) e + 1]; ++j) {
+                const int32_t entry = by_expert[(size_t) j];
+                ctx.h_tok_.push_back(entry / kU);
+                ctx.h_dst_.push_back(entry);
+            }
+            ctx.h_start_.push_back((int32_t) ctx.h_tok_.size());
+        }
+        // pageable copies: staged before each call returns, so the vectors may change for the next round
+        cudaMemcpyAsync(ctx.grp_expert, ctx.h_expert_.data(), (size_t) ng * 4, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(ctx.grp_start, ctx.h_start_.data(), (size_t) (ng + 1) * 4, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(ctx.n_groups, &ng, 4, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(ctx.ent_tok, ctx.h_tok_.data(), ctx.h_tok_.size() * 4, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(ctx.ent_dst, ctx.h_dst_.data(), ctx.h_dst_.size() * 4, cudaMemcpyHostToDevice, s);
+        k::glm_expert_group_ptrs(table, ctx.grp_expert, ng, ctx.grp_ptr, stream);
+        k::native_expert_grouped_clamped(w.expert_layout, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
+                                         ctx.ent_tok, ng, entries, ctx.xq, ctx.exp_scr, ctx.parts,
+                                         (float) g.swiglu_clamp_exp, stream);
+    }
     return true;
 }
 
 bool GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, GlmContext& ctx,
                        void* stream, std::string& err) {
     const int D = (int) g.n_embd;
+    const int n = (int) ctx.n_;
     void* q8 = ctx.q8;
-    auto lin = [&](const GlmLinear& m, const float* in, float* out) { k::glm_linear(m, in, out, 1, q8, stream); };
+    auto lin = [&](const GlmLinear& m, const float* in, float* out) { k::glm_linear(m, in, out, n, q8, stream); };
     if (il < g.n_dense_lead) {
         lin(w.ffn_gate, ctx.h, ctx.fg);
         lin(w.ffn_up, ctx.h, ctx.fu);
-        k::swiglu_clamp(ctx.fg, ctx.fu, ctx.fh, g.n_ff_dense, (float) g.swiglu_clamp_shexp, stream);
+        k::swiglu_clamp(ctx.fg, ctx.fu, ctx.fh, (int64_t) n * g.n_ff_dense, (float) g.swiglu_clamp_shexp, stream);
         lin(w.ffn_down, ctx.fh, ctx.f);
         return true;
     }
     const int kU = (int) g.n_expert_used;
     lin(w.gate_inp, ctx.h, ctx.logits);
-    k::glm_router(ctx.logits, w.exp_probs_b, 1, (int) g.n_expert, kU, (int) g.expert_gating, g.expert_weights_norm,
+    k::glm_router(ctx.logits, w.exp_probs_b, n, (int) g.n_expert, kU, (int) g.expert_gating, g.expert_weights_norm,
                   (float) g.expert_weights_scale, ctx.eids, ctx.ew, stream);
-    const unsigned long long* ptrs = w.expert_ptrs;
-    if (!ptrs) {
-        if (!ctx.expert_provider) {
-            err = "block " + std::to_string(il) + ": no expert addresses and no provider";
-            return false;
-        }
-        ptrs = ctx.expert_provider->experts(il, ctx.eids, kU, stream, err);
-        if (!ptrs) return false;
+    if (!w.expert_ptrs && !ctx.expert_provider) {
+        err = "block " + std::to_string(il) + ": no expert addresses and no provider";
+        return false;
     }
-    k::glm_expert_groups_decode(ctx.eids, ptrs, kU, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
-                                ctx.ent_tok, stream);
-    k::quantize_q8_1_rows(ctx.h, 1, D, ctx.xq, stream);
-    k::native_expert_grouped_clamped(w.expert_layout, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
-                                     ctx.ent_tok, kU, kU, ctx.xq, ctx.exp_scr, ctx.parts,
-                                     (float) g.swiglu_clamp_exp, stream);
+    k::quantize_q8_1_rows(ctx.h, n, D, ctx.xq, stream);
+    if (n == 1) {
+        const unsigned long long* ptrs = w.expert_ptrs;
+        if (!ptrs) {
+            ptrs = ctx.expert_provider->experts(il, ctx.eids, kU, stream, err);
+            if (!ptrs) return false;
+        }
+        k::glm_expert_groups_decode(ctx.eids, ptrs, kU, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
+                                    ctx.ent_tok, stream);
+        k::native_expert_grouped_clamped(w.expert_layout, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
+                                         ctx.ent_tok, kU, kU, ctx.xq, ctx.exp_scr, ctx.parts,
+                                         (float) g.swiglu_clamp_exp, stream);
+    } else if (!experts_prompt(g, il, w, ctx, stream, err)) {
+        return false;
+    }
     lin(w.sh_gate, ctx.h, ctx.fg);
     lin(w.sh_up, ctx.h, ctx.fu);
-    k::swiglu_clamp(ctx.fg, ctx.fu, ctx.fh, g.n_ff_shexp, (float) g.swiglu_clamp_shexp, stream);
+    k::swiglu_clamp(ctx.fg, ctx.fu, ctx.fh, (int64_t) n * g.n_ff_shexp, (float) g.swiglu_clamp_shexp, stream);
     lin(w.sh_down, ctx.fh, ctx.shared);
-    k::native_moe_combine(ctx.parts, ctx.ew, ctx.shared, ctx.f, D, kU, stream);
+    if (n == 1) k::native_moe_combine(ctx.parts, ctx.ew, ctx.shared, ctx.f, D, kU, stream);
+    else k::native_moe_combine_multi(ctx.parts, ctx.ew, ctx.shared, ctx.f, D, kU, n, stream);
     return true;
 }
 
@@ -352,21 +471,21 @@ bool glm_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const GlmLaye
         err = "glm_layer_decode: block " + std::to_string(il) + " is the MTP block (glm_mtp_layer_decode)";
         return false;
     }
-    const int D = (int) g.n_embd;
+    const int D = (int) g.n_embd, n = (int) ctx.tokens();
     const float rms_eps = (float) g.rms_eps, hc_eps = (float) g.hc_eps;
     const int iters = (int) g.hc_sinkhorn_iters;
 
-    k::mhc_pre(x, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, 1, D, rms_eps, hc_eps, iters, ctx.mhc_scr, ctx.h,
+    k::mhc_pre(x, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base, n, D, rms_eps, hc_eps, iters, ctx.mhc_scr, ctx.h,
                ctx.post, ctx.comb, nullptr, stream);
-    k::rms_norm_weighted(ctx.h, w.attn_norm, 1, D, rms_eps, stream);
+    k::rms_norm_weighted(ctx.h, w.attn_norm, n, D, rms_eps, stream);
     if (!GlmLayerImpl::attention(g, il, w, st, ctx, stream, err)) return false;
-    k::mhc_post(ctx.f, ctx.post, ctx.comb, x, 1, D, stream);
+    k::mhc_post(ctx.f, ctx.post, ctx.comb, x, n, D, stream);
 
-    k::mhc_pre(x, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, 1, D, rms_eps, hc_eps, iters, ctx.mhc_scr, ctx.h,
+    k::mhc_pre(x, w.hc_ffn_fn, w.hc_ffn_scale, w.hc_ffn_base, n, D, rms_eps, hc_eps, iters, ctx.mhc_scr, ctx.h,
                ctx.post, ctx.comb, nullptr, stream);
-    k::rms_norm_weighted(ctx.h, w.ffn_norm, 1, D, rms_eps, stream);
+    k::rms_norm_weighted(ctx.h, w.ffn_norm, n, D, rms_eps, stream);
     if (!GlmLayerImpl::ffn(g, il, w, ctx, stream, err)) return false;
-    k::mhc_post(ctx.f, ctx.post, ctx.comb, x, 1, D, stream);
+    k::mhc_post(ctx.f, ctx.post, ctx.comb, x, n, D, stream);
     return launched("glm_layer_decode", err);
 }
 
@@ -377,17 +496,17 @@ bool glm_mtp_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const Glm
         err = "glm_mtp_layer_decode: block " + std::to_string(il) + " is not an MLA MTP block";
         return false;
     }
-    const int D = (int) g.n_embd;
+    const int D = (int) g.n_embd, n = (int) ctx.tokens();
     const float rms_eps = (float) g.rms_eps;
     const cudaStream_t s = (cudaStream_t) stream;
-    cudaMemcpyAsync(ctx.h, x, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
-    k::rms_norm_weighted(ctx.h, w.attn_norm, 1, D, rms_eps, stream);
+    cudaMemcpyAsync(ctx.h, x, (size_t) n * D * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    k::rms_norm_weighted(ctx.h, w.attn_norm, n, D, rms_eps, stream);
     if (!GlmLayerImpl::attention(g, il, w, st, ctx, stream, err)) return false;
-    k::add_inplace(x, ctx.f, D, stream);
-    cudaMemcpyAsync(ctx.h, x, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
-    k::rms_norm_weighted(ctx.h, w.ffn_norm, 1, D, rms_eps, stream);
+    k::add_inplace(x, ctx.f, (int64_t) n * D, stream);
+    cudaMemcpyAsync(ctx.h, x, (size_t) n * D * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    k::rms_norm_weighted(ctx.h, w.ffn_norm, n, D, rms_eps, stream);
     if (!GlmLayerImpl::ffn(g, il, w, ctx, stream, err)) return false;
-    k::add_inplace(x, ctx.f, D, stream);
+    k::add_inplace(x, ctx.f, (int64_t) n * D, stream);
     return launched("glm_mtp_layer_decode", err);
 }
 

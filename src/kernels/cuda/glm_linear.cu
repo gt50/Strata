@@ -50,6 +50,13 @@ __global__ void expert_groups_decode_kernel(const int32_t* __restrict__ ids,
     }
 }
 
+__global__ void expert_group_ptrs_kernel(const unsigned long long* __restrict__ table,
+                                         const int32_t* __restrict__ experts, int n,
+                                         unsigned long long* __restrict__ grp_ptr) {
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) grp_ptr[i] = table[experts[i]];
+}
+
 void check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -127,6 +134,17 @@ void glm_expert_groups_decode(const int32_t* ids, const unsigned long long* expe
     expert_groups_decode_kernel<<<1, 1024 < k ? 1024 : (k < 32 ? 32 : k), 0, (cudaStream_t) stream>>>(
         ids, expert_ptrs, k, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
     check_launch("glm_expert_groups_decode");
+}
+
+void glm_expert_group_ptrs(const unsigned long long* table, const int32_t* experts, int n, unsigned long long* grp_ptr,
+                           void* stream) {
+    if (n <= 0) return;
+    if (!table || !experts || !grp_ptr) {
+        std::fprintf(stderr, "glm_expert_group_ptrs: invalid arguments\n");
+        std::exit(1);
+    }
+    expert_group_ptrs_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(table, experts, n, grp_ptr);
+    check_launch("glm_expert_group_ptrs");
 }
 
 }  // namespace strata::kernels

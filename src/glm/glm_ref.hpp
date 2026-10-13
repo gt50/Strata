@@ -140,7 +140,9 @@ Lin make_lin(int type, int64_t n_in, int64_t n_out, float s = 1.0f) {
 }
 
 /// Roundings the reference makes on a boundary, where the device's FP32 activation, ~1e-7 from the reference's, can
-/// go the other way: a code (x / d within 1e-4 of .5), or a block's FP16 scale (d within 1e-5 of the midpoint
+/// go the other way: a code (x / d within 3e-4 of .5 - 1e-4 was enough at decode; the prompt kernels' sums reach
+/// further: glm_prompt_parity B, pos 25, a code 1e-4 .. 3e-4 from .5 rounded the other way), or a block's FP16 scale
+/// (d within 1e-5 of the midpoint
 /// between two FP16 values - then all 32 values of the block move by one FP16 step, 4.9e-4).  Found by
 /// glm_layer_parity: at 2103 a block's amax was 0.79767389 in the reference and 0.79767448 on the device, either side
 /// of one.  Each such rounding is an event, counted in g_near in the order the reference meets them; the events
@@ -160,8 +162,15 @@ bool scale_on_boundary(float d) {
     return std::fabs(d - mid) < 1e-5f * d;
 }
 
+/// The quantizations made since the events were last reset: the device quantizes an activation once in the same way
+/// for every projection that reads it (wq and wk both read the attention's h), so where it rounds a value the other way
+/// it does so for all of them.  A vector quantized again gives the same result and no new events.
+vector<std::pair<vector<double>, vector<double>>> g_q8_memo;
+
 /// The q8_1 rounding of an activation the quantized projections and the grouped experts read.
 vector<double> q8_1(const vector<double>& x) {
+    for (const auto& [in, res] : g_q8_memo)
+        if (in == x) return res;
     vector<double> out(x.size());
     for (size_t b = 0; b < x.size(); b += 32) {
         float amax = 0.0f;
@@ -175,11 +184,12 @@ vector<double> q8_1(const vector<double>& x) {
             float q = amax == 0.0f ? 0.0f : std::round((float) x[i] / d);
             if (amax != 0.0f) {
                 const double fl = std::floor((double) x[i] / d), fr = (double) x[i] / d - fl;
-                if (std::fabs(fr - 0.5) < 1e-4 && flip_next()) q = (float) (q == (float) fl ? fl + 1 : fl);
+                if (std::fabs(fr - 0.5) < 3e-4 && flip_next()) q = (float) (q == (float) fl ? fl + 1 : fl);
             }
             out[i] = q * dh;
         }
     }
+    g_q8_memo.emplace_back(x, out);
     return out;
 }
 vector<double> lin_ref(const Lin& L, const vector<double>& x) {
@@ -730,11 +740,13 @@ struct Fit {
 /// one, two or three of those roundings taken the other way, and it passes only if one set explains the result and
 /// the state together: an explanation checked, not assumed (a wrong result does not land within 1e-4 of the
 /// reference with a specific other rounding).  The state left is the accepted run's, else the plain reference's.
+bool g_quiet = false;   ///< verify prints only the results that needed a search (or failed)
 template <class Run, class Undo>
 bool verify(const char* what, int64_t pos, long long il, Run run, Undo undo) {
     auto good = [](const Fit& f) { return f.rel <= 1e-4 && f.rest; };
     g_flip.clear();
     g_near = 0;
+    g_q8_memo.clear();
     const Fit f0 = run();
     const int n = g_near;
     Fit f = f0;
@@ -752,6 +764,7 @@ bool verify(const char* what, int64_t pos, long long il, Run run, Undo undo) {
             undo();
             g_flip = s;
             g_near = 0;
+            g_q8_memo.clear();
             const Fit fs = run();
             if (good(fs)) { f = fs; taken = s; break; }
         }
@@ -759,10 +772,12 @@ bool verify(const char* what, int64_t pos, long long il, Run run, Undo undo) {
             undo();
             g_flip.clear();
             g_near = 0;
+            g_q8_memo.clear();
             run();
         }
     }
     g_flip.clear();
+    if (g_quiet && good(f0)) return true;
     std::printf("  pos %lld block %lld: %s rel %.3e%s", (long long) pos, il, what, f.rel, f.rest ? "" : " (and its state)");
     if (!taken.empty())
         std::printf("  (%.1e%s as rounded; the reference matches with %zu of its %d q8_1 roundings on a boundary taken "

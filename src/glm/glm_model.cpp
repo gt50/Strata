@@ -7,6 +7,8 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
+
 namespace strata::glm {
 namespace k = strata::kernels;
 namespace {
@@ -49,7 +51,7 @@ GlmModel::~GlmModel() {
 }
 
 bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err,
-                    GlmExpertProvider* experts) {
+                    GlmExpertProvider* experts, int64_t max_chunk) {
     if (buf_arena_) { err = "GlmModel::init: already initialized"; return false; }
     const int64_t D = g.n_embd;
     if ((int64_t) w.blocks.size() != g.n_blocks() || (int64_t) g.is_mla.size() != g.n_blocks()) {
@@ -71,11 +73,13 @@ bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, i
             return false;
         if (!w.enorm || !w.hnorm) { err = "GlmModel: nextn.enorm / nextn.hnorm missing"; return false; }
     }
-    if (!ctx_.init(g, max_ctx, err)) return false;
+    if (max_chunk < 1) { err = "GlmModel::init: max_chunk must be at least 1"; return false; }
+    if (!ctx_.init(g, max_ctx, err, max_chunk)) return false;
     ctx_.expert_provider = experts;
     g_ = g;
     w_ = w;
     max_ctx_ = max_ctx;
+    max_chunk_ = max_chunk;
 
     // the blocks' state, one allocation
     const int64_t n_state = g.n_layers + (has_mtp_ ? 1 : 0);
@@ -94,8 +98,10 @@ bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, i
 
     // the model's own buffers
     const size_t V = (size_t) g.n_vocab;
-    const size_t sizes[] = {sizeof(int32_t), 2 * D * sizeof(float), 4 * D * sizeof(float), D * sizeof(float),
-                            V * sizeof(float),  D * sizeof(float),     D * sizeof(float),     V * sizeof(float)};
+    const size_t C = (size_t) max_chunk;
+    const size_t sizes[] = {C * sizeof(int32_t), std::max<size_t>(2, C) * D * sizeof(float), C * 4 * D * sizeof(float),
+                            D * sizeof(float),   V * sizeof(float), D * sizeof(float), D * sizeof(float),
+                            V * sizeof(float)};
     size_t total = 0;
     for (size_t s : sizes) total += align256(s);
     if (cudaMalloc(&buf_arena_, total) != cudaSuccess) {
@@ -162,10 +168,50 @@ bool GlmModel::decode(int32_t token, int64_t pos, void* stream, std::string& err
             return false;
         if (taps_) cudaMemcpyAsync((uint8_t*) taps_ + (size_t) (il + 1) * xb, x_, xb, cudaMemcpyDeviceToDevice, s);
     }
-    k::mhc_mean(x_, h_, 1, D, stream);
+    head(0, stream);
+    return launched("GlmModel::decode", err);
+}
+
+void GlmModel::head(int64_t row, void* stream) {
+    const int D = (int) g_.n_embd;
+    k::mhc_mean(x_ + (size_t) row * 4 * D, h_, 1, D, stream);
     k::rms_norm_weighted(h_, w_.output_norm, 1, D, (float) g_.rms_eps, stream);
     k::glm_linear(w_.output, h_, logits_, 1, ctx_.q8, stream);
-    return launched("GlmModel::decode", err);
+}
+
+bool GlmModel::prompt(const int32_t* tokens, int64_t n, int64_t pos0, void* stream, std::string& err) {
+    if (!buf_arena_) { err = "GlmModel::prompt: not initialized"; return false; }
+    if (!tokens || n < 1 || pos0 < 0 || pos0 + n > max_ctx_) {
+        err = "GlmModel::prompt: " + std::to_string(n) + " tokens at " + std::to_string(pos0) +
+              " do not fit the context of " + std::to_string(max_ctx_);
+        return false;
+    }
+    for (int64_t i = 0; i < n; ++i)
+        if (tokens[i] < 0 || tokens[i] >= g_.n_vocab) {
+            err = "GlmModel::prompt: token " + std::to_string(tokens[i]) + " outside the vocabulary";
+            return false;
+        }
+    const int D = (int) g_.n_embd;
+    const cudaStream_t s = (cudaStream_t) stream;
+    int64_t nc = 0;
+    for (int64_t c0 = 0; c0 < n; c0 += nc) {
+        nc = std::min(max_chunk_, n - c0);
+        const size_t xb = (size_t) nc * 4 * D * sizeof(float);
+        // pageable source: staged before the call returns; set_positions synchronizes the stream after its own copy
+        cudaMemcpyAsync(tok_, tokens + c0, (size_t) nc * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+        ctx_.set_positions(pos0 + c0, nc, stream);
+        ctx_.sel_valid = false;
+        k::iq_embed_rows(w_.tok_embd.type, w_.tok_embd.data, w_.tok_embd.row_bytes, tok_, nc, D, e_, stream);
+        k::mhc_init(e_, x_, (int) nc, D, stream);
+        if (taps_) cudaMemcpyAsync(taps_, x_, xb, cudaMemcpyDeviceToDevice, s);
+        for (int64_t il = 0; il < g_.n_layers; ++il) {
+            if (!glm_layer_decode(g_, il, w_.blocks[(size_t) il], states_[(size_t) il], ctx_, x_, stream, err))
+                return false;
+            if (taps_) cudaMemcpyAsync((uint8_t*) taps_ + (size_t) (il + 1) * xb, x_, xb, cudaMemcpyDeviceToDevice, s);
+        }
+    }
+    head(nc - 1, stream);
+    return launched("GlmModel::prompt", err);
 }
 
 bool GlmModel::mtp_decode(int32_t token, int64_t pos, const float* h, void* stream, std::string& err) {

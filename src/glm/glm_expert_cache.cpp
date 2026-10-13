@@ -188,19 +188,39 @@ const unsigned long long* GlmExpertCache::experts(int64_t il, const int32_t* ids
         return nullptr;
     }
     const cudaStream_t st = (cudaStream_t) stream;
-    auto t0 = std::chrono::steady_clock::now();
+    const auto t0 = std::chrono::steady_clock::now();
     // the router's choice; the synchronization also means no kernel before it still reads a slot
     if (!cuda_ok(cudaMemcpyAsync(ids_host_, ids, (size_t) k * sizeof(int32_t), cudaMemcpyDeviceToHost, st), "ids",
                  err) ||
         !cuda_ok(cudaStreamSynchronize(st), "the router", err))
         return nullptr;
     stats_.sync_ms += ms_since(t0);
-    t0 = std::chrono::steady_clock::now();
+    return admit(il, ids_host_, k, stream, err);
+}
+
+const unsigned long long* GlmExpertCache::resident(int64_t il, const int32_t* experts, int n, void* stream,
+                                                   std::string& err) {
+    if (!tables_ || il < 0 || il >= (int64_t) src_.size() || !src_[(size_t) il].gate || n <= 0 ||
+        n > (int) owner_.size()) {
+        err = "GlmExpertCache: block " + std::to_string(il) + " has no streamed experts, or " + std::to_string(n) +
+              " experts are more than the " + std::to_string(owner_.size()) + " slots";
+        return nullptr;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!cuda_ok(cudaStreamSynchronize((cudaStream_t) stream), "the round before", err)) return nullptr;
+    stats_.sync_ms += ms_since(t0);
+    return admit(il, experts, n, stream, err);
+}
+
+const unsigned long long* GlmExpertCache::admit(int64_t il, const int32_t* ids_host, int k, void* stream,
+                                                std::string& err) {
+    const cudaStream_t st = (cudaStream_t) stream;
+    const auto t0 = std::chrono::steady_clock::now();
     ++stats_.calls;
     const uint64_t call = ++call_;
     std::vector<int64_t> missing;
     for (int i = 0; i < k; ++i) {
-        const int32_t e = ids_host_[i];
+        const int32_t e = ids_host[i];
         if (e < 0 || e >= n_expert_) {
             err = "GlmExpertCache: the router chose expert " + std::to_string(e);
             return nullptr;

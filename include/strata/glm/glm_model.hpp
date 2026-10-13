@@ -16,8 +16,8 @@
 // embed, head and head_norm are the MTP block's own (nextn.embed_tokens, shared_head_head, shared_head_norm) where
 // the file has them, else the model's.
 //
-// What this is not yet: one token a call (no prompt path), the experts all on the device (the real file is 157 GB),
-// nothing captured (the step is on the device; mla_kv_store's row is still a host argument), and no loader.
+// What this is not yet: the MTP block over a prompt, and nothing captured (the step is on the device; mla_kv_store's
+// row is still a host argument).
 #pragma once
 
 #include "strata/core/geometry_glm5_next.hpp"
@@ -63,13 +63,18 @@ public:
     /// Checks every weight against the geometry (glm_layer_check) and allocates; the weights must outlive the model.
     /// `experts`: where the MoE layers' experts are when their expert_ptrs are null (a cache; it must outlive the
     /// model too).
+    /// `max_chunk`: the most tokens prompt() runs a call (its scratch; 1 = decode only).
     bool init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err,
-              GlmExpertProvider* experts = nullptr);
+              GlmExpertProvider* experts = nullptr, int64_t max_chunk = 1);
     /// A new sequence: the KDA conv histories and recurrent states zeroed (the caches are written before read).
     void reset(void* stream);
 
     /// The token at `pos` through the model: logits() and h_nextn() hold the result when the stream gets there.
     bool decode(int32_t token, int64_t pos, void* stream, std::string& err);
+    /// The n tokens at pos0 .. pos0 + n - 1 (a prompt, or its next part) through the main layers, max_chunk tokens a
+    /// call: every block's state and caches advance as n decode() calls would advance them, by the prompt kernels;
+    /// logits() and h_nextn() hold the last token's.  (The MTP block's cache is not filled for them yet.)
+    bool prompt(const int32_t* tokens, int64_t n, int64_t pos0, void* stream, std::string& err);
     bool has_mtp() const { return has_mtp_; }
     /// The MTP block for `token` at `pos`, reading h [n_embd] (device; h_nextn() of the token before, or mtp_h() to
     /// draft on): mtp_logits() and mtp_h() hold the result.  The block keeps its own caches by `pos`.
@@ -84,7 +89,7 @@ public:
     const GlmLayerState& state(int64_t il) const { return states_[(size_t) il]; }
     const GlmContext& context() const { return ctx_; }
     /// A test's view: when set, decode copies the streams X to taps [n_layers + 1][4][n_embd] (device) after
-    /// mhc_init and after every main block.
+    /// mhc_init and after every main block; prompt() the last chunk's, [n_layers + 1][chunk][4][n_embd].
     void set_taps(float* taps) { taps_ = taps; }
 
 private:
@@ -93,7 +98,7 @@ private:
     GlmContext ctx_;
     std::vector<GlmLayerState> states_;
     bool has_mtp_ = false;
-    int64_t max_ctx_ = 0;
+    int64_t max_ctx_ = 0, max_chunk_ = 1;
     void* state_arena_ = nullptr;
     void* buf_arena_ = nullptr;
     int32_t* tok_ = nullptr;
@@ -102,6 +107,7 @@ private:
     float* taps_ = nullptr;
 
     bool start(int32_t token, int64_t pos, const char* who, void* stream, std::string& err);
+    void head(int64_t row, void* stream);   ///< logits() and h_nextn() from token `row` of x_
 };
 
 }  // namespace strata::glm
