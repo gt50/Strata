@@ -89,11 +89,14 @@ public:
     /// one).  Changing the taps drops the graph.
     ///
     /// Measured on the Radeon 8060S (glm_graph_parity --bench 45: GLM-5.3-Flash's shapes, 45 layers, 8 resident
-    /// IQ4_XS experts a layer): 72.5-74.5 ms a token either way - the step reads 9.6 GB of weights (131 GB/s), and the
-    /// ~2000 launches hide under that.  The graph is for the steps the host must not wait on (a verify window, a
-    /// faster card), not for this one.
+    /// IQ4_XS experts a layer): 59.4-59.9 ms a token either way (an earlier run: 72.5-74.5) - the step reads 9.75 GB of
+    /// weights (164 GB/s), and its 1961 kernels run on the GPU no faster replayed than launched one by one
+    /// (glm_graph_parity --kernels: the step is the GPU's time, not the launches').  The graph is for the steps the
+    /// host must not wait on (a verify window, a faster card), not for this one.
     void set_decode_graph(bool on);
     bool decode_graph_ready() const { return graph_exec_ != nullptr; }
+    /// The captured step (a cudaGraph_t, null before the capture), for a profiler to read its nodes; the model owns it.
+    void* decode_graph() const { return graph_; }
     /// The n tokens at pos0 .. pos0 + n - 1 (a prompt, or its next part) through the main layers, max_chunk tokens a
     /// call: every block's state and caches advance as n decode() calls would advance them, by the prompt kernels;
     /// logits() and h_nextn() hold the last token's.
