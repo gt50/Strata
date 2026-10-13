@@ -617,7 +617,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  # strata_glm: a GLM-5.3-Flash GGUF serves on its own loop (src/glm/glm_serve.cpp)
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec strata_glm ${_strata_gpu_runtime_target})
 
   if(STRATA_ENABLE_HIP)
     enable_testing()
@@ -903,7 +904,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # GLM-5.3-Flash's layer glue and model loop at decode from the kernels above (src/glm), and their tests against a
   # double transcription of the glm5-next graph (src/glm/glm_ref.hpp): three blocks, and a five-layer model with MTP
   add_library(strata_glm STATIC src/glm/glm_layer.cpp src/glm/glm_model.cpp src/glm/glm_loader.cpp
-              src/glm/glm_expert_cache.cpp src/glm/glm_gemm.cpp src/glm/glm_spec.cpp)
+              src/glm/glm_expert_cache.cpp src/glm/glm_gemm.cpp src/glm/glm_spec.cpp src/glm/glm_serve.cpp)
   target_include_directories(strata_glm PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata_glm PUBLIC strata_kernels strata_prefill ${_strata_gpu_runtime_target})
   add_executable(glm_layer_parity src/glm/glm_layer_parity.cpp)
@@ -930,6 +931,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(glm_spec_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_spec_parity PRIVATE strata_glm strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME glm_spec_parity COMMAND glm_spec_parity --selftest)
+  add_executable(glm_serve_parity src/glm/glm_serve_parity.cpp)
+  target_include_directories(glm_serve_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_serve_parity PRIVATE strata_glm strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME glm_serve_parity COMMAND glm_serve_parity --selftest)
 
   add_executable(s2_gemv_q8_parity src/kernels/s2_gemv_q8_parity.cpp)
   target_include_directories(s2_gemv_q8_parity PRIVATE ${_strata_gpu_include_directories})

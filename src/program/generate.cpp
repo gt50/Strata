@@ -53,6 +53,7 @@
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/glm/glm_serve.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -1770,6 +1771,15 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // a GLM-5.3-Flash GGUF (general.architecture glm5-next) serves on its own loop, the same protocol
+    // (include/strata/glm/glm_serve.hpp); everything below is the Qwen engine's
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::strcmp(argv[i], "--native") == 0 && strata::glm::glm_is_glm_gguf(argv[i + 1])) {
+            for (int j = 1; j < argc; ++j)
+                if (std::strcmp(argv[j], "--serve") == 0) return strata::glm::glm_serve_stdio(argc, argv);
+            std::fprintf(stderr, "strata: %s is a GLM-5.3-Flash model, which runs with --serve only\n", argv[i + 1]);
+            return 2;
+        }
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is touched
     for (int i = 1; i < argc && i < 3; ++i) {
         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {

@@ -38,6 +38,36 @@ struct GlmSpecStats {
     int64_t accepted = 0;   ///< drafts accepted
 };
 
+/// Generation a step at a time (what a server streams): start() reads a prompt and picks the first token; each next()
+/// returns the next tokens - one, or a round's kept tokens - so the caller can stop after any of them (an end token, a
+/// cancel).  The work for what follows (a decode, a round's commit) is done at the next call, so stopping costs
+/// nothing.  The model needs init_verify() (its picks).
+class GlmGenerator {
+public:
+    explicit GlmGenerator(GlmModel& m) : m_(m) {}
+    /// A new sequence: the model reset, `prompt` (n tokens at positions 0 ..) read, its next token picked.  n_draft
+    /// 0, or a model without an MTP block: a token at a time; otherwise rounds of up to n_draft drafts (and at most
+    /// max_verify() - 1).
+    bool start(const int32_t* prompt, int64_t n, int n_draft, void* stream, std::string& err);
+    /// Appends the next tokens to `out`: 1 .. limit of them (the context permitting: n + tokens <= max_ctx).
+    bool next(int64_t limit, std::vector<int32_t>& out, void* stream, std::string& err);
+    const GlmSpecStats& stats() const { return st_; }
+
+private:
+    GlmModel& m_;
+    std::vector<int32_t> seq_;         ///< every token before t_: the penalties' history
+    std::vector<int32_t> window_, picks_;
+    int32_t t_ = 0;                    ///< the next token to return, at position pos_
+    int64_t pos_ = 0;
+    int k_max_ = 0;
+    bool spec_ = false, started_ = false;
+    bool owed_ = false;                ///< t_ was returned: its decode (or the round's commit) is next()'s first step
+    int keep_ = 0;                     ///< the round's commit: its kept tokens and the token after them
+    int32_t next_ = 0;
+    GlmSpecStats st_;
+    bool pick_after(const float* logits, int32_t& tok, void* stream, std::string& err);
+};
+
 /// n_gen tokens after `prompt` (n_prompt tokens at positions 0 ..; the model reset first), picked as the model's
 /// sampling says (greedy by default; the penalties count the prompt and every token since): `out` holds them.
 /// n_draft 0, or a model without an MTP block: decode() a token at a time.  Otherwise rounds of up to n_draft drafts
