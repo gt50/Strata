@@ -75,29 +75,33 @@ __device__ __forceinline__ float bf16_hi(uint32_t v) { return __uint_as_float(v 
 constexpr int kBf16RowLanes = 16;
 __global__ void __launch_bounds__(256) bf16_short_rows_kernel(const uint16_t* __restrict__ w,
                                                               const float* __restrict__ x, float* __restrict__ y,
-                                                              int n_in, int64_t n_out) {
+                                                              int n_in, int64_t n_out, int n_tok) {
     const int sub = threadIdx.x & (kBf16RowLanes - 1);
     const int64_t row = (int64_t) blockIdx.x * (256 / kBf16RowLanes) + (threadIdx.x / kBf16RowLanes);
     const int64_t r = row < n_out ? row : n_out - 1;   // every lane takes part in the exchanges
     const uint16_t* wr = w + r * n_in;
-    float acc = 0.0f;
-    for (int c = sub * 8; c < n_in; c += kBf16RowLanes * 8) {
-        const uint4 wv = *reinterpret_cast<const uint4*>(wr + c);
-        const float4 x0 = *reinterpret_cast<const float4*>(x + c), x1 = *reinterpret_cast<const float4*>(x + c + 4);
-        acc = fmaf(bf16_lo(wv.x), x0.x, acc);
-        acc = fmaf(bf16_hi(wv.x), x0.y, acc);
-        acc = fmaf(bf16_lo(wv.y), x0.z, acc);
-        acc = fmaf(bf16_hi(wv.y), x0.w, acc);
-        acc = fmaf(bf16_lo(wv.z), x1.x, acc);
-        acc = fmaf(bf16_hi(wv.z), x1.y, acc);
-        acc = fmaf(bf16_lo(wv.w), x1.z, acc);
-        acc = fmaf(bf16_hi(wv.w), x1.w, acc);
+    for (int t = 0; t < n_tok; ++t) {   // each token's sums as one token's call makes them (the row from cache after)
+        const float* xt = x + (int64_t) t * n_in;
+        float acc = 0.0f;
+        for (int c = sub * 8; c < n_in; c += kBf16RowLanes * 8) {
+            const uint4 wv = *reinterpret_cast<const uint4*>(wr + c);
+            const float4 x0 = *reinterpret_cast<const float4*>(xt + c);
+            const float4 x1 = *reinterpret_cast<const float4*>(xt + c + 4);
+            acc = fmaf(bf16_lo(wv.x), x0.x, acc);
+            acc = fmaf(bf16_hi(wv.x), x0.y, acc);
+            acc = fmaf(bf16_lo(wv.y), x0.z, acc);
+            acc = fmaf(bf16_hi(wv.y), x0.w, acc);
+            acc = fmaf(bf16_lo(wv.z), x1.x, acc);
+            acc = fmaf(bf16_hi(wv.z), x1.y, acc);
+            acc = fmaf(bf16_lo(wv.w), x1.z, acc);
+            acc = fmaf(bf16_hi(wv.w), x1.w, acc);
+        }
+        acc += lane_xor16<8>(acc);
+        acc += lane_xor16<4>(acc);
+        acc += lane_xor16<2>(acc);
+        acc += lane_xor16<1>(acc);
+        if (sub == 0 && row < n_out) y[(int64_t) t * n_out + row] = acc;
     }
-    acc += lane_xor16<8>(acc);
-    acc += lane_xor16<4>(acc);
-    acc += lane_xor16<2>(acc);
-    acc += lane_xor16<1>(acc);
-    if (sub == 0 && row < n_out) y[row] = acc;
 }
 
 /// A block of 256 per row: the squares summed, then x = x w / rms in place (each thread its own values).
@@ -111,21 +115,59 @@ __global__ void __launch_bounds__(256) glm_rms_norm_kernel(float* __restrict__ x
     for (int64_t c = threadIdx.x; c < cols; c += 256) r[c] = (w ? r[c] * w[c] : r[c]) * inv;
 }
 
+/// The larger of two (value, index) picks; equal values: the lower index.
+__device__ __forceinline__ void pick_max(float& v, int& i, float v2, int i2) {
+    if (v2 > v || (v2 == v && i2 < i)) {
+        v = v2;
+        i = i2;
+    }
+}
+
+__global__ void __launch_bounds__(1024) glm_argmax_kernel(const float* __restrict__ logits, int n,
+                                                          int32_t* __restrict__ out) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const float* x = logits + (int64_t) blockIdx.x * n;
+    float v = -INFINITY;
+    int i = 0x7fffffff;
+    for (int c = threadIdx.x; c < n; c += 1024) {
+        const float a = x[c];
+        if (a > v) {   // ascending c: the first of equal values stays; NaN is never > anything
+            v = a;
+            i = c;
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) pick_max(v, i, __shfl_xor_sync(0xffffffffu, v, off),
+                                                    __shfl_xor_sync(0xffffffffu, i, off));
+    if ((threadIdx.x & 31) == 0) {
+        sv[threadIdx.x >> 5] = v;
+        si[threadIdx.x >> 5] = i;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = sv[threadIdx.x];
+        i = si[threadIdx.x];
+        for (int off = 16; off > 0; off >>= 1) pick_max(v, i, __shfl_xor_sync(0xffffffffu, v, off),
+                                                        __shfl_xor_sync(0xffffffffu, i, off));
+        if (threadIdx.x == 0) out[blockIdx.x] = i == 0x7fffffff ? 0 : i;
+    }
+}
+
 __global__ void expert_groups_decode_kernel(const int32_t* __restrict__ ids,
                                             const unsigned long long* __restrict__ expert_ptrs, int k,
                                             unsigned long long* __restrict__ grp_ptr, int32_t* __restrict__ grp_start,
                                             int32_t* __restrict__ n_groups, int32_t* __restrict__ ent_dst,
-                                            int32_t* __restrict__ ent_tok) {
-    const int i = threadIdx.x;
-    if (i < k) {
+                                            int32_t* __restrict__ ent_tok, int n_tok) {
+    const int i = threadIdx.x, e = n_tok * k;
+    if (i < e) {
         grp_ptr[i] = expert_ptrs[ids[i]];
         grp_start[i] = i;
         ent_dst[i] = i;
-        ent_tok[i] = 0;
+        ent_tok[i] = i / k;
     }
     if (i == 0) {
-        grp_start[k] = k;
-        *n_groups = k;
+        grp_start[e] = e;
+        *n_groups = e;
     }
 }
 
@@ -180,10 +222,10 @@ void glm_linear(const GlmLinear& w, const float* x, float* y, int n_tok, void* s
             check_launch("glm_linear (F32)");
             break;
         case kLinearBf16:
-            if (n_tok == 1 && w.n_in % (kBf16RowLanes * 8) == 0 && w.n_in <= 2048 &&
+            if (n_tok <= kNativeCols && w.n_in % (kBf16RowLanes * 8) == 0 && w.n_in <= 2048 &&
                 ((uintptr_t) w.data & 15) == 0 && ((uintptr_t) x & 15) == 0) {   // short rows, 16-byte loads
                 bf16_short_rows_kernel<<<(unsigned) ((w.n_out + 15) / 16), 256, 0, s>>>(
-                    (const uint16_t*) w.data, x, y, (int) w.n_in, w.n_out);
+                    (const uint16_t*) w.data, x, y, (int) w.n_in, w.n_out, n_tok);
                 check_launch("glm_linear (BF16, short rows)");
                 break;
             }
@@ -221,14 +263,26 @@ void glm_rms_norm(float* x, const float* w, int64_t rows, int64_t cols, float ep
 
 void glm_expert_groups_decode(const int32_t* ids, const unsigned long long* expert_ptrs, int k,
                               unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
-                              int32_t* ent_tok, void* stream) {
-    if (!ids || !expert_ptrs || !grp_ptr || !grp_start || !n_groups || !ent_dst || !ent_tok || k <= 0 || k > 1024) {
+                              int32_t* ent_tok, void* stream, int n_tok) {
+    const int e = n_tok * k;
+    if (!ids || !expert_ptrs || !grp_ptr || !grp_start || !n_groups || !ent_dst || !ent_tok || k <= 0 || n_tok <= 0 ||
+        e > 1024) {
         std::fprintf(stderr, "glm_expert_groups_decode: invalid arguments\n");
         std::exit(1);
     }
-    expert_groups_decode_kernel<<<1, 1024 < k ? 1024 : (k < 32 ? 32 : k), 0, (cudaStream_t) stream>>>(
-        ids, expert_ptrs, k, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+    expert_groups_decode_kernel<<<1, e < 32 ? 32 : e, 0, (cudaStream_t) stream>>>(ids, expert_ptrs, k, grp_ptr,
+                                                                                 grp_start, n_groups, ent_dst,
+                                                                                 ent_tok, n_tok);
     check_launch("glm_expert_groups_decode");
+}
+
+void glm_argmax_rows(const float* logits, int rows, int n, int32_t* out, void* stream) {
+    if (!logits || !out || rows <= 0 || n <= 0) {
+        std::fprintf(stderr, "glm_argmax_rows: invalid arguments\n");
+        std::exit(1);
+    }
+    glm_argmax_kernel<<<(unsigned) rows, 1024, 0, (cudaStream_t) stream>>>(logits, n, out);
+    check_launch("glm_argmax_rows");
 }
 
 void glm_expert_group_ptrs(const unsigned long long* table, const int32_t* experts, int n, unsigned long long* grp_ptr,

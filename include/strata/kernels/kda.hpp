@@ -48,8 +48,14 @@ inline constexpr int kKdaConvKernel = 4;
 ///   x       [T][3 * d_inner]          the projections, q | k | v
 ///   w_q/k/v (d_inner, d_conv)         the GGUF tensors as stored: `w[c * d_conv + i]` is tap i of channel c
 ///   out     [T][3 * d_inner]          may not alias x or history
+///   update_history false: the history is read, not changed - a verify window, whose tokens may not all stay
+///                     (kda_conv_advance then moves it over the ones that do)
 void kda_conv_l2(float* history, const float* x, const float* w_q, const float* w_k, const float* w_v, float* out,
-                 int heads, int n_tokens, float eps, void* stream);
+                 int heads, int n_tokens, float eps, void* stream, bool update_history = true);
+
+/// The history after n_tokens more inputs x [T][3 * d_inner] (the raw projections kda_conv_l2 read): what
+/// kda_conv_l2 with update_history leaves, without the conv.
+void kda_conv_advance(float* history, const float* x, int heads, int n_tokens, void* stream);
 
 /// The per-channel log decay, elementwise over [T][d_inner]: `raw` is f_b(f_a(x)) before the bias.
 ///
@@ -73,8 +79,13 @@ void kda_gate(const float* raw, const float* dt_bias, const float* ssm_a, float*
 ///   z      [T][d_inner]      the output gate's pre-activation, g_b(g_a(x))
 ///   o_norm (D,)              ssm_norm, the same for every head
 ///   y      [T][d_inner]      rms_norm(o, eps) * o_norm * sigmoid(z); may not alias any input
+///
+/// write_state false: the state is read, not written back - y as with it (a verify window's; the tokens that stay are
+/// scanned again with it, which leaves the state bitwise as one-token calls would: the per-token arithmetic is the same
+/// for any n_tokens)
 void kda_scan_norm(float* state, const float* qkv, const float* gate, const float* beta, const float* z,
-                   const float* o_norm, float eps, float* y, int heads, int n_tokens, void* stream);
+                   const float* o_norm, float eps, float* y, int heads, int n_tokens, void* stream,
+                   bool write_state = true);
 
 /// Tokens per chunk of kda_scan_norm_chunked, and per super-block (one prep and one scan launch each).
 inline constexpr int kKdaChunk = 32;

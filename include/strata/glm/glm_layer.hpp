@@ -127,6 +127,13 @@ public:
 
     /// the experts of a layer whose expert_ptrs are null (a cache), else unused
     GlmExpertProvider* expert_provider = nullptr;
+    /// A verify window (GlmModel::verify): more than one token through the DECODE kernels - each token's arithmetic a
+    /// decode step's, never the prompt kernels' - so its logits are bitwise what decode would give.
+    bool exact = false;
+    /// In such a window, for a KDA block: where it keeps what GlmModel::commit needs - the raw projections and the conv
+    /// output [tokens][3 d_inner], the gate [tokens][d_inner] and beta [tokens][H] - with the block's conv history and
+    /// state left as they were.  Null: the block advances them as usual.
+    float *win_raw = nullptr, *win_qkv = nullptr, *win_gate = nullptr, *win_beta = nullptr;
     // the steps [tokens][kStepCount], and the selections [tokens][cap] a full-indexer layer leaves for the shared ones
     // after it
     int32_t* step = nullptr;

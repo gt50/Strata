@@ -428,6 +428,60 @@ double time_graph_wall(const vector<const KParams*>& nodes, cudaStream_t s, int 
 /// of its own of its kernels from all layers back to back - so a group's weights stream from memory as they do in the
 /// step (one layer's tensor alone, repeated, would sit in the 8060S's 32 MB Infinity Cache).  A group's kernels read
 /// what the step left in the buffers: a routed-expert group reads the last layer's 8 experts every time (107 MB).
+
+/// `--spec [layers]`: a verify window's time (GlmModel::verify, T tokens through the decode kernels) and commit's,
+/// against a decode token's, on the --bench model.  Host clock, a host wait after every call.
+int spec(int64_t layers) {
+    std::printf("verify windows on a model of GLM-5.3-Flash's shapes, %lld layers, 8 resident IQ4_XS experts a layer"
+                " (building)\n", (long long) layers);
+    Glm5NextGeometry g;
+    glm::GlmModelWeights w;
+    build_bench(layers, g, w);
+    glm::GlmModel model;
+    std::string err;
+    if (!model.init(g, w, 4096, err, nullptr, 9) || !model.init_verify(8, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    cudaStream_t s;
+    check(cudaStreamCreate(&s), "stream");
+    model.reset(s);
+    auto die = [&]() {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        std::exit(1);
+    };
+    for (int i = 0; i < 40; ++i)   // 40 cells of context
+        if (!model.decode((int32_t) (7 * i + 1), i, s, err)) die();
+    check(cudaStreamSynchronize(s), "decode");
+    auto ms_of = [&](auto&& f) {
+        double best = 1e30;
+        for (int t = 0; t < 3; ++t) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < 5; ++r) {
+                f();
+                check(cudaStreamSynchronize(s), "sync");
+            }
+            best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 5);
+        }
+        return best;
+    };
+    const double dec = ms_of([&] { if (!model.decode(3, 40, s, err)) die(); });
+    std::printf("  a decode token: %.2f ms\n", dec);
+    std::printf("  %3s %12s %14s %12s %18s\n", "T", "verify ms", "ms a token", "commit ms", "T decodes would be");
+    for (const int T : {1, 2, 4, 8}) {
+        int32_t toks[8], picks[8];
+        for (int i = 0; i < T; ++i) toks[i] = 11 * i + 5;
+        const double v = ms_of([&] { if (!model.verify(toks, T, 40, picks, s, err)) die(); });
+        const double c = ms_of([&] {
+            if (!model.verify(toks, T, 40, picks, s, err) || !model.commit(T, 1, s, err)) die();
+        }) - v;
+        std::printf("  %3d %12.2f %14.2f %12.2f %15.2f ms\n", T, v, v / T, c, dec * T);
+    }
+    cudaStreamDestroy(s);
+    for (void* p : g_free) cudaFree(p);
+    return 0;
+}
+
 int kernels(int64_t layers, bool dump) {
     std::printf("the decode step at GLM-5.3-Flash's shapes, %lld layers, 8 resident IQ4_XS experts a layer, kernel by kernel\n",
                 (long long) layers);
@@ -667,10 +721,12 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--selftest") selftest = true;
         else if (a == "--bench") return bench(i + 1 < argc ? std::atoll(argv[i + 1]) : 45);
+        else if (a == "--spec") return spec(i + 1 < argc ? std::atoll(argv[i + 1]) : 45);
         else if (a == "--kernels" || a == "--kernels-dump")
             return kernels(i + 1 < argc ? std::atoll(argv[i + 1]) : 45, a == "--kernels-dump");
         else {
-            std::fprintf(stderr, "usage: glm_graph_parity [--selftest] | --bench [layers] | --kernels[-dump] [layers]\n");
+            std::fprintf(stderr, "usage: glm_graph_parity [--selftest] | --bench [layers] | --kernels[-dump] [layers] | "
+                                 "--spec [layers]\n");
             return 2;
         }
     }

@@ -2,7 +2,8 @@
 // type, and the small pieces of glue the GLM layer needs between kernels.
 //
 // The type picks the kernel: F32 a block per output row (glm_linear's own); BF16 bf16_gemv_fp32_mmvf_cols (FP32
-// activations), or for one token on rows of at most 2048 (a multiple of 128) glm_linear's own, 16 lanes a row; the types native_mmvq takes (Q4_0, Q5_0, Q8_0, Q2_0, Q3_K .. Q6_K, IQ4_NL, IQ4_XS) on q8_1
+// activations), or for up to 8 tokens on rows of at most 2048 (a multiple of 128) glm_linear's own, 16 lanes a row
+// (each token's sums the same whatever the count); the types native_mmvq takes (Q4_0, Q5_0, Q8_0, Q2_0, Q3_K .. Q6_K, IQ4_NL, IQ4_XS) on q8_1
 // activations, llama.cpp's CUDA contract; the other i-quants through iq_mmvq, also on q8_1.  Which one a type takes is
 // glm_linear_kind, so a loader can refuse a file before allocating anything.
 #pragma once
@@ -40,12 +41,17 @@ inline bool glm_linear_quantizes(GlmLinearKind k) noexcept { return k == kLinear
 /// row, for GLM's few wide rows (rms_norm_weighted's single warp a row took 12-30 us on a 1536- or 4096-wide one).
 void glm_rms_norm(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream);
 
-/// The grouped-expert call for one token's k chosen experts (distinct, as a top-k is): group i is expert ids[i], its
-/// blob at expert_ptrs[ids[i]], with the one entry i (token 0, output row i).  Read on the device, so a decode step can
-/// be captured.  grp_ptr [k], grp_start [k + 1], n_groups [1], ent_dst / ent_tok [k].
+/// The grouped-expert call for n_tok tokens' k chosen experts each (ids [n_tok][k]): group i is expert ids[i], its
+/// blob at expert_ptrs[ids[i]], with the one entry i (token i / k, output row i) - a group an entry, as one token's
+/// call makes it, so each entry's sums are bitwise a decode step's.  Read on the device, so a decode step can be
+/// captured.  E = n_tok k <= 1024: grp_ptr [E], grp_start [E + 1], n_groups [1], ent_dst / ent_tok [E].
 void glm_expert_groups_decode(const int32_t* ids, const unsigned long long* expert_ptrs, int k,
                               unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
-                              int32_t* ent_tok, void* stream);
+                              int32_t* ent_tok, void* stream, int n_tok = 1);
+
+/// out[r] = the argmax of row r of `logits` (rows of n): the first index of the largest value, NaN never picked, 0
+/// when nothing is above -inf.  A block of 1024 a row; graph-capturable.
+void glm_argmax_rows(const float* logits, int rows, int n, int32_t* out, void* stream);
 
 /// grp_ptr[g] = table[experts[g]] for g < n: a prompt round's blob addresses from a provider's table (both device).
 void glm_expert_group_ptrs(const unsigned long long* table, const int32_t* experts, int n, unsigned long long* grp_ptr,

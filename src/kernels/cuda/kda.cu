@@ -29,7 +29,7 @@ __device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : lo
 __global__ void __launch_bounds__(D) kda_conv_l2_kernel(float* __restrict__ hist, const float* __restrict__ x,
                                                         const float* __restrict__ w_q, const float* __restrict__ w_k,
                                                         const float* __restrict__ w_v, float* __restrict__ out,
-                                                        int heads, int n_tokens, float eps) {
+                                                        int heads, int n_tokens, float eps, int slide) {
     __shared__ float part_sum[D / 32];
     const int part = blockIdx.x / heads;            // 0 q, 1 k, 2 v: uniform over the block
     const int t = blockIdx.y;
@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(D) kda_conv_l2_kernel(float* __restrict__ hist
 #pragma unroll
     for (int i = 0; i < DC; ++i) sum = fmaf(tap[i], w[i], sum);   // kernel[0] reads the OLDEST input
     float y = sum / (1.0f + __expf(-sum));                         // SiLU
-    if (n_tokens == 1) {
+    if (slide) {   // one token, history updated: in place
 #pragma unroll
         for (int i = 0; i < DC - 1; ++i) h[i] = tap[i + 1];
     }
@@ -104,7 +104,7 @@ template <int CW>
 __global__ void __launch_bounds__(CW * RG) kda_scan_kernel(float* __restrict__ state, const float* __restrict__ qkv,
                                                            const float* __restrict__ gate,
                                                            const float* __restrict__ beta, float* __restrict__ o_out,
-                                                           int heads, int n_tokens) {
+                                                           int heads, int n_tokens, int write_state) {
     __shared__ float sk[D], sq[D], sdec[D];
     __shared__ float red_kv[RG][CW];
     __shared__ float red_o[RG][CW];
@@ -160,6 +160,7 @@ __global__ void __launch_bounds__(CW * RG) kda_scan_kernel(float* __restrict__ s
             o_out[ht + col] = oo * rsqrtf((float) D);
         }
     }
+    if (!write_state) return;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * D] = s[r];
 }
@@ -486,20 +487,27 @@ void check_launch(const char* what) {
 }  // namespace
 
 void kda_conv_l2(float* history, const float* x, const float* w_q, const float* w_k, const float* w_v, float* out,
-                 int heads, int n_tokens, float eps, void* stream) {
+                 int heads, int n_tokens, float eps, void* stream, bool update_history) {
     if (!history || !x || !w_q || !w_k || !w_v || !out || heads <= 0 || n_tokens <= 0 || n_tokens > 65535) {
         std::fprintf(stderr, "kda_conv_l2: invalid arguments\n");
         std::exit(1);
     }
     const dim3 grid((unsigned) (3 * heads), (unsigned) n_tokens);
-    kda_conv_l2_kernel<<<grid, D, 0, (cudaStream_t) stream>>>(history, x, w_q, w_k, w_v, out, heads, n_tokens, eps);
+    kda_conv_l2_kernel<<<grid, D, 0, (cudaStream_t) stream>>>(history, x, w_q, w_k, w_v, out, heads, n_tokens, eps,
+                                                              update_history && n_tokens == 1 ? 1 : 0);
     check_launch("kda_conv_l2");
-    if (n_tokens > 1) {
-        const int channels = 3 * heads * D;
-        kda_conv_hist_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, x, channels,
-                                                                                                    n_tokens);
-        check_launch("kda_conv_l2 (history)");
+    if (update_history && n_tokens > 1) kda_conv_advance(history, x, heads, n_tokens, stream);
+}
+
+void kda_conv_advance(float* history, const float* x, int heads, int n_tokens, void* stream) {
+    if (!history || !x || heads <= 0 || n_tokens <= 0) {
+        std::fprintf(stderr, "kda_conv_advance: invalid arguments\n");
+        std::exit(1);
     }
+    const int channels = 3 * heads * D;
+    kda_conv_hist_kernel<<<(unsigned) ((channels + 255) / 256), 256, 0, (cudaStream_t) stream>>>(history, x, channels,
+                                                                                                n_tokens);
+    check_launch("kda_conv_advance");
 }
 
 void kda_gate(const float* raw, const float* dt_bias, const float* ssm_a, float* gate, int heads, int n_tokens,
@@ -516,7 +524,8 @@ void kda_gate(const float* raw, const float* dt_bias, const float* ssm_a, float*
 }
 
 void kda_scan_norm(float* state, const float* qkv, const float* gate, const float* beta, const float* z,
-                   const float* o_norm, float eps, float* y, int heads, int n_tokens, void* stream) {
+                   const float* o_norm, float eps, float* y, int heads, int n_tokens, void* stream,
+                   bool write_state) {
     if (!state || !qkv || !gate || !beta || !z || !o_norm || !y || heads <= 0 || n_tokens <= 0 ||
         (int64_t) n_tokens * heads > 0x7fffffff) {
         std::fprintf(stderr, "kda_scan_norm: invalid arguments\n");
@@ -524,7 +533,8 @@ void kda_scan_norm(float* state, const float* qkv, const float* gate, const floa
     }
     const cudaStream_t s = (cudaStream_t) stream;
     kda_scan_kernel<kScanCols><<<(unsigned) (heads * (D / kScanCols)), dim3(kScanCols, RG), 0, s>>>(state, qkv, gate, beta,
-                                                                                                   y, heads, n_tokens);
+                                                                                                   y, heads, n_tokens,
+                                                                                                   write_state ? 1 : 0);
     check_launch("kda_scan_norm (scan)");
     kda_out_norm_kernel<<<(unsigned) ((int64_t) n_tokens * heads), D, 0, s>>>(z, o_norm, eps, y);
     check_launch("kda_scan_norm (norm)");

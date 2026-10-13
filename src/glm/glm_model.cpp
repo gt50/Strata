@@ -3,6 +3,7 @@
 
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/kda.hpp"
 #include "strata/kernels/mhc.hpp"
 
 #include <cuda_runtime.h>
@@ -64,6 +65,169 @@ GlmModel::~GlmModel() {
     if (staged_) cudaEventDestroy((cudaEvent_t) staged_);
     if (state_arena_) cudaFree(state_arena_);
     if (buf_arena_) cudaFree(buf_arena_);
+    if (win_arena_) cudaFree(win_arena_);
+    if (pick_host_) cudaFreeHost(pick_host_);
+}
+
+namespace {
+/// A KDA block's window storage, floats a token: raw projections and conv output (3 d_inner each), gate (d_inner),
+/// beta (H).
+int64_t kda_window_floats(const core::Glm5NextGeometry& g) {
+    const int64_t di = g.n_head * g.kda_head_dim;
+    return 7 * di + g.n_head;
+}
+}  // namespace
+
+bool GlmModel::init_verify(int max_t, std::string& err) {
+    if (!buf_arena_ || win_arena_) {
+        err = "GlmModel::init_verify: the model is not initialized, or windows already are";
+        return false;
+    }
+    if (max_t < 1 || max_t + 1 > max_chunk_) {
+        err = "GlmModel::init_verify: windows of " + std::to_string(max_t) + " tokens need a max_chunk of at least " +
+              std::to_string(max_t + 1) + " (it is " + std::to_string(max_chunk_) + ")";
+        return false;
+    }
+    const size_t T = (size_t) max_t, V = (size_t) g_.n_vocab, D = (size_t) g_.n_embd;
+    const size_t per_kda = (size_t) kda_window_floats(g_) * T * sizeof(float);
+    int64_t n_kda = 0;
+    for (int64_t il = 0; il < g_.n_layers; ++il) n_kda += g_.is_mla[(size_t) il] ? 0 : 1;
+    const size_t sizes[] = {T * V * sizeof(float), T * D * sizeof(float), T * sizeof(int32_t), per_kda * (size_t) n_kda};
+    size_t total = 0;
+    for (size_t sz : sizes) total += align256(sz);
+    if (cudaMalloc(&win_arena_, total) != cudaSuccess ||
+        cudaHostAlloc((void**) &pick_host_, T * sizeof(int32_t), cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        err = "GlmModel::init_verify: " + std::to_string(total) + " bytes for the windows";
+        return false;
+    }
+    cudaMemset(win_arena_, 0, total);
+    uint8_t* p = (uint8_t*) win_arena_;
+    auto take = [&](size_t i) { uint8_t* q = p; p += align256(sizes[i]); return q; };
+    wlogits_ = (float*) take(0);
+    whall_ = (float*) take(1);
+    wpick_ = (int32_t*) take(2);
+    float* kda = (float*) take(3);
+    win_kda_.assign((size_t) g_.n_layers, nullptr);
+    for (int64_t il = 0; il < g_.n_layers; ++il)
+        if (!g_.is_mla[(size_t) il]) {
+            win_kda_[(size_t) il] = kda;
+            kda += (size_t) kda_window_floats(g_) * T;
+        }
+    max_t_ = max_t;
+    const cudaError_t e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+        err = std::string("GlmModel::init_verify: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+bool GlmModel::argmax(const float* logits, int rows, int32_t* out, void* stream, std::string& err) {
+    if (!wpick_ || rows < 1 || rows > max_t_ || !logits || !out) {
+        err = "GlmModel::argmax: no verify buffers (init_verify), or " + std::to_string(rows) + " rows";
+        return false;
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    k::glm_argmax_rows(logits, rows, (int) g_.n_vocab, wpick_, stream);
+    cudaMemcpyAsync(pick_host_, wpick_, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, s);
+    if (cudaStreamSynchronize(s) != cudaSuccess) return launched("GlmModel::argmax", err);
+    std::copy(pick_host_, pick_host_ + rows, out);
+    return true;
+}
+
+bool GlmModel::verify(const int32_t* tokens, int T, int64_t pos0, int32_t* picks, void* stream, std::string& err) {
+    if (!win_arena_ || !tokens || !picks || T < 1 || T > max_t_ || pos0 < 0 || pos0 + T > max_ctx_) {
+        err = "GlmModel::verify: no window buffers (init_verify), or " + std::to_string(T) + " tokens at " +
+              std::to_string(pos0) + " outside the window or the context";
+        return false;
+    }
+    for (int t = 0; t < T; ++t)
+        if (tokens[t] < 0 || tokens[t] >= g_.n_vocab) {
+            err = "GlmModel::verify: token " + std::to_string(tokens[t]) + " outside the vocabulary";
+            return false;
+        }
+    const int D = (int) g_.n_embd;
+    const cudaStream_t s = (cudaStream_t) stream;
+    win_pos0_ = -1;
+    // pageable source: staged before the call returns; set_positions synchronizes the stream after its own copy
+    cudaMemcpyAsync(tok_, tokens, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    ctx_.set_positions(pos0, T, stream);
+    ctx_.sel_valid = false;
+    k::iq_embed_rows(w_.tok_embd.type, w_.tok_embd.data, w_.tok_embd.row_bytes, tok_, T, D, e_, stream);
+    k::mhc_init(e_, x_, T, D, stream);
+    const int64_t di = g_.n_head * g_.kda_head_dim;
+    ctx_.exact = true;
+    bool ok = true;
+    for (int64_t il = 0; il < g_.n_layers && ok; ++il) {
+        float* wk = win_kda_[(size_t) il];
+        if (wk) {   // raw [T][3 di] | conv output [T][3 di] | gate [T][di] | beta [T][H]
+            ctx_.win_raw = wk;
+            ctx_.win_qkv = wk + (size_t) T * 3 * di;
+            ctx_.win_gate = wk + (size_t) T * 6 * di;
+            ctx_.win_beta = wk + (size_t) T * 7 * di;
+        }
+        ok = glm_layer_decode(g_, il, w_.blocks[(size_t) il], states_[(size_t) il], ctx_, x_, stream, err);
+        ctx_.win_raw = ctx_.win_qkv = ctx_.win_gate = ctx_.win_beta = nullptr;
+    }
+    ctx_.exact = false;
+    if (!ok) return false;
+    // every row's head, as head() computes one
+    k::mhc_mean(x_, whall_, T, D, stream);
+    k::glm_rms_norm(whall_, w_.output_norm, T, D, (float) g_.rms_eps, stream);
+    k::glm_linear(w_.output, whall_, wlogits_, T, ctx_.q8, stream);
+    if (!argmax(wlogits_, T, picks, stream, err)) return false;
+    win_tokens_.assign(tokens, tokens + T);
+    win_pos0_ = pos0;
+    return true;
+}
+
+bool GlmModel::commit(int n_keep, int32_t next, void* stream, std::string& err) {
+    const int T = (int) win_tokens_.size();
+    if (win_pos0_ < 0 || n_keep < 1 || n_keep > T || next < 0 || next >= g_.n_vocab) {
+        err = "GlmModel::commit: no window to commit, " + std::to_string(n_keep) + " of its " + std::to_string(T) +
+              " tokens, or a next token outside the vocabulary";
+        return false;
+    }
+    const int D = (int) g_.n_embd, H = (int) g_.n_head;
+    const int64_t di = g_.n_head * g_.kda_head_dim;
+    const float eps = (float) g_.rms_eps;
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int64_t pos0 = win_pos0_;
+    win_pos0_ = -1;
+    // the KDA blocks over the kept tokens: what decode leaves (the output, into scratch, unused)
+    for (int64_t il = 0; il < g_.n_layers; ++il) {
+        float* wk = win_kda_[(size_t) il];
+        if (!wk) continue;
+        const GlmLayerState& st = states_[(size_t) il];
+        k::kda_conv_advance(st.conv_hist, wk, H, n_keep, stream);
+        float* gate = wk + (size_t) T * 6 * di;
+        k::kda_scan_norm(st.kda_state, wk + (size_t) T * 3 * di, gate, wk + (size_t) T * 7 * di, gate,
+                         w_.blocks[(size_t) il].o_norm, eps, ctx_.y, H, n_keep, stream);
+    }
+    cudaMemcpyAsync(h_, whall_ + (size_t) (n_keep - 1) * D, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    cudaMemcpyAsync(logits_, window_logits(n_keep - 1), (size_t) g_.n_vocab * sizeof(float), cudaMemcpyDeviceToDevice,
+                    s);
+    if (has_mtp_) {   // the MTP block over the kept positions (and the prompt's pending one), the main model's h each
+        const int first = pending_pos_ >= 0 && pending_pos_ == pos0 - 1 ? 1 : 0;
+        pending_pos_ = -1;
+        std::vector<int32_t> nt;
+        if (first) nt.push_back(win_tokens_[0]);
+        for (int t = 1; t < n_keep; ++t) nt.push_back(win_tokens_[(size_t) t]);
+        nt.push_back(next);
+        const int R = first + n_keep;
+        // pageable: staged before the call returns
+        cudaMemcpyAsync(mtp_tok_, nt.data(), nt.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+        if (first) cudaMemcpyAsync(hall_, h_pending_, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(hall_ + (size_t) first * D, whall_, (size_t) n_keep * D * sizeof(float), cudaMemcpyDeviceToDevice,
+                        s);
+        if (!mtp_pass(pos0 - first, R, hall_, stream, err)) return false;
+        cudaMemcpyAsync(mtp_h_, xm_ + (size_t) (R - 1) * D, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        k::glm_rms_norm(mtp_h_, w_.mtp_head_norm ? w_.mtp_head_norm : w_.output_norm, 1, D, eps, stream);
+        k::glm_linear(w_.mtp_head.data ? w_.mtp_head : w_.output, mtp_h_, mtp_logits_, 1, ctx_.q8, stream);
+    }
+    win_tokens_.clear();
+    return launched("GlmModel::commit", err);
 }
 
 bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, int64_t max_ctx, std::string& err,

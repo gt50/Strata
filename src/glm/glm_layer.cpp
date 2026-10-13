@@ -39,10 +39,10 @@ bool full_indexer(const core::Glm5NextGeometry& g, int64_t il) {
     return il >= g.n_layers || g.idx_full.empty() || g.idx_full[(size_t) il] != 0;
 }
 
-/// A sublayer's projections: one token through glm_linear, each input quantized once (a projection of the same input,
-/// on the same path, as the quantizing call before it reuses that call's q8_1), more through ctx.linear (the prompt
-/// products).  So an input must not change between two calls that read it: the sublayers write each buffer before
-/// they project it, never after.
+/// A sublayer's projections: one token (or a verify window's tokens) through glm_linear, each input quantized once (a
+/// projection of the same input, on the same path, as the quantizing call before it reuses that call's q8_1), a
+/// prompt's through ctx.linear (the prompt products).  So an input must not change between two calls that read it:
+/// the sublayers write each buffer before they project it, never after.
 struct Linear {
     GlmContext& ctx;
     int n;
@@ -51,13 +51,13 @@ struct Linear {
     k::GlmLinearKind kind = k::kLinearNone;
     int64_t n_in = 0;
     void operator()(const GlmLinear& m, const float* in, float* out) {
-        if (n != 1) {
+        if (n != 1 && !ctx.exact) {
             ctx.linear(m, in, out, n, stream);
             return;
         }
         const k::GlmLinearKind kd = k::glm_linear_kind(m.type, m.n_in);
         const bool q = k::glm_linear_quantizes(kd);
-        k::glm_linear(m, in, out, 1, ctx.q8, stream, q && in == last && kd == kind && m.n_in == n_in);
+        k::glm_linear(m, in, out, n, ctx.q8, stream, q && in == last && kd == kind && m.n_in == n_in);
         if (q) {
             last = in;
             kind = kd;
@@ -95,7 +95,7 @@ bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::str
     const int64_t max_in = std::max({2 * D, di, g.kda_head_dim, g.q_lora_rank, H * g.head_dim_v, ff});
     const int64_t mix_scr = (int64_t) k::mhc_pre_scratch_floats((int) T, (int) D);
     const int64_t attn_floats = (int64_t) k::mla_decode_attn_scratch_floats((int) H, cap_);
-    const int64_t groups = std::min<int64_t>(std::max<int64_t>(g.n_expert, 1), T * kU);
+    const int64_t groups = T * kU;   // a verify window's: a group an entry
     for (int pass = 0; pass < 2; ++pass) {
         Carver c;
         c.base = (uint8_t*) arena_;
@@ -233,6 +233,7 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
     const int di = H * (int) g.kda_head_dim;
     const int n = (int) ctx.n_;
     const float rms_eps = (float) g.rms_eps;
+    const cudaStream_t s = (cudaStream_t) stream;
     Linear lin{ctx, n, stream};
     if (!g.is_mla[(size_t) il]) {
         if (n == 1) {
@@ -243,13 +244,16 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
             lin(w.wq, ctx.h, ctx.y);
             lin(w.wk, ctx.h, ctx.z);
             lin(w.wv, ctx.h, ctx.gate);
-            const cudaStream_t s = (cudaStream_t) stream;
             const size_t row = (size_t) di * sizeof(float);
             cudaMemcpy2DAsync(ctx.qkv, 3 * row, ctx.y, row, row, (size_t) n, cudaMemcpyDeviceToDevice, s);
             cudaMemcpy2DAsync(ctx.qkv + di, 3 * row, ctx.z, row, row, (size_t) n, cudaMemcpyDeviceToDevice, s);
             cudaMemcpy2DAsync(ctx.qkv + 2 * di, 3 * row, ctx.gate, row, row, (size_t) n, cudaMemcpyDeviceToDevice, s);
         }
-        k::kda_conv_l2(st.conv_hist, ctx.qkv, w.conv_q, w.conv_k, w.conv_v, ctx.qkv_c, H, n, 1e-6f, stream);
+        // a verify window keeps its inputs for commit and leaves the history and the state as they were
+        const bool win = ctx.win_raw != nullptr;
+        const size_t q3 = (size_t) n * 3 * di * sizeof(float);
+        if (win) cudaMemcpyAsync(ctx.win_raw, ctx.qkv, q3, cudaMemcpyDeviceToDevice, s);
+        k::kda_conv_l2(st.conv_hist, ctx.qkv, w.conv_q, w.conv_k, w.conv_v, ctx.qkv_c, H, n, 1e-6f, stream, !win);
         lin(w.f_a, ctx.h, ctx.lo);
         lin(w.f_b, ctx.lo, ctx.raw);
         k::kda_gate(ctx.raw, w.dt_bias, w.ssm_a, ctx.gate, H, n, g.has_kda_gate_lower_bound,
@@ -258,8 +262,14 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
         k::gdn_beta_gate(ctx.beta, (int64_t) n * H, stream);
         lin(w.g_a, ctx.h, ctx.lo);
         lin(w.g_b, ctx.lo, ctx.z);
+        if (win) {
+            cudaMemcpyAsync(ctx.win_qkv, ctx.qkv_c, q3, cudaMemcpyDeviceToDevice, s);
+            cudaMemcpyAsync(ctx.win_gate, ctx.gate, (size_t) n * di * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            cudaMemcpyAsync(ctx.win_beta, ctx.beta, (size_t) n * H * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        }
         // a prompt's too: token by token it is faster than kda_scan_norm_chunked at every length measured (kda.hpp)
-        k::kda_scan_norm(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H, n, stream);
+        k::kda_scan_norm(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H, n, stream,
+                         !win);
         lin(w.wo, ctx.y, ctx.f);
         return true;
     }
@@ -271,12 +281,32 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
     k::glm_rms_norm(ctx.qr, w.q_a_norm, n, g.q_lora_rank, rms_eps, stream);
     lin(w.wq_b, ctx.qr, ctx.q);
     if (full) lin(w.idx_q_b, ctx.qr, ctx.iq);
+    // a verify window: the decode kernels a token at a time, from each token's device step
+    const bool per_token = n > 1 && ctx.exact;
+    auto step_of = [&](int t) { return ctx.step + (size_t) t * k::kStepCount; };
     // one token: the row from the device step (a captured decode step writes the right one at every replay)
-    k::mla_kv_store(ctx.kv, w.kv_a_norm, rms_eps, st.latent, ctx.pos_, n, stream, n == 1 ? ctx.step : nullptr);
+    if (!per_token)
+        k::mla_kv_store(ctx.kv, w.kv_a_norm, rms_eps, st.latent, ctx.pos_, n, stream, n == 1 ? ctx.step : nullptr);
+    else
+        for (int t = 0; t < n; ++t)
+            k::mla_kv_store(ctx.kv + (size_t) t * L, w.kv_a_norm, rms_eps, st.latent, 0, 1, stream, step_of(t));
     k::mla_head_gemv(ctx.q, w.k_b, ctx.q_abs, H, DK, L, n, stream);
     if (full) {
         lin(w.idx_gate, ctx.h, ctx.ig);
-        if (n == 1) {   // the decode step's row and pool from the device step (capturable)
+        const int IK = (int) g.idx_key_dim, IH = (int) g.idx_heads;
+        const float w_scale = 1.0f / std::sqrt((float) (g.idx_key_dim * g.idx_heads));
+        if (per_token) {   // each token's row, pool, scores and selection in turn, as its decode step runs them
+            lin(w.idx_proj, ctx.h, ctx.iw);
+            for (int t = 0; t < n; ++t) {
+                k::kpool_key_store(ctx.ik + (size_t) t * IK, ctx.ig + (size_t) t * IK, w.idx_k_norm, w.idx_k_norm_b,
+                                   (float) g.norm_eps, st.idx_cache, 0, 1, step_of(t), stream);
+                k::kpool_pool(st.idx_cache, w.idx_ape, st.pooled, 0, 0, step_of(t), stream);
+                k::kpool_scores(st.pooled, ctx.iq + (size_t) t * IH * IK, ctx.iw + (size_t) t * IH, w_scale,
+                                step_of(t), 1, ctx.max_blocks_, ctx.select_tail_, ctx.scores, stream);
+                k::qsa_block_topk(ctx.scores, step_of(t), 1, ctx.max_blocks_, ctx.cap_,
+                                  k::kpool_topk_shapes(ctx.top_k_), ctx.sel_ids + (size_t) t * ctx.cap_, stream);
+            }
+        } else if (n == 1) {   // the decode step's row and pool from the device step (capturable)
             k::kpool_key_store(ctx.ik, ctx.ig, w.idx_k_norm, w.idx_k_norm_b, (float) g.norm_eps, st.idx_cache, 0, 1,
                                ctx.step, stream);
             k::kpool_pool(st.idx_cache, w.idx_ape, st.pooled, 0, 0, ctx.step, stream);
@@ -286,11 +316,13 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
             const int64_t b0 = ctx.pos_ / g.idx_kpool, b1 = (ctx.pos_ + n) / g.idx_kpool;
             if (b1 > b0) k::kpool_pool(st.idx_cache, w.idx_ape, st.pooled, b0, b1 - b0, nullptr, stream);
         }
-        lin(w.idx_proj, ctx.h, ctx.iw);
-        k::kpool_scores(st.pooled, ctx.iq, ctx.iw, 1.0f / std::sqrt((float) (g.idx_key_dim * g.idx_heads)),
-                        ctx.step, n, ctx.max_blocks_, ctx.select_tail_, ctx.scores, stream);
-        k::qsa_block_topk(ctx.scores, ctx.step, n, ctx.max_blocks_, ctx.cap_, k::kpool_topk_shapes(ctx.top_k_),
-                          ctx.sel_ids, stream);
+        if (!per_token) {
+            lin(w.idx_proj, ctx.h, ctx.iw);
+            k::kpool_scores(st.pooled, ctx.iq, ctx.iw, w_scale, ctx.step, n, ctx.max_blocks_, ctx.select_tail_,
+                            ctx.scores, stream);
+            k::qsa_block_topk(ctx.scores, ctx.step, n, ctx.max_blocks_, ctx.cap_, k::kpool_topk_shapes(ctx.top_k_),
+                              ctx.sel_ids, stream);
+        }
         ctx.sel_valid = true;
     } else if (!ctx.sel_valid) {
         err = "glm_layer_decode: block " + std::to_string(il) + " shares an indexer no earlier block computed";
@@ -300,6 +332,11 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
     if (n == 1)
         k::mla_decode_attn_step(ctx.q_abs, st.latent, ctx.sel_ids, ctx.step, ctx.cap_, scale, ctx.attn_scr, ctx.o_lat,
                                 H, stream);
+    else if (per_token)
+        for (int t = 0; t < n; ++t)
+            k::mla_decode_attn_step(ctx.q_abs + (size_t) t * H * L, st.latent, ctx.sel_ids + (size_t) t * ctx.cap_,
+                                    step_of(t), ctx.cap_, scale, ctx.attn_scr, ctx.o_lat + (size_t) t * H * L, H,
+                                    stream);
     else
         k::mla_prompt_attn(ctx.q_abs, st.latent, ctx.sel_ids, ctx.step, ctx.cap_, n, scale, ctx.o_lat, H, stream);
     k::mla_head_gemv(ctx.o_lat, w.v_b, ctx.o_mla, H, L, DV, n, stream);
@@ -451,16 +488,16 @@ bool GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLay
         return false;
     }
     k::quantize_q8_1_rows(ctx.h, n, D, ctx.xq, stream);
-    if (n == 1) {
+    if (n == 1 || ctx.exact) {   // grouped on the device, a group an entry (a verify window's too: each a decode step's)
         const unsigned long long* ptrs = w.expert_ptrs;
         if (!ptrs) {
-            ptrs = ctx.expert_provider->experts(il, ctx.eids, kU, stream, err);
+            ptrs = ctx.expert_provider->experts(il, ctx.eids, n * kU, stream, err);
             if (!ptrs) return false;
         }
         k::glm_expert_groups_decode(ctx.eids, ptrs, kU, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
-                                    ctx.ent_tok, stream);
+                                    ctx.ent_tok, stream, n);
         k::native_expert_grouped_clamped(w.expert_layout, ctx.grp_ptr, ctx.grp_start, ctx.n_groups, ctx.ent_dst,
-                                         ctx.ent_tok, kU, kU, ctx.xq, ctx.exp_scr, ctx.parts,
+                                         ctx.ent_tok, n * kU, n * kU, ctx.xq, ctx.exp_scr, ctx.parts,
                                          (float) g.swiglu_clamp_exp, stream);
     } else if (!experts_prompt(g, il, w, ctx, stream, err)) {
         return false;

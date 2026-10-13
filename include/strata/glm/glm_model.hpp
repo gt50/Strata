@@ -16,8 +16,9 @@
 // embed, head and head_norm are the MTP block's own (nextn.embed_tokens, shared_head_head, shared_head_norm) where
 // the file has them, else the model's.
 //
-// What this is not yet: the MTP block over a prompt, and nothing captured (the step is on the device; mla_kv_store's
-// row is still a host argument).
+// Speculative decoding (glm_spec.hpp runs the loop): verify() runs a window - the last token kept and the drafts
+// after it - through the main layers by the decode kernels, so each row's greedy pick is bitwise decode()'s, without
+// committing the KDA blocks' history and state; commit() keeps the accepted prefix and runs the MTP block over it.
 #pragma once
 
 #include "strata/core/geometry_glm5_next.hpp"
@@ -113,6 +114,27 @@ public:
     /// draft on): mtp_logits() and mtp_h() hold the result.  The block keeps its own caches by `pos`.
     bool mtp_decode(int32_t token, int64_t pos, const float* h, void* stream, std::string& err);
 
+    /// Buffers for verify windows of up to max_t tokens (max_t + 1 <= the max_chunk init was given).
+    bool init_verify(int max_t, std::string& err);
+    int max_verify() const { return max_t_; }
+    /// A verify window: tokens[0..T) at pos0 .. pos0 + T - 1 - the last token kept and T - 1 drafts - through the
+    /// main layers by the decode kernels, every token's arithmetic a decode step's (glm_layer.hpp: GlmContext::exact),
+    /// so picks[t] (host) is bitwise the greedy pick decode() gives after token t.  The positions' caches are written
+    /// (a later token at a position rewrites them before anything reads them); the KDA conv histories and states are
+    /// left as they were until commit().  Synchronizes the stream.
+    bool verify(const int32_t* tokens, int T, int64_t pos0, int32_t* picks, void* stream, std::string& err);
+    /// Row t of the last window's logits (device [n_vocab]).
+    const float* window_logits(int t) const { return wlogits_ + (size_t) t * (size_t) g_.n_vocab; }
+    /// Keeps the last window's first n_keep tokens (1..T): the KDA histories and states advance over them (bitwise
+    /// as n_keep decode() calls would leave them, from the inputs the window kept), logits() and h_nextn() become
+    /// token n_keep - 1's, and with an MTP block it runs over the kept positions with `next`, the token after them
+    /// (and over the prompt's pending last position, when the window follows it) - mtp_logits() / mtp_h() then draft
+    /// the token after `next`.
+    bool commit(int n_keep, int32_t next, void* stream, std::string& err);
+    /// The greedy picks of `rows` device logit rows of n_vocab (glm_argmax_rows: ties to the lowest index) into host
+    /// `out`; synchronizes the stream.
+    bool argmax(const float* logits, int rows, int32_t* out, void* stream, std::string& err);
+
     const float* logits() const { return logits_; }          ///< device [n_vocab]
     const float* h_nextn() const { return h_; }               ///< device [n_embd]
     const float* mtp_logits() const { return mtp_logits_; }  ///< device [n_vocab]
@@ -150,6 +172,14 @@ private:
     void drop_graph();
     bool decode_body(void* stream, std::string& err);   ///< the step once tok_ and the step are on the device
     bool mtp_prompt_ = true;
+    // verify windows
+    int max_t_ = 0;
+    void* win_arena_ = nullptr;
+    float *wlogits_ = nullptr, *whall_ = nullptr;
+    int32_t *wpick_ = nullptr, *pick_host_ = nullptr;
+    std::vector<float*> win_kda_;           ///< per block: its window storage (KDA blocks), else null
+    std::vector<int32_t> win_tokens_;       ///< the last window's tokens, until commit
+    int64_t win_pos0_ = -1;
     int64_t pending_pos_ = -1;   ///< a prompt's last position, its MTP row waiting for the next token
     float *hall_ = nullptr, *eb_ = nullptr, *h_pending_ = nullptr;
     int32_t* mtp_tok_ = nullptr;
