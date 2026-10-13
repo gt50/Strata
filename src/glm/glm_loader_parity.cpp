@@ -156,15 +156,42 @@ int bench_file(const char* shard, int64_t slots) {
 /// OUT_PREFIX.ids (every id, prompt and answer, as text) and OUT_PREFIX.logits (float32 [answer tokens][n_vocab]: row r
 /// the logits that chose answer token r).  For comparing with another implementation on the same ids
 /// (tools/glm_compare_logits.py).
+///
+/// Teacher-forced instead, when PROMPT_IDS has a second line P (the format OUT_PREFIX.ids has): the first P ids through
+/// prompt(), then every later id through decode() whatever the model would have chosen, a row of logits before each -
+/// a text's per-position predictions (perplexity) on the path serving takes.  N_NEW is then not used.
 int logits_real(const char* shard, const char* ids_path, const std::string& out, int n_new, int64_t slots) {
     try {
-        std::vector<int32_t> ids;
+        std::vector<int32_t> ids, forced;
         {
             std::FILE* f = std::fopen(ids_path, "r");
             if (!f) { std::fprintf(stderr, "%s: cannot open\n", ids_path); return 1; }
-            int v;
-            while (std::fscanf(f, "%d", &v) == 1) ids.push_back(v);
+            std::vector<std::string> lines;
+            char buf[1 << 16];
+            std::string cur;
+            while (std::fgets(buf, sizeof buf, f)) {
+                cur += buf;
+                if (!cur.empty() && cur.back() == '\n') { lines.push_back(cur); cur.clear(); }
+            }
+            if (!cur.empty()) lines.push_back(cur);
             std::fclose(f);
+            std::vector<int32_t> all;
+            if (!lines.empty()) {
+                const char* p = lines[0].c_str();
+                char* end = nullptr;
+                for (long v = std::strtol(p, &end, 10); end != p; v = std::strtol(p, &end, 10)) {
+                    all.push_back((int32_t) v);
+                    p = end;
+                }
+            }
+            const long P = lines.size() > 1 ? std::strtol(lines[1].c_str(), nullptr, 10) : 0;
+            if (P > 0 && P < (long) all.size()) {   // teacher-forced: the rest of the ids are the answer
+                ids.assign(all.begin(), all.begin() + P);
+                forced.assign(all.begin() + P, all.end());
+                n_new = (int) forced.size();
+            } else {
+                ids = all;
+            }
         }
         const strata::GgufModel m = strata::GgufModel::open(shard);
         Glm5NextGeometry g;
@@ -198,9 +225,10 @@ int logits_real(const char* shard, const char* ids_path, const std::string& out,
             check(cudaMemcpyAsync(row.data(), model.logits(), V * 4, cudaMemcpyDeviceToHost, s), "logits");
             check(cudaStreamSynchronize(s), "sync");
             std::fwrite(row.data(), 4, V, fl);
-            const int32_t next = (int32_t) (std::max_element(row.begin(), row.end()) - row.begin());
+            const int32_t next = forced.empty() ? (int32_t) (std::max_element(row.begin(), row.end()) - row.begin())
+                                                : forced[(size_t) t];
             ids.push_back(next);
-            if (std::find(ends.begin(), ends.end(), next) != ends.end() || t + 1 == n_new) break;
+            if ((forced.empty() && std::find(ends.begin(), ends.end(), next) != ends.end()) || t + 1 == n_new) break;
             if (!model.decode(next, (int64_t) ids.size() - 1, s, err)) {
                 std::fprintf(stderr, "%s\n", err.c_str());
                 return 1;

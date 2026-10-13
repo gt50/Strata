@@ -16,7 +16,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 
 | | |
 | --- | --- |
-| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s and 4-12 s for a 20-token prompt, bound by reading experts from the SSD; its next-token choices match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)) |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s and 4-12 s for a 20-token prompt, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)) |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
@@ -273,6 +273,29 @@ a second `GROUP` - Strata decoding 0.536, llama.cpp decoding 0.745, while llama.
 and Strata's prompt path `GROUP` (0.564). The doubled `GROUP BY` that answer shows is the model's own choice when
 decoding, not Strata's.
 
+**Perplexity over text.** Given a file whose second line is a prompt length P (the `.ids` format), `--logits`
+teacher-forces instead: the first P ids through the prompt path, every later id through decode whatever the model
+would have chosen, a row of logits before each. Three texts of 450 tokens from this repository, each `[gMASK]<sop>`
+and then English prose (README.md), Python (tools/glm_trace_replay.py) and Chinese prose (README.zh-CN.md), P = 64,
+1,158 predicted positions:
+
+| | English | Python | Chinese | All |
+| --- | --- | --- | --- | --- |
+| Perplexity, Strata | 11.896 | 5.289 | 13.483 | 9.467 |
+| Perplexity, llama.cpp one batch | 11.975 | 5.322 | 13.575 | 9.529 |
+| Perplexity, llama.cpp one token at a time | 12.085 | 5.303 | 13.509 | 9.531 |
+
+| | Same top token | KL mean | KL median | KL max |
+| --- | --- | --- | --- | --- |
+| Strata against llama.cpp, one batch | 1,073 of 1,158 (92.7%) | 0.0204 | 0.0103 | 1.763 |
+| Strata against llama.cpp, one token at a time | 1,065 of 1,158 (92.0%) | 0.0222 | 0.0108 | 1.687 |
+| llama.cpp one token at a time against one batch | 1,073 of 1,158 (92.7%) | 0.0202 | 0.0102 | 0.468 |
+
+On text the next token is often uncertain, so the top token differs more often than in the answers above - for
+llama.cpp's own two paths as much as for Strata. One position is further apart than llama.cpp's two paths ever are:
+the digit after "Q2_0 用的是引擎 " in the Chinese README (a version number), where Strata puts `2` first (0.374) and
+llama.cpp `57` (0.249); 99% of positions are under KL 0.14.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -295,7 +318,8 @@ python tools/test_setup_glm.py
 
 - Per-layer slot shares (prompt misses 60% -> 48% in the replay above, decode 18.3% -> 17.6%): they need a
   per-layer table measured on the model; the shares were not learned well online.
-- A longer quality comparison (perplexity over a text, more prompts) than the 152 positions above.
+- Quality on long contexts (the comparison above is 450 tokens; the MLA indexer selects from 2,048 cells only past
+  that), and with thinking on.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
   lines while a prompt is read.

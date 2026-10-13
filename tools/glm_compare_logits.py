@@ -5,7 +5,8 @@
     python tools/glm_compare_logits.py OUT [OUT ...] [--tokenizer DIR] [--llama .llama1]
 
 Per answer position: whether both pick the same top token, the KL divergence KL(llama.cpp || Strata) of the softmax,
-and the top-5 overlap.  With --tokenizer (a Strata tokenizer folder), the answer is printed and each position where the
+and the top-5 overlap; and each one's perplexity on the ids that follow (for a teacher-forced text, its perplexity;
+for Strata's own greedy answer, how sure each is of it).  With --tokenizer (a Strata tokenizer folder), the answer is printed and each position where the
 two disagree on the top token shows both choices.
 """
 from __future__ import annotations
@@ -57,6 +58,7 @@ def main() -> int:
     a = ap.parse_args()
     text = decoder(a.tokenizer)
     all_kl, all_same, n_all = [], 0, 0
+    all_nll_s, all_nll_l = [], []
     for p in a.prefixes:
         ids, n_prompt, s, ll = load(p, a.llama)
         ls, lll = log_softmax(s), log_softmax(ll)
@@ -64,9 +66,15 @@ def main() -> int:
         top_s, top_l = s.argmax(axis=-1), ll.argmax(axis=-1)
         same = top_s == top_l
         top5 = [len(set(np.argsort(-s[r])[:5]) & set(np.argsort(-ll[r])[:5])) for r in range(len(s))]
+        nxt = np.array(ids[n_prompt:n_prompt + len(s)])
+        ppl_s = float(np.exp(-ls[np.arange(len(s)), nxt].mean()))
+        ppl_l = float(np.exp(-lll[np.arange(len(s)), nxt].mean()))
+        all_nll_s.append(-ls[np.arange(len(s)), nxt])
+        all_nll_l.append(-lll[np.arange(len(s)), nxt])
         print("%s: %d answer tokens; top token the same at %d of %d; KL mean %.4f, max %.4f (at %d); top-5 overlap "
-              "mean %.2f" % (Path(p).name, len(s), int(same.sum()), len(s), kl.mean(), kl.max(), int(kl.argmax()),
-                             float(np.mean(top5))))
+              "mean %.2f; perplexity Strata %.3f, llama.cpp %.3f" % (
+                  Path(p).name, len(s), int(same.sum()), len(s), kl.mean(), kl.max(), int(kl.argmax()),
+                  float(np.mean(top5)), ppl_s, ppl_l))
         if text:
             print("  answer: %r" % text(ids[n_prompt:n_prompt + len(s)]))
             for r in np.nonzero(~same)[0]:
@@ -78,9 +86,11 @@ def main() -> int:
         all_same += int(same.sum())
         n_all += len(s)
     if len(a.prefixes) > 1:
-        print("all: top token the same at %d of %d (%.1f%%); KL mean %.4f, median %.4f, max %.4f" % (
-            all_same, n_all, 100.0 * all_same / n_all, float(np.mean(all_kl)), float(np.median(all_kl)),
-            float(np.max(all_kl))))
+        print("all: top token the same at %d of %d (%.1f%%); KL mean %.4f, median %.4f, max %.4f; perplexity Strata "
+              "%.3f, llama.cpp %.3f" % (
+                  all_same, n_all, 100.0 * all_same / n_all, float(np.mean(all_kl)), float(np.median(all_kl)),
+                  float(np.max(all_kl)), float(np.exp(np.concatenate(all_nll_s).mean())),
+                  float(np.exp(np.concatenate(all_nll_l).mean()))))
     return 0
 
 
