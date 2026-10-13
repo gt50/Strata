@@ -1,5 +1,6 @@
 // src/glm/glm_layer.cpp - see include/strata/glm/glm_layer.hpp.
 #include "strata/glm/glm_layer.hpp"
+#include "strata/glm/glm_gemm.hpp"
 
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/gdn.hpp"
@@ -43,6 +44,8 @@ bool full_indexer(const core::Glm5NextGeometry& g, int64_t il) {
 GlmContext::~GlmContext() {
     if (arena_) cudaFree(arena_);
     if (eids_host_) cudaFreeHost(eids_host_);
+    if (mmq_bounds_) cudaFree(mmq_bounds_);
+    delete gemm_;
 }
 
 bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::string& err, int64_t max_tokens) {
@@ -108,6 +111,10 @@ bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::str
         eids_host_ = nullptr;
         err = "GlmContext::init: the router's pinned host buffer";
         return false;
+    }
+    if (T > 1) {
+        gemm_ = new GlmPromptGemm();
+        if (!gemm_->init(T, max_in, D, std::max<int64_t>(g.n_ff_exp, 1), g.n_expert_used, err)) return false;
     }
     return true;
 }
@@ -189,7 +196,10 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
     const int n = (int) ctx.n_;
     const float rms_eps = (float) g.rms_eps;
     void* q8 = ctx.q8;
-    auto lin = [&](const GlmLinear& m, const float* in, float* out) { k::glm_linear(m, in, out, n, q8, stream); };
+    auto lin = [&](const GlmLinear& m, const float* in, float* out) {
+        if (n == 1) k::glm_linear(m, in, out, 1, q8, stream);
+        else ctx.gemm_->linear(m, in, out, n, q8, stream);
+    };
     if (!g.is_mla[(size_t) il]) {
         if (n == 1) {
             lin(w.wq, ctx.h, ctx.qkv);
@@ -298,6 +308,10 @@ bool GlmLayerImpl::experts_prompt(const core::Glm5NextGeometry& g, int64_t il, c
         err = "block " + std::to_string(il) + ": the expert provider holds no expert";
         return false;
     }
+    // matrix products over the blobs when they lie a fixed stride apart (the resident arena, or the cache's slots)
+    const uint8_t* base = w.expert_ptrs ? w.expert_base : ctx.expert_provider->slot_base();
+    const uint64_t stride = w.expert_ptrs ? w.expert_stride : ctx.expert_provider->slot_stride();
+    const bool mmq = base && glm_prompt_experts_mmq(w.expert_layout, stride);
     for (size_t r0 = 0; r0 < order.size(); r0 += (size_t) cap) {
         const size_t r1 = std::min(order.size(), r0 + (size_t) cap);
         const int ng = (int) (r1 - r0);
@@ -305,6 +319,57 @@ bool GlmLayerImpl::experts_prompt(const core::Glm5NextGeometry& g, int64_t il, c
         if (!table) {
             table = ctx.expert_provider->resident(il, order.data() + r0, ng, stream, err);
             if (!table) return false;
+        }
+        if (mmq) {   // the round's rows grouped by slot; bounds over the slots [s0, s1]
+            std::vector<std::pair<int32_t, int32_t>> by_slot;   // (slot, expert)
+            for (size_t i = r0; i < r1; ++i) {
+                const int32_t e = order[i];
+                by_slot.emplace_back(w.expert_ptrs ? e : ctx.expert_provider->slot_of(il, e), e);
+            }
+            std::sort(by_slot.begin(), by_slot.end());
+            const int32_t s0 = by_slot.front().first, s1 = by_slot.back().first;
+            if (s0 < 0) {
+                err = "block " + std::to_string(il) + ": an expert the provider did not place";
+                return false;
+            }
+            const int64_t n_slots = s1 - s0 + 1;
+            if (n_slots + 1 > ctx.mmq_bounds_cap_) {
+                if (ctx.mmq_bounds_) cudaFree(ctx.mmq_bounds_);   // (synchronizes: no product still reads it)
+                ctx.mmq_bounds_cap_ = std::max<int64_t>(n_slots + 1, 1024);
+                if (cudaMalloc((void**) &ctx.mmq_bounds_, (size_t) ctx.mmq_bounds_cap_ * 4) != cudaSuccess) {
+                    cudaGetLastError();
+                    ctx.mmq_bounds_ = nullptr;
+                    ctx.mmq_bounds_cap_ = 0;
+                    err = "block " + std::to_string(il) + ": the expert products' bounds";
+                    return false;
+                }
+            }
+            ctx.h_start_.assign((size_t) n_slots + 1, 0);
+            ctx.h_tok_.clear();
+            ctx.h_dst_.clear();
+            int max_rows = 0;
+            size_t q = 0;
+            for (int64_t sl = s0; sl <= s1; ++sl) {
+                int rows = 0;
+                if (q < by_slot.size() && by_slot[q].first == sl) {
+                    const int32_t e = by_slot[q++].second;
+                    for (int32_t j = first[(size_t) e]; j < first[(size_t) e + 1]; ++j, ++rows) {
+                        const int32_t entry = by_expert[(size_t) j];
+                        ctx.h_tok_.push_back(entry / kU);
+                        ctx.h_dst_.push_back(entry);
+                    }
+                }
+                max_rows = std::max(max_rows, rows);
+                ctx.h_start_[(size_t) (sl - s0 + 1)] = (int32_t) ctx.h_tok_.size();
+            }
+            const int rows = (int) ctx.h_tok_.size();
+            cudaMemcpyAsync(ctx.mmq_bounds_, ctx.h_start_.data(), (size_t) (n_slots + 1) * 4, cudaMemcpyHostToDevice, s);
+            cudaMemcpyAsync(ctx.ent_tok, ctx.h_tok_.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, s);
+            cudaMemcpyAsync(ctx.ent_dst, ctx.h_dst_.data(), (size_t) rows * 4, cudaMemcpyHostToDevice, s);
+            ctx.gemm_->experts(w.expert_layout, base + (uint64_t) s0 * stride, stride, (int) n_slots,
+                               ctx.mmq_bounds_, ctx.ent_tok, ctx.ent_dst, rows, max_rows, ctx.h, ctx.parts,
+                               (float) g.swiglu_clamp_exp, stream);
+            continue;
         }
         ctx.h_expert_.assign(order.begin() + (ptrdiff_t) r0, order.begin() + (ptrdiff_t) r1);
         ctx.h_start_.assign(1, 0);
@@ -337,7 +402,10 @@ bool GlmLayerImpl::ffn(const core::Glm5NextGeometry& g, int64_t il, const GlmLay
     const int D = (int) g.n_embd;
     const int n = (int) ctx.n_;
     void* q8 = ctx.q8;
-    auto lin = [&](const GlmLinear& m, const float* in, float* out) { k::glm_linear(m, in, out, n, q8, stream); };
+    auto lin = [&](const GlmLinear& m, const float* in, float* out) {
+        if (n == 1) k::glm_linear(m, in, out, 1, q8, stream);
+        else ctx.gemm_->linear(m, in, out, n, q8, stream);
+    };
     if (il < g.n_dense_lead) {
         lin(w.ffn_gate, ctx.h, ctx.fg);
         lin(w.ffn_up, ctx.h, ctx.fu);

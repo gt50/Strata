@@ -14,12 +14,18 @@
 // Every block is checked for every token of a call from the streams the device gave it (the taps) and its latent
 // history, the way glm_model_parity checks a decode token (glm_ref.hpp's verify: 1e-4, or a set of the reference's
 // q8_1 roundings on a boundary taken the other way); the KDA blocks' conv history and state at the end of each call;
-// the last indexer's cells and the last router's experts for every token; the head on the last token.
+// the last indexer's cells and the last router's experts for every token; the head on the last token.  A prompt
+// call's projections and experts are the prompt products (glm_gemm.hpp: MMQ, the BF16 GEMM), so the reference rounds
+// their activations as those do (glm_ref.hpp's g_prompt).
+//
+// `--bench [T]`: the prompt products' times at GLM-5.3-Flash's sizes; `--gemm`: the BF16 GEMM's accuracy by rows.
 #include "glm_ref.hpp"
 
 #include "strata/glm/glm_expert_cache.hpp"
 #include "strata/glm/glm_model.hpp"
 #include "strata/kernels/kpool.hpp"
+
+#include <chrono>
 
 namespace {
 
@@ -40,6 +46,7 @@ struct Run {
 
 /// The n tokens at pos0 that the last prompt() or decode() call ran, block by block from the taps.
 void verify_call(Run& run, int64_t pos0, int64_t n) {
+    g_prompt = n > 1;   // a prompt call took the prompt products (glm_gemm.hpp), a decode step the GEMVs
     const Glm5NextGeometry& g = run.tm.g;
     const int64_t D = g.n_embd, NL = g.n_layers;
     const vector<float> tp = download(run.taps, (size_t) ((NL + 1) * n * 4 * D));
@@ -106,6 +113,7 @@ void verify_call(Run& run, int64_t pos0, int64_t n) {
     const vector<float> h = download(run.model.h_nextn(), (size_t) D), lg = download(run.model.logits(), (size_t) g.n_vocab);
     const double rh = rel_l1(hm, h);
     vector<double> lg_ref;
+    g_prompt = 0;   // the head runs the last token alone, by the GEMV
     const bool lg_ok = verify("logits", pos0 + n - 1, -1, [&] {
         lg_ref = lin_ref(run.tm.out, vector<double>(h.begin(), h.end()));
         return Fit{rel_l1(lg_ref, lg)};
@@ -174,11 +182,141 @@ void prompt(Run& run, const vector<int32_t>& tokens, int64_t pos0, void* stream)
 
 }  // namespace
 
+/// `--gemm`: a BF16 projection (1024 x 1024) through GlmPromptGemm for T rows against double on the same BF16-rounded
+/// activations: the largest difference over the largest value.
+int gemm_check() {
+    const int64_t K = 1024, N = 1024;
+    const Lin L = make_lin(30, K, N);
+    glm::GlmPromptGemm pg;
+    std::string err;
+    if (!pg.init(64, K, 1024, 256, 4, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    for (int T : {64, 40, 32, 24, 16, 12, 8, 4, 2, 1}) {
+        const vector<float> x = gvec((size_t) (T * K), 1.0f);
+        float* dx = upload(x);
+        float* dy = nullptr;
+        check(cudaMalloc(&dy, (size_t) (T * N) * 4), "y");
+        pg.linear(L.dev, dx, dy, T, nullptr, nullptr);
+        check(cudaDeviceSynchronize(), "gemm");
+        const vector<float> y = download(dy, (size_t) (T * N));
+        double worst = 0, top = 0;
+        for (int t = 0; t < T; ++t) {
+            vector<double> xt(x.begin() + (ptrdiff_t) (t * K), x.begin() + (ptrdiff_t) ((t + 1) * K));
+            for (auto& v : xt) v = bf16_val(bf16_bits((float) v));
+            for (int64_t o = 0; o < N; ++o) {
+                double a = 0;
+                for (int64_t i = 0; i < K; ++i) a += (double) L.w[(size_t) (o * K + i)] * xt[(size_t) i];
+                worst = std::max(worst, std::fabs(a - y[(size_t) (t * N + o)]));
+                top = std::max(top, std::fabs(a));
+            }
+        }
+        std::printf("  BF16 GEMM, %2d rows: largest difference / largest value %.3e\n", T, worst / top);
+        cudaFree(dx);
+        cudaFree(dy);
+    }
+    return 0;
+}
+
+/// `--bench [T]`: a chunk of T tokens (256) at GLM-5.3-Flash's sizes, the prompt products against the GEMV path they replace.
+/// Projections 4096 -> 8192 (KDA's q / k / v) in IQ4_XS, Q8_0 and BF16; one MoE layer, 288 IQ4_XS experts of
+/// 4096 x 2048, 8 a token (random choices), through the grouped kernel and through MMQ.  Times back to back (one
+/// synchronization around 10 runs).
+int bench(int T) {
+    const int64_t D = 4096, N = 8192, F = 2048, NE = 288, KU = 8;
+    std::string err;
+    glm::GlmPromptGemm pg;
+    if (!pg.init(T, N, D, F, KU, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    cudaStream_t s;
+    check(cudaStreamCreate(&s), "stream");
+    float* x = upload(gvec((size_t) (T * N), 1.0f));
+    float* y = nullptr;
+    check(cudaMalloc(&y, (size_t) (T * N) * 4), "y");
+    void* q8 = nullptr;
+    check(cudaMalloc(&q8, k::glm_linear_scratch_bytes(N, T)), "q8");
+    auto time = [&](auto fn) {
+        fn();
+        check(cudaStreamSynchronize(s), "warm");
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 10; ++i) fn();
+        check(cudaStreamSynchronize(s), "timed");
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 10;
+    };
+    std::printf("prompt products at GLM-5.3-Flash's sizes, %d tokens (Radeon 8060S):\n", T);
+    for (int type : {23, 8, 30}) {
+        const Lin L = make_lin(type, D, N);
+        const double gemv = time([&] { k::glm_linear(L.dev, x, y, T, q8, s); });
+        const double prod = time([&] { pg.linear(L.dev, x, y, T, q8, s); });
+        std::printf("  projection 4096 -> 8192 %-6s: GEMV %7.2f ms, %s %6.2f ms (%5.1fx; %.0f tokens/s through it)\n",
+                    type == 23 ? "IQ4_XS" : type == 8 ? "Q8_0" : "BF16", gemv,
+                    type == 30 ? "BF16 GEMM" : "MMQ      ", prod, gemv / prod, T / prod * 1000);
+    }
+    // one MoE layer: 288 experts in one arena, the blob of one random expert repeated
+    const k::NativeExpertLayout el = k::native_expert_layout(23, 23, D, F);
+    const uint64_t slot = (el.bytes + 255) & ~(uint64_t) 255;
+    uint8_t* arena = nullptr;
+    check(cudaMalloc(&arena, slot * (uint64_t) NE), "experts");
+    {
+        const Lin g = make_lin(23, D, F), u = make_lin(23, D, F), dn = make_lin(23, F, D);
+        for (int64_t e = 0; e < NE; ++e) {
+            uint8_t* b = arena + slot * (uint64_t) e;
+            check(cudaMemcpy(b, g.dev.data, el.up_off, cudaMemcpyDeviceToDevice), "gate");
+            check(cudaMemcpy(b + el.up_off, u.dev.data, el.up_off, cudaMemcpyDeviceToDevice), "up");
+            check(cudaMemcpy(b + el.down_off, dn.dev.data, el.bytes - el.down_off, cudaMemcpyDeviceToDevice), "down");
+        }
+    }
+    // random routing, grouped by expert (entries t * 8 + j)
+    vector<vector<int32_t>> by_e((size_t) NE);
+    for (int t = 0; t < T; ++t) {
+        vector<int32_t> pick;
+        while ((int64_t) pick.size() < KU) {
+            const int32_t e = (int32_t) (unit() * (float) NE) % (int32_t) NE;
+            if (std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+        }
+        for (int j = 0; j < KU; ++j) by_e[(size_t) pick[(size_t) j]].push_back(t * (int32_t) KU + j);
+    }
+    vector<int32_t> starts{0}, tok, ent, bounds{0};
+    vector<unsigned long long> ptrs;
+    int max_rows = 0, groups = 0;
+    for (int64_t e = 0; e < NE; ++e) {
+        for (int32_t en : by_e[(size_t) e]) { tok.push_back(en / (int32_t) KU); ent.push_back(en); }
+        bounds.push_back((int32_t) tok.size());
+        max_rows = std::max(max_rows, (int) by_e[(size_t) e].size());
+        if (!by_e[(size_t) e].empty()) {
+            ++groups;
+            starts.push_back((int32_t) tok.size());
+            ptrs.push_back((unsigned long long) (uintptr_t) (arena + slot * (uint64_t) e));
+        }
+    }
+    int32_t *d_start = upload(starts), *d_tok = upload(tok), *d_ent = upload(ent), *d_bounds = upload(bounds);
+    unsigned long long* d_ptrs = upload(ptrs);
+    int32_t* d_ng = upload(vector<int32_t>{groups});
+    void* xq = nullptr;
+    void* scr = nullptr;
+    float* parts = nullptr;
+    check(cudaMalloc(&xq, k::glm_linear_scratch_bytes(D, T)), "xq");
+    check(cudaMalloc(&scr, k::native_expert_scratch_bytes(T * KU, F)), "scratch");
+    check(cudaMalloc(&parts, (size_t) (T * KU * D) * 4), "parts");
+    const double grouped = time([&] {
+        k::quantize_q8_1_rows(x, T, D, xq, s);
+        k::native_expert_grouped_clamped(el, d_ptrs, d_start, d_ng, d_ent, d_tok, groups, T * KU, xq, scr, parts, 10.0f,
+                                         s);
+    });
+    const double mmq = time([&] {
+        pg.experts(el, arena, slot, (int) NE, d_bounds, d_tok, d_ent, (int) (T * KU), max_rows, x, parts, 10.0f, s);
+    });
+    const double gb = (double) groups * (double) el.bytes / 1e9;
+    std::printf("  one MoE layer, %d of 288 experts used (%.2f GB of blobs): grouped kernel %7.2f ms, MMQ %6.2f ms "
+                "(%4.1fx)\n", groups, gb, grouped, mmq, grouped / mmq);
+    cudaStreamDestroy(s);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
-        else { std::fprintf(stderr, "usage: glm_prompt_parity [--selftest]\n"); return 2; }
+        else if (std::string(argv[i]) == "--bench") return bench(i + 1 < argc ? std::atoi(argv[i + 1]) : 256);
+        else if (std::string(argv[i]) == "--gemm") return gemm_check();
+        else { std::fprintf(stderr, "usage: glm_prompt_parity [--selftest | --gemm]\n"); return 2; }
     }
     TestModel tm = build_test_model(MAX_CTX);
     const Glm5NextGeometry& g = tm.g;

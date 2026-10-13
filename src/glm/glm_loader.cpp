@@ -458,6 +458,8 @@ bool GlmLoadedWeights::load(const GgufModel& m, const core::Glm5NextGeometry& g,
         GlmLayerWeights& b = w_.blocks[(size_t) il];
         b.expert_layout = el;
         b.expert_ptrs = (const unsigned long long*) pd;
+        b.expert_base = blobs;
+        b.expert_stride = slot;
     }
     return true;
 }

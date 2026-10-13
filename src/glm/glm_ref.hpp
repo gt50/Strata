@@ -11,6 +11,7 @@
 // other way that explains the result and the state the block carries together.
 #pragma once
 
+#include "strata/glm/glm_gemm.hpp"
 #include "strata/glm/glm_layer.hpp"
 #include "strata/glm/glm_model.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -165,12 +166,25 @@ bool scale_on_boundary(float d) {
 /// The quantizations made since the events were last reset: the device quantizes an activation once in the same way
 /// for every projection that reads it (wq and wk both read the attention's h), so where it rounds a value the other way
 /// it does so for all of them.  A vector quantized again gives the same result and no new events.
-vector<std::pair<vector<double>, vector<double>>> g_q8_memo;
+struct Memo {
+    int kind;   // 0 q8_1 (GEMV), 1 MMQ with an FP32 scale, 2 MMQ with an FP16 scale, 3 BF16
+    vector<double> in, out;
+};
+vector<Memo> g_q8_memo;
+const vector<double>* memo_find(int kind, const vector<double>& x) {
+    for (const Memo& m : g_q8_memo)
+        if (m.kind == kind && m.in == x) return &m.out;
+    return nullptr;
+}
 
-/// The q8_1 rounding of an activation the quantized projections and the grouped experts read.
+/// 1: the calls being checked ran as a prompt (more than one token): the projections and the experts took the prompt
+/// products (glm_gemm.hpp), which round their activations as llama.cpp's batched path does.
+int g_prompt = 0;
+
+/// The q8_1 rounding of an activation the quantized projections and the grouped experts read (the GEMV's: x / d, the
+/// scale amax / 127 in FP16).
 vector<double> q8_1(const vector<double>& x) {
-    for (const auto& [in, res] : g_q8_memo)
-        if (in == x) return res;
+    if (const vector<double>* r = memo_find(0, x)) return *r;
     vector<double> out(x.size());
     for (size_t b = 0; b < x.size(); b += 32) {
         float amax = 0.0f;
@@ -189,11 +203,74 @@ vector<double> q8_1(const vector<double>& x) {
             out[i] = q * dh;
         }
     }
-    g_q8_memo.emplace_back(x, out);
+    g_q8_memo.push_back({0, x, out});
     return out;
 }
+
+/// MMQ's q8_1 rounding (llama.cpp's quantize_mmq_q8_1): q = roundf(x * (127 / amax)) in FP32, the scale
+/// 1 / (127 / amax) kept in FP32 (D4) or FP16 (DS4).
+vector<double> q8_1_mmq(const vector<double>& x, bool fp16_scale) {
+    const int kind = fp16_scale ? 2 : 1;
+    if (const vector<double>* r = memo_find(kind, x)) return *r;
+    vector<double> out(x.size());
+    for (size_t b = 0; b < x.size(); b += 32) {
+        float amax = 0.0f;
+        for (size_t i = b; i < b + 32; ++i) amax = std::max(amax, std::fabs((float) x[i]));
+        const float d_inv = 127.0f / amax, d = 1.0f / d_inv;
+        double dh = d;
+        if (fp16_scale) {
+            const uint16_t h16 = k::f16_from_f32(d);
+            dh = k::f32_from_f16(h16);
+            if (amax != 0.0f && scale_on_boundary(d) && flip_next())
+                dh = k::f32_from_f16((uint16_t) (d > (float) dh ? h16 + 1 : h16 - 1));
+        }
+        for (size_t i = b; i < b + 32; ++i) {
+            const float p = amax == 0.0f ? 0.0f : (float) x[i] * d_inv;
+            float q = std::round(p);
+            if (amax != 0.0f) {
+                const double fl = std::floor((double) p), fr = (double) p - fl;
+                if (std::fabs(fr - 0.5) < 3e-4 && flip_next()) q = (float) (q == (float) fl ? fl + 1 : fl);
+            }
+            out[i] = amax == 0.0f ? 0.0 : (double) q * dh;
+        }
+    }
+    g_q8_memo.push_back({kind, x, out});
+    return out;
+}
+
+/// The BF16 rounding of the activations a BF16 GEMM reads (round to nearest even), a value within 3e-4 of a BF16 step
+/// of the midpoint an event.
+vector<double> bf16_act(const vector<double>& x) {
+    if (const vector<double>* r = memo_find(3, x)) return *r;
+    vector<double> out(x.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+        const float f = (float) x[i];
+        uint32_t u;
+        std::memcpy(&u, &f, 4);
+        const uint32_t lo = u & 0xffffu;
+        uint16_t b = bf16_bits(f);
+        if (std::fabs((double) lo / 65536.0 - 0.5) < 3e-4 && flip_next())
+            b = (uint16_t) ((u >> 16) + (b == (uint16_t) (u >> 16) ? 1 : 0));   // the other neighbour
+        out[i] = bf16_val(b);
+    }
+    g_q8_memo.push_back({3, x, out});
+    return out;
+}
+
+/// What a projection reads: at decode the GEMV's (q8_1 for a quantized weight, the FP32 values otherwise); in a prompt
+/// the product glm_prompt_path chose (MMQ's q8_1, BF16 for a BF16 GEMM, or the GEMV's).
+vector<double> act_for(const Lin& L, const vector<double>& x) {
+    if (g_prompt) {
+        switch (glm::glm_prompt_path(L.dev.type, L.dev.n_in, L.dev.n_out)) {
+            case glm::GlmProjPath::Mmq: return q8_1_mmq(x, glm::glm_mmq_fp16_scale(L.dev.type));
+            case glm::GlmProjPath::Bf16Gemm: return bf16_act(x);
+            case glm::GlmProjPath::Gemv: break;
+        }
+    }
+    return L.quant ? q8_1(x) : x;
+}
 vector<double> lin_ref(const Lin& L, const vector<double>& x) {
-    const vector<double> xa = L.quant ? q8_1(x) : x;
+    const vector<double> xa = act_for(L, x);
     vector<double> y((size_t) L.dev.n_out);
     for (int64_t o = 0; o < L.dev.n_out; ++o) {
         double a = 0;
@@ -488,7 +565,13 @@ vector<double> ffn_ref(Block& b, const Glm5NextGeometry& g, const vector<double>
     double sum = 0;
     r.eids.clear();
     for (int i = 0; i < KU; ++i) { r.eids.push_back(order[(size_t) i]); sum += p[(size_t) order[(size_t) i]]; }
-    const vector<double> xq = q8_1(h);
+    // the experts' activations: a prompt's MMQ products round as MMQ does, else the grouped kernel's q8_1
+    const k::NativeExpertLayout& el = b.w.expert_layout;
+    const bool mmq = g_prompt && glm::glm_prompt_experts_mmq(el, b.w.expert_stride);
+    auto round_in = [&](const vector<double>& v, int type) {
+        return mmq ? q8_1_mmq(v, glm::glm_mmq_fp16_scale(type)) : q8_1(v);
+    };
+    const vector<double> xq = round_in(h, el.gu_type);
     vector<double> out((size_t) g.n_embd, 0.0);
     for (int i = 0; i < KU; ++i) {
         const int e = order[(size_t) i];
@@ -504,7 +587,7 @@ vector<double> ffn_ref(Block& b, const Glm5NextGeometry& g, const vector<double>
             gg[(size_t) f] = a;
             uu[(size_t) f] = c;
         }
-        const vector<double> s = q8_1(swiglu_clamp(gg, uu, g.swiglu_clamp_exp));
+        const vector<double> s = round_in(swiglu_clamp(gg, uu, g.swiglu_clamp_exp), el.d_type);
         for (int64_t d = 0; d < D; ++d) {
             double a = 0;
             for (int64_t f = 0; f < F; ++f) a += (double) b.e_down[(size_t) e][(size_t) (d * F + f)] * s[(size_t) f];
@@ -594,6 +677,8 @@ void build_moe(Block& b, const Glm5NextGeometry& g) {
     }
     w.expert_ptrs = upload(ptrs);
     g_free.push_back((void*) w.expert_ptrs);
+    w.expert_base = blobs;
+    w.expert_stride = slot;
     b.sh_gate = make_lin(23, D, g.n_ff_shexp); b.sh_up = make_lin(23, D, g.n_ff_shexp);
     b.sh_down = make_lin(8, g.n_ff_shexp, D);
     w.sh_gate = b.sh_gate.dev; w.sh_up = b.sh_up.dev; w.sh_down = b.sh_down.dev;
@@ -744,6 +829,18 @@ bool g_quiet = false;   ///< verify prints only the results that needed a search
 template <class Run, class Undo>
 bool verify(const char* what, int64_t pos, long long il, Run run, Undo undo) {
     auto good = [](const Fit& f) { return f.rel <= 1e-4 && f.rest; };
+    // FP32 summation against double: within this the reference took the device's roundings.  A result between it and
+    // 1e-4 may still be a rounding taken the other way whose effect is small here but carried in the state - a KDA
+    // block's conv history, which a prompt shows only at its end - so the search runs for it too, and keeps the plain
+    // reference when nothing comes closer.
+    auto exact = [](const Fit& f) { return f.rel <= 1e-6 && f.rest; };
+    auto run_with = [&](const vector<int>& s) {
+        undo();
+        g_flip = s;
+        g_near = 0;
+        g_q8_memo.clear();
+        return run();
+    };
     g_flip.clear();
     g_near = 0;
     g_q8_memo.clear();
@@ -751,7 +848,7 @@ bool verify(const char* what, int64_t pos, long long il, Run run, Undo undo) {
     const int n = g_near;
     Fit f = f0;
     vector<int> taken;
-    if (!good(f0) && n > 0) {
+    if (!exact(f0) && n > 0) {
         vector<vector<int>> sets;
         for (int a = 0; a < n; ++a) sets.push_back({a});
         for (int a = 0; a < n; ++a)
@@ -760,24 +857,25 @@ bool verify(const char* what, int64_t pos, long long il, Run run, Undo undo) {
             for (int a = 0; a < n; ++a)
                 for (int c = a + 1; c < n; ++c)
                     for (int e = c + 1; e < n; ++e) sets.push_back({a, c, e});
+        bool found = false, have_good = false;
+        vector<int> good_set;
         for (const vector<int>& s : sets) {
-            undo();
-            g_flip = s;
-            g_near = 0;
-            g_q8_memo.clear();
-            const Fit fs = run();
-            if (good(fs)) { f = fs; taken = s; break; }
+            const Fit fs = run_with(s);
+            if (exact(fs)) { f = fs; taken = s; found = true; break; }
+            if (!have_good && good(fs)) { have_good = true; good_set = s; }
         }
-        if (taken.empty()) {   // none: leave the plain reference's state
-            undo();
-            g_flip.clear();
-            g_near = 0;
-            g_q8_memo.clear();
-            run();
+        if (!found) {
+            if (!good(f0) && have_good) {   // the closest acceptable explanation
+                taken = good_set;
+                f = run_with(taken);
+            } else {                          // the plain reference (its state)
+                f = run_with({});
+            }
         }
     }
     g_flip.clear();
-    if (g_quiet && good(f0)) return true;
+    if (g_quiet && exact(f0)) return true;
+    if (g_quiet && good(f0) && taken.empty()) return true;
     std::printf("  pos %lld block %lld: %s rel %.3e%s", (long long) pos, il, what, f.rel, f.rest ? "" : " (and its state)");
     if (!taken.empty())
         std::printf("  (%.1e%s as rounded; the reference matches with %zu of its %d q8_1 roundings on a boundary taken "

@@ -39,5 +39,7 @@ void glm_router(const float* logits, const float* bias, int n_tok, int n_expert,
 /// h = silu(min(gate, lim)) * clamp(up, -lim, lim) over n values; lim <= 0: silu(gate) * up.  For the shared expert
 /// and the dense layers, whose projections are single GEMVs.
 void swiglu_clamp(const float* gate, const float* up, float* h, int64_t n, float lim, void* stream);
+/// The same over rows of [gate n_ff | up n_ff] (an MMQ gate/up product's output): h [rows][n_ff].
+void swiglu_clamp_rows(const float* gu, float* h, int64_t rows, int64_t n_ff, float lim, void* stream);
 
 }  // namespace strata::kernels

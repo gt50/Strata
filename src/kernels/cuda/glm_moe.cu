@@ -119,6 +119,21 @@ __global__ void swiglu_clamp_kernel(const float* __restrict__ gate, const float*
     h[i] = g / (1.0f + expf(-g)) * u;
 }
 
+/// gu [rows][2 n_ff] (gate n_ff, then up n_ff: one MMQ product's output) to h [rows][n_ff], swiglu_clamp_kernel's
+/// arithmetic.
+__global__ void swiglu_clamp_rows_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows,
+                                         int64_t n_ff, float lim) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * n_ff) return;
+    const int64_t r = i / n_ff, c = i % n_ff;
+    float g = gu[r * 2 * n_ff + c], u = gu[r * 2 * n_ff + n_ff + c];
+    if (lim > 0.0f) {
+        g = fminf(g, lim);
+        u = fminf(fmaxf(u, -lim), lim);
+    }
+    h[i] = g / (1.0f + expf(-g)) * u;
+}
+
 void check_launch(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -149,6 +164,17 @@ void swiglu_clamp(const float* gate, const float* up, float* h, int64_t n, float
     if (n == 0) return;
     swiglu_clamp_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(gate, up, h, n, lim);
     check_launch("swiglu_clamp");
+}
+
+void swiglu_clamp_rows(const float* gu, float* h, int64_t rows, int64_t n_ff, float lim, void* stream) {
+    if (!gu || !h || rows < 0 || n_ff <= 0) {
+        std::fprintf(stderr, "swiglu_clamp_rows: invalid arguments\n");
+        std::exit(1);
+    }
+    const int64_t n = rows * n_ff;
+    if (n == 0) return;
+    swiglu_clamp_rows_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, lim);
+    check_launch("swiglu_clamp_rows");
 }
 
 }  // namespace strata::kernels

@@ -61,6 +61,10 @@ struct GlmLayerWeights {
     const float* exp_probs_b = nullptr;                 ///< (n_expert,)
     kernels::NativeExpertLayout expert_layout;          ///< [gate rows | up rows | down rows] a blob
     const unsigned long long* expert_ptrs = nullptr;    ///< device: the n_expert blobs' device addresses
+    /// when the blobs lie a fixed stride apart (blob e at expert_base + e * expert_stride): a prompt's experts then
+    /// run as matrix products over them (glm_gemm.hpp); else 0
+    const uint8_t* expert_base = nullptr;
+    uint64_t expert_stride = 0;
     GlmLinear sh_gate, sh_up, sh_down;
 };
 
@@ -89,7 +93,15 @@ public:
                                                std::string& err) = 0;
     /// The experts one call can hold.
     virtual int64_t capacity() const = 0;
+    /// The slots' layout when they lie a fixed stride apart (slot s at slot_base() + s * slot_stride(), device
+    /// addresses), so a prompt round runs as matrix products over them; null / 0 otherwise.
+    virtual const uint8_t* slot_base() const { return nullptr; }
+    virtual uint64_t slot_stride() const { return 0; }
+    /// After resident(): the slot expert e of block il is in.
+    virtual int32_t slot_of(int64_t il, int32_t e) const { (void) il; (void) e; return -1; }
 };
+
+class GlmPromptGemm;
 
 /// The per-token values and the scratch every layer shares: one per model (and stream).
 class GlmContext {
@@ -136,6 +148,9 @@ private:
     int64_t pos_ = -1;   ///< set_positions' first position, for mla_kv_store's row
     int64_t n_ = 0;      ///< and its token count
     int32_t* eids_host_ = nullptr;   ///< pinned: a prompt's router choices, grouped on the host
+    GlmPromptGemm* gemm_ = nullptr;  ///< the prompt products (max_tokens > 1)
+    int32_t* mmq_bounds_ = nullptr;  ///< device: a round's per-slot bounds for the expert products
+    int64_t mmq_bounds_cap_ = 0;
     std::vector<int32_t> h_expert_, h_start_, h_tok_, h_dst_;
     int64_t top_k_ = 0;
     bool select_tail_ = true;

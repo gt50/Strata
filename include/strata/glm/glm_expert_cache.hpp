@@ -64,6 +64,9 @@ public:
     const unsigned long long* resident(int64_t il, const int32_t* experts, int n, void* stream,
                                        std::string& err) override;
     int64_t capacity() const override { return (int64_t) owner_.size(); }
+    const uint8_t* slot_base() const override { return blobs_; }
+    uint64_t slot_stride() const override { return slot_bytes_; }
+    int32_t slot_of(int64_t il, int32_t e) const override { return slot_of_[(size_t) (il * n_expert_ + e)]; }
 
     const Stats& stats() const { return stats_; }
     void reset_stats() { stats_ = Stats{}; }
