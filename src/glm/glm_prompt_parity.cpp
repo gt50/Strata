@@ -1,4 +1,4 @@
-// src/glm/glm_prompt_parity.cpp - GlmModel::prompt (many tokens a call: kda_scan_norm_chunked, mla_prompt_attn, the
+// src/glm/glm_prompt_parity.cpp - GlmModel::prompt (many tokens a call: kda_scan_norm over them, mla_prompt_attn, the
 // experts grouped on the host) on glm_model_parity's synthetic model, against glm_ref.hpp's transcription of llama.cpp's
 // glm5-next graph, token by token.
 //
@@ -230,12 +230,12 @@ void history(Run& run, int64_t p0, void* stream) {
             const vector<float> hist = gvec((size_t) 3 * di * 3, 1.0f), stt = gvec((size_t) Dh * H * Dh, 0.05f);
             b.conv_hist.assign(hist.begin(), hist.end());
             vector<float> dev((size_t) stt.size());
-            for (int hh = 0; hh < H; ++hh)   // the reference's [h][j][i]; the device's [i][h][j]
+            for (int hh = 0; hh < H; ++hh)   // the reference's [h][j][i]; the device's [h][i][j]
                 for (int j = 0; j < Dh; ++j)
                     for (int i = 0; i < Dh; ++i) {
                         const float v = stt[((size_t) hh * Dh + j) * Dh + i];
                         b.kda_state[((size_t) hh * Dh + j) * Dh + i] = v;
-                        dev[((size_t) i * H + hh) * Dh + j] = v;
+                        dev[((size_t) hh * Dh + i) * Dh + j] = v;
                     }
             check(cudaMemcpy(st.conv_hist, hist.data(), hist.size() * 4, cudaMemcpyHostToDevice), "hist");
             check(cudaMemcpy(st.kda_state, dev.data(), dev.size() * 4, cudaMemcpyHostToDevice), "state");

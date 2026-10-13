@@ -122,7 +122,6 @@ bool GlmContext::init(const core::Glm5NextGeometry& g, int64_t max_ctx, std::str
         q8 = c.take<uint8_t>(k::glm_linear_scratch_bytes(max_in, (int) T));
         xq = c.take<uint8_t>(k::glm_linear_scratch_bytes(D, (int) T));
         exp_scr = c.take<uint8_t>(g.n_expert_used > 0 ? k::native_expert_scratch_bytes(T * kU, g.n_ff_exp) : 0);
-        kda_scr = c.take<float>(T > 1 ? k::kda_chunked_scratch_floats((int) H, (int) T) : 0);
         if (pass == 0) {
             if (cudaMalloc(&arena_, c.off) != cudaSuccess) {
                 cudaGetLastError();
@@ -259,11 +258,8 @@ bool GlmLayerImpl::attention(const core::Glm5NextGeometry& g, int64_t il, const 
         k::gdn_beta_gate(ctx.beta, (int64_t) n * H, stream);
         lin(w.g_a, ctx.h, ctx.lo);
         lin(w.g_b, ctx.lo, ctx.z);
-        if (n == 1)
-            k::kda_scan_norm(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H, 1, stream);
-        else
-            k::kda_scan_norm_chunked(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H,
-                                     n, ctx.kda_scr, stream);
+        // a prompt's too: token by token it is faster than kda_scan_norm_chunked at every length measured (kda.hpp)
+        k::kda_scan_norm(st.kda_state, ctx.qkv_c, ctx.gate, ctx.beta, ctx.z, w.o_norm, rms_eps, ctx.y, H, n, stream);
         lin(w.wo, ctx.y, ctx.f);
         return true;
     }

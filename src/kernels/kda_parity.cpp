@@ -23,6 +23,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -152,19 +153,19 @@ void ref_scan_norm(std::vector<double>& st, const std::vector<float>& qkv, const
     }
 }
 
-/// Strata's (D, H, D) state, [(i * H + h) * D + j], from and to ggml's per-head s[j * D + i].
+/// Strata's (H, D, D) state, [(h * D + i) * D + j], from and to ggml's per-head s[j * D + i].
 std::vector<float> to_dev(const std::vector<double>& st, int nh = H) {
     std::vector<float> d((size_t) D * nh * D);
     for (int h = 0; h < nh; ++h)
         for (int i = 0; i < D; ++i)
-            for (int j = 0; j < D; ++j) d[((size_t) i * nh + h) * D + j] = (float) st[(size_t) h * D * D + (size_t) j * D + i];
+            for (int j = 0; j < D; ++j) d[((size_t) h * D + i) * D + j] = (float) st[(size_t) h * D * D + (size_t) j * D + i];
     return d;
 }
 std::vector<float> from_dev(const std::vector<float>& d, int nh = H) {
     std::vector<float> st((size_t) nh * D * D);
     for (int h = 0; h < nh; ++h)
         for (int i = 0; i < D; ++i)
-            for (int j = 0; j < D; ++j) st[(size_t) h * D * D + (size_t) j * D + i] = d[((size_t) i * nh + h) * D + j];
+            for (int j = 0; j < D; ++j) st[(size_t) h * D * D + (size_t) j * D + i] = d[((size_t) h * D + i) * D + j];
     return st;
 }
 std::vector<float> to_float(const std::vector<double>& v) { return std::vector<float>(v.begin(), v.end()); }
@@ -336,7 +337,7 @@ int main(int argc, char** argv) {
     const std::vector<float> y_got = download(d_y, y_want.size());
     const std::vector<float> st_got = download(d_st, st0.size());
     expect_close("kda_scan_norm: y", y_want, y_got, 2e-5);
-    expect_close("kda_scan_norm: state, read through (D, H, D)", to_float(st_want), from_dev(st_got), 2e-5);
+    expect_close("kda_scan_norm: state, read through (H, D, D)", to_float(st_want), from_dev(st_got), 2e-5);
 
     // one token: what decode runs
     {
@@ -443,7 +444,7 @@ int main(int argc, char** argv) {
 
     // ================= --bench: the two scans over a prompt =================
     if (bench) {
-        std::printf("\nkda_scan_norm vs kda_scan_norm_chunked, all %d heads, best of 5 launches:\n", H);
+        std::printf("\nkda_scan_norm vs kda_scan_norm_chunked, all %d heads, best of 5 launches (host clock: launch, wait):\n", H);
         for (const int n : {32, 128, 512, 2048, 8192}) {
             std::vector<float> qkv((size_t) n * 3 * DI), gt((size_t) n * DI), bt((size_t) n * H), zt((size_t) n * DI);
             for (auto& x : qkv) x = 0.088f * gauss(rng);   // about unit rows of 128
@@ -454,26 +455,21 @@ int main(int argc, char** argv) {
             float *dy = nullptr, *dscr = nullptr;
             check(cudaMalloc(&dy, (size_t) n * DI * 4), "y");
             check(cudaMalloc(&dscr, strata::kernels::kda_chunked_scratch_floats(H, n) * 4), "scratch");
-            cudaEvent_t e0, e1;
-            check(cudaEventCreate(&e0), "ev");
-            check(cudaEventCreate(&e1), "ev");
-            float best[2] = {1e30f, 1e30f};
+            // the host clock: HIP's events under Windows can close before the work has run
+            double best[2] = {1e30, 1e30};
             for (int it = 0; it < 6; ++it)
                 for (int which = 0; which < 2; ++which) {   // alternate, so a clock step affects both alike
-                    check(cudaEventRecord(e0, nullptr), "rec");
+                    check(cudaDeviceSynchronize(), "sync");
+                    const auto c0 = std::chrono::steady_clock::now();
                     if (which == 0) strata::kernels::kda_scan_norm(ds, dq, dg, db, dz, d_gamma, kRmsEps, dy, H, n, nullptr);
                     else strata::kernels::kda_scan_norm_chunked(ds, dq, dg, db, dz, d_gamma, kRmsEps, dy, H, n, dscr, nullptr);
-                    check(cudaEventRecord(e1, nullptr), "rec");
-                    check(cudaEventSynchronize(e1), "sync");
-                    float ms = 0;
-                    check(cudaEventElapsedTime(&ms, e0, e1), "el");
+                    check(cudaDeviceSynchronize(), "sync");
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
                     if (it > 0) best[which] = std::fmin(best[which], ms);   // the first is a warm-up
                 }
             std::printf("  T = %-5d  token by token %9.3f ms (%5.2f us/token)   chunked %9.3f ms (%5.2f us/token)   %.2fx\n", n,
                         best[0], 1000.0 * best[0] / n, best[1], 1000.0 * best[1] / n, best[0] / best[1]);
             for (float* p : {dq, dg, db, dz, ds, dy, dscr}) cudaFree(p);
-            cudaEventDestroy(e0);
-            cudaEventDestroy(e1);
         }
     }
 

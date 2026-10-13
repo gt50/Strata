@@ -750,10 +750,10 @@ KdaDev kda_dev(const Block& b, const Glm5NextGeometry& g) {
     d.hist = download(b.st.conv_hist, b.conv_hist.size());
     const vector<float> dst = download(b.st.kda_state, b.kda_state.size());
     d.state.resize(dst.size());
-    for (int hh = 0; hh < H; ++hh)   // the reference's [h][j][i]; the device's [i][h][j]
+    for (int hh = 0; hh < H; ++hh)   // the reference's [h][j][i]; the device's [h][i][j]
         for (int j = 0; j < Dh; ++j)
             for (int i = 0; i < Dh; ++i)
-                d.state[((size_t) hh * Dh + j) * Dh + i] = dst[((size_t) i * H + hh) * Dh + j];
+                d.state[((size_t) hh * Dh + j) * Dh + i] = dst[((size_t) hh * Dh + i) * Dh + j];
     return d;
 }
 /// The conv history within 1e-6 (it holds the raw projections) and the state within 1e-5.

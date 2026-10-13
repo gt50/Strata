@@ -68,12 +68,12 @@ int main(int argc, char** argv) {
         b.conv_hist.assign(hist.begin(), hist.end());
         b.kda_state.assign(stt.size(), 0.0);
         vector<float> dev_state(stt.size());
-        for (int hh = 0; hh < H; ++hh)   // stt is the reference's [h][j][i]; the device's is [i][h][j]
+        for (int hh = 0; hh < H; ++hh)   // stt is the reference's [h][j][i]; the device's is [h][i][j]
             for (int j = 0; j < Dh; ++j)
                 for (int i = 0; i < Dh; ++i) {
                     const float v = stt[((size_t) hh * Dh + j) * Dh + i];
                     b.kda_state[((size_t) hh * Dh + j) * Dh + i] = v;
-                    dev_state[((size_t) i * H + hh) * Dh + j] = v;
+                    dev_state[((size_t) hh * Dh + i) * Dh + j] = v;
                 }
         void* base = nullptr;
         check(cudaMalloc(&base, glm::glm_layer_state_bytes(g, 0, MAX_CTX)), "state 0");

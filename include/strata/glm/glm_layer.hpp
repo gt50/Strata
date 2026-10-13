@@ -71,7 +71,7 @@ struct GlmLayerWeights {
 /// One block's recurrent and cache state, device memory.
 struct GlmLayerState {
     float* conv_hist = nullptr;   ///< KDA: [3 d_inner][d_conv - 1]
-    float* kda_state = nullptr;   ///< KDA: [D][H][D], kda.hpp's layout
+    float* kda_state = nullptr;   ///< KDA: [H][D][D], kda.hpp's layout
     uint16_t* latent = nullptr;   ///< MLA: [max_ctx][kv_lora] FP16
     float* idx_cache = nullptr;   ///< MLA + indexer: [max_ctx][2 x 128] (key | gate)
     float* pooled = nullptr;      ///< MLA + indexer: [max_ctx / 4][128]
@@ -146,7 +146,6 @@ public:
     int32_t *grp_start = nullptr, *n_groups = nullptr, *ent_dst = nullptr, *ent_tok = nullptr;
     int32_t* grp_expert = nullptr;
     void *q8 = nullptr, *xq = nullptr, *exp_scr = nullptr;
-    float* kda_scr = nullptr;   ///< kda_scan_norm_chunked's, for more than one token
 
 private:
     int64_t max_ctx_ = 0, cap_ = 0, max_blocks_ = 0, max_tokens_ = 1;
@@ -177,7 +176,7 @@ void glm_layer_state_carve(const core::Glm5NextGeometry& g, int64_t il, int64_t 
 /// The tokens of ctx's positions (set_positions: one at decode, a chunk of a prompt) through block `il`: X
 /// [tokens][4][n_embd] (each token's four streams) updated in place, the block's state too.  A shared-indexer MLA layer
 /// takes the selections the last full-indexer layer left in ctx.  One token runs the decode kernels (kda_scan_norm,
-/// mla_decode_attn_step, the experts grouped on the device); more run the prompt ones (kda_scan_norm_chunked,
+/// mla_decode_attn_step, the experts grouped on the device); more run the prompt ones (kda_scan_norm over all of them,
 /// mla_prompt_attn, the experts grouped on the host, in rounds of what an expert provider holds).
 bool glm_layer_decode(const core::Glm5NextGeometry& g, int64_t il, const GlmLayerWeights& w, const GlmLayerState& st,
                       GlmContext& ctx, float* x, void* stream, std::string& err);

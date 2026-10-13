@@ -61,9 +61,12 @@ void kda_gate(const float* raw, const float* dt_bias, const float* ssm_a, float*
               bool has_lower_bound, float lower_bound, void* stream);
 
 /// The recurrence and the output norm for `n_tokens` consecutive tokens of one sequence, the state carried in
-/// registers from one token to the next: one block per head, state read once and written once per launch.
+/// registers from one token to the next: a block per (head, 32 value columns), 8 row groups of 16 rows, the state read
+/// once and written once per launch; then the norm.  On a Radeon 8060S, 64 heads: 44.7 us a decode token (one block a
+/// head on the (D, H, D) layout: 59 us), and 3.7-3.9 us a token over a prompt of 128 to 8192.
 ///
-///   state  (D, H, D) f32, updated in place
+///   state  (H, D, D) f32, updated in place: row i (key channel), column j (value channel) of head h at
+///          (h D + i) D + j - each head's 64 KB in one piece
 ///   qkv    [T][3 * d_inner]  q and k L2-normalised, q NOT scaled (the 1/sqrt(D) is applied to the readout)
 ///   gate   [T][d_inner]      kda_gate's output (log decay, <= 0)
 ///   beta   [T][H]            already sigmoided
@@ -97,10 +100,12 @@ size_t kda_chunked_scratch_floats(int heads, int n_tokens);
 /// largest value 3.5e-6 at 2048 tokens).  Same arguments, plus `scratch` (kda_chunked_scratch_floats(heads,
 /// n_tokens) floats, the caller's); y is written twice (o, then the norm).
 ///
-/// Which to use is the caller's choice, by measurement.  On a Radeon 8060S (gfx1151, 40 CUs; kda_parity --bench,
-/// 64 heads, the two launches alternating, two runs) this one against kda_scan_norm: 1.02-1.13x at 32 and 128
-/// tokens, 0.87-0.93x at 512, 1.08x at 2048, 1.21-1.27x at 8192 - a prep of about 2.5 us a token once a prompt
-/// outgrows the cache, and a scan of about 3.5.  Not yet run on a CUDA card.
+/// Which to use is the caller's choice, by measurement.  On a Radeon 8060S (gfx1151, 40 CUs; kda_parity --bench, 64
+/// heads, the two launches alternating, host clock): kda_scan_norm takes 0.85x this one's time at 32 tokens, 0.82x at
+/// 128, 0.55x at 512, 0.62x at 2048, 0.64x at 8192 (this one 4.6-6.7 us a token: a prep of about 2.5 once a prompt
+/// outgrows the cache, and a scan of about 3.5) - so GLM's layer runs kda_scan_norm for prompts too.  (Against the
+/// one-block-a-head kda_scan_norm before it, this one was 1.02-1.27x faster, timed by events.)  Not yet run on a CUDA
+/// card.
 void kda_scan_norm_chunked(float* state, const float* qkv, const float* gate, const float* beta, const float* z,
                            const float* o_norm, float eps, float* y, int heads, int n_tokens, float* scratch,
                            void* stream);

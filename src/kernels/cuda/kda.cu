@@ -13,8 +13,9 @@ namespace {
 
 constexpr int D = kKdaHeadDim;  // head width: state rows = cols = 128
 constexpr int DC = kKdaConvKernel;
-constexpr int RG = 4;           // row groups of the scan's block
-constexpr int RPG = D / RG;     // 32 state rows per thread
+constexpr int RG = 8;           // row groups of the scan's block
+constexpr int RPG = D / RG;     // 16 state rows per thread
+constexpr int kScanCols = 32;   // value columns a scan block takes (D / kScanCols blocks a head)
 static_assert(D == 128 && DC == 4, "the reductions below are written for 4 warps of 32 over a 128-wide head");
 
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
@@ -89,44 +90,48 @@ __global__ void kda_gate_kernel(const float* raw, const float* __restrict__ dt,
     gate[idx] = has_lb ? lb / (1.0f + expf(a * u)) : softplus_f(u) * a;
 }
 
-/// One block per head, threads (column j, row group): each thread holds 32 rows of one column of the state in
-/// registers for the whole run of tokens.  Per token, row i is decayed by exp(gate[i]) BEFORE it is contracted
-/// against k (llama.cpp decays first, then forms S^T k from the decayed state).
-__global__ void __launch_bounds__(D * RG) kda_scan_norm_kernel(float* __restrict__ state, const float* __restrict__ qkv,
-                                                               const float* __restrict__ gate,
-                                                               const float* __restrict__ beta,
-                                                               const float* __restrict__ z,
-                                                               const float* __restrict__ gamma, float eps,
-                                                               float* __restrict__ y, int heads, int n_tokens) {
+/// The scan: a block per (head, CW of its 128 value columns), threads (column j, row group); each thread holds 32 rows
+/// of its column of the state in registers for the whole run of tokens.  Per token, row i is decayed by exp(gate[i])
+/// BEFORE it is contracted against k (llama.cpp decays first, then forms S^T k from the decayed state).  A column's
+/// update reads only that column (kv_j = sum_i S[i][j] k[i], o_j likewise), so a head's columns split across blocks;
+/// only the output norm spans the head - o goes to y, and kda_out_norm_kernel finishes it.
+///
+/// On the 8060S, a decode token's 64 heads: one block a head of 4 x 32 rows, the state (D, H, D) - a head's rows 32 KB
+/// apart - 59 us (8 MB moved at ~140 GB/s); split 4 ways by column, 56 us; the same on the state (H, D, D), a head's
+/// 64 KB in one piece, 50 us; and 8 row groups of 16 rows (64K threads: more than are resident, so one wave's writes
+/// overlap the next one's reads) 44-45 us.  16 groups of 8: 44 us; 8 groups on (D, H, D): 59 us.
+template <int CW>
+__global__ void __launch_bounds__(CW * RG) kda_scan_kernel(float* __restrict__ state, const float* __restrict__ qkv,
+                                                           const float* __restrict__ gate,
+                                                           const float* __restrict__ beta, float* __restrict__ o_out,
+                                                           int heads, int n_tokens) {
     __shared__ float sk[D], sq[D], sdec[D];
-    __shared__ float red_kv[RG][D];
-    __shared__ float red_o[RG][D];
-    __shared__ float wsum[D * RG / 32];
+    __shared__ float red_kv[RG][CW];
+    __shared__ float red_o[RG][CW];
     __shared__ float sbeta;
-    const int head = blockIdx.x;
-    const int col = threadIdx.x;          // 0..127, the value column j
-    const int rg = threadIdx.y;           // 0..3
-    const int tid = rg * D + col;
+    const int head = blockIdx.x / (D / CW);
+    const int cl = threadIdx.x;           // the column within the block's
+    const int col = (blockIdx.x % (D / CW)) * CW + cl;   // 0..127, the value column j
+    const int rg = threadIdx.y;           // 0..RG - 1
+    const int tid = rg * CW + cl;
     const int d_inner = heads * D;
     const size_t row3 = (size_t) 3 * d_inner;
 
     float s[RPG];
-    float* base = state + ((size_t) (rg * RPG) * heads + head) * D + col;
-    const size_t row_stride = (size_t) heads * D;
+    float* base = state + ((size_t) head * D + rg * RPG) * D + col;   // (H, D, D): row i of head h at (h D + i) D
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * D];
 
     for (int t = 0; t < n_tokens; ++t) {
         const float* qt = qkv + (size_t) t * row3 + (size_t) head * D;
         const size_t ht = (size_t) t * d_inner + (size_t) head * D;
         __syncthreads();                  // the previous token is done with the shared arrays
-        if (tid < D) {
-            sq[tid] = qt[tid];
-            sk[tid] = qt[d_inner + tid];
-            sdec[tid] = expf(gate[ht + tid]);
-        } else if (tid == D) {
-            sbeta = beta[(size_t) t * heads + head];
+        for (int i = tid; i < D; i += CW * RG) {
+            sq[i] = qt[i];
+            sk[i] = qt[d_inner + i];
+            sdec[i] = expf(gate[ht + i]);
         }
+        if (tid == 0) sbeta = beta[(size_t) t * heads + head];
         __syncthreads();
         float kv = 0.0f;
 #pragma unroll
@@ -134,9 +139,11 @@ __global__ void __launch_bounds__(D * RG) kda_scan_norm_kernel(float* __restrict
             s[r] *= sdec[rg * RPG + r];
             kv = fmaf(s[r], sk[rg * RPG + r], kv);
         }
-        red_kv[rg][col] = kv;
+        red_kv[rg][cl] = kv;
         __syncthreads();
-        const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
+        float kv_col = red_kv[0][cl];
+#pragma unroll
+        for (int g2 = 1; g2 < RG; ++g2) kv_col += red_kv[g2][cl];
         const float delta = (qt[2 * d_inner + col] - kv_col) * sbeta;
         float o = 0.0f;
 #pragma unroll
@@ -144,25 +151,17 @@ __global__ void __launch_bounds__(D * RG) kda_scan_norm_kernel(float* __restrict
             s[r] = fmaf(sk[rg * RPG + r], delta, s[r]);
             o = fmaf(s[r], sq[rg * RPG + r], o);
         }
-        red_o[rg][col] = o;
-        __syncthreads();
-        float oc = 0.0f, sq_part = 0.0f;
-        if (rg == 0) {
-            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) D);
-            sq_part = oc * oc;
-        }
-        // RMS over the head's 128 outputs: the warps of row group 0 are threads 0..127.
-        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
-        if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
+        red_o[rg][cl] = o;
         __syncthreads();
         if (rg == 0) {
-            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-            const float scale = rsqrtf(ss / (float) D + eps);
-            y[ht + col] = oc * scale * gamma[col] * sigmoid_f(z[ht + col]);
+            float oo = red_o[0][cl];
+#pragma unroll
+            for (int g2 = 1; g2 < RG; ++g2) oo += red_o[g2][cl];
+            o_out[ht + col] = oo * rsqrtf((float) D);
         }
     }
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+    for (int r = 0; r < RPG; ++r) base[r * D] = s[r];
 }
 
 // ---------------------------------------------------------------- the chunked scan (kda_scan_norm_chunked)
@@ -320,7 +319,7 @@ __global__ void __launch_bounds__(256) kda_chunk_prep_kernel(const float* __rest
 __global__ void __launch_bounds__(2 * D) KDA_SCAN_OCCUPANCY
 kda_chunk_scan_kernel(float* __restrict__ state, const float* __restrict__ qkv, const float* __restrict__ beta,
                       const float* __restrict__ tm, const float* __restrict__ pm, const float* __restrict__ gm,
-                      float* __restrict__ o_out, int heads, int64_t t0, int nch, int64_t T) {
+                      float* __restrict__ o_out, int heads, int64_t t0, int nch, int64_t T, int stride_rows) {
     constexpr int HD = D / 2;                     // state rows a lane holds
     constexpr int RPL = GCH / 2;                  // rows of D and of P D a lane computes
     __shared__ __align__(16) float sa[GCH * D];
@@ -330,10 +329,14 @@ kda_chunk_scan_kernel(float* __restrict__ state, const float* __restrict__ qkv, 
     const int jc = tid & (D - 1), rset = tid >> 7;   // the triangular products' lane: column, rows rset + 2m
     const int d_inner = heads * D;
     const size_t row3 = (size_t) 3 * d_inner;
-    const size_t rs = (size_t) heads * D;   // the state's row stride
+    // the state's row stride, D in (H, D, D), as stride_rows (1) x D: a runtime multiple of D - with the constant D,
+    // or a stride argument of D, the scan took 192 VGPRs and spilled 114; with this, 182 and none (as with the old
+    // layout's heads x D)
+    const size_t rs = (size_t) stride_rows * D;
+    const size_t hb = (size_t) h * D * D + j;   // the lane's column of its head
     float s[HD];
 #pragma unroll
-    for (int i = 0; i < HD; ++i) s[i] = state[(size_t) (i0 + i) * rs + (size_t) h * D + j];
+    for (int i = 0; i < HD; ++i) s[i] = state[(size_t) (i0 + i) * rs + hb];
     const float out_scale = rsqrtf((float) D);
     // this lane's dot of its half column with staged row t
     auto dot_half = [&](const float* buf, int t) {
@@ -454,12 +457,11 @@ kda_chunk_scan_kernel(float* __restrict__ state, const float* __restrict__ qkv, 
     // the loads' 64 addresses (128 registers) live through the whole scan, and spilled
     const size_t rs2 = (size_t) __shfl_sync(0xffffffffu, (int) rs, 0);
 #pragma unroll
-    for (int i = 0; i < HD; ++i) state[(size_t) (i0 + i) * rs2 + (size_t) h * D + j] = s[i];
+    for (int i = 0; i < HD; ++i) state[(size_t) (i0 + i) * rs2 + hb] = s[i];
 }
 
-/// y = rms_norm(o) * o_norm * sigmoid(z) in place, a block per (token, head): the scan's lanes each hold half a
-/// column, so the norm, which couples the head's columns, runs after it.  The same sums in the same
-/// order as kda_scan_norm_kernel's norm.
+/// y = rms_norm(o) * o_norm * sigmoid(z) in place, a block per (token, head): both scans' lanes hold parts of a
+/// column, so the norm, which couples the head's columns, runs after them.
 __global__ void __launch_bounds__(D) kda_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                          float eps, float* __restrict__ y) {
     __shared__ float wsum[D / 32];
@@ -515,13 +517,17 @@ void kda_gate(const float* raw, const float* dt_bias, const float* ssm_a, float*
 
 void kda_scan_norm(float* state, const float* qkv, const float* gate, const float* beta, const float* z,
                    const float* o_norm, float eps, float* y, int heads, int n_tokens, void* stream) {
-    if (!state || !qkv || !gate || !beta || !z || !o_norm || !y || heads <= 0 || n_tokens <= 0) {
+    if (!state || !qkv || !gate || !beta || !z || !o_norm || !y || heads <= 0 || n_tokens <= 0 ||
+        (int64_t) n_tokens * heads > 0x7fffffff) {
         std::fprintf(stderr, "kda_scan_norm: invalid arguments\n");
         std::exit(1);
     }
-    kda_scan_norm_kernel<<<(unsigned) heads, dim3(D, RG), 0, (cudaStream_t) stream>>>(state, qkv, gate, beta, z, o_norm,
-                                                                                    eps, y, heads, n_tokens);
-    check_launch("kda_scan_norm");
+    const cudaStream_t s = (cudaStream_t) stream;
+    kda_scan_kernel<kScanCols><<<(unsigned) (heads * (D / kScanCols)), dim3(kScanCols, RG), 0, s>>>(state, qkv, gate, beta,
+                                                                                                   y, heads, n_tokens);
+    check_launch("kda_scan_norm (scan)");
+    kda_out_norm_kernel<<<(unsigned) ((int64_t) n_tokens * heads), D, 0, s>>>(z, o_norm, eps, y);
+    check_launch("kda_scan_norm (norm)");
 }
 
 size_t kda_chunked_scratch_floats(int heads, int n_tokens) {
@@ -548,7 +554,7 @@ void kda_scan_norm_chunked(float* state, const float* qkv, const float* gate, co
                                                                                     t0, n_tokens);
         check_launch("kda_scan_norm_chunked (prep)");
         kda_chunk_scan_kernel<<<(unsigned) heads, 2 * D, 0, s>>>(state, qkv, beta, tm, pm, gm, y, heads, t0, nch,
-                                                                n_tokens);
+                                                                n_tokens, 1);
         check_launch("kda_scan_norm_chunked (scan)");
     }
     kda_out_norm_kernel<<<(unsigned) ((int64_t) n_tokens * heads), D, 0, s>>>(z, o_norm, eps, y);
