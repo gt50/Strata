@@ -52,6 +52,9 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        # the model family the template is written for: "glm" (GLM-5.3-Flash: `[gMASK]<sop>`, <|user|> turns,
+        # <arg_key> calls) or "qwen" (ChatML) - the parser, the end tokens and forced calls follow it
+        self.dialect = "glm" if self.source.lstrip().startswith("[gMASK]") else "qwen"
         self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
@@ -62,12 +65,23 @@ class ChatTemplate:
                     if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                       and not _text_of(m.get("content")).strip()
                                                       and not _has_image(m.get("content")) and not m.get("tool_calls"))]
-        return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+        off = False
+        if self.dialect == "glm":     # the levels effort_kwargs gives (Qwen's names) -> GLM's: low, high, max
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            if level in GLM_EFFORT:
+                kwargs["reasoning_effort"] = GLM_EFFORT[level]
+        text = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
+        if off and add_generation_prompt and text.endswith("<think>"):
+            text += "</think>"        # GLM's template has no off switch: an empty thinking block, as its history writes
+        return text
 
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
         These are rendering hints, not a guarantee that the model will follow a request."""
+        if self.dialect == "glm":
+            return self._detect_caps_glm()
         def render(messages, tools=None):
             try:
                 return self.render(messages, tools=tools)
@@ -112,6 +126,47 @@ class ChatTemplate:
                 "supports_parallel_tool_calls": calls_supported(2),
                 "supports_preserve_reasoning": "strata_caps_reasoning" in render(history)}
 
+    def _detect_caps_glm(self) -> dict[str, bool]:
+        """_detect_caps for GLM's call format: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...`."""
+        tool = {"type": "function", "function": {"name": "strata_caps_call_0", "description": "strata_caps_description",
+                                                 "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}}
+        user = {"role": "user", "content": "strata_caps_user"}
+
+        def render(messages, tools=None):
+            try:
+                return self.render(messages, tools=tools, add_generation_prompt=True)
+            except Exception:
+                return ""
+
+        tool_prompt = render([user], [tool])
+
+        def calls_supported(count):
+            calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}}
+                     for i in range(count)]
+            tools = [{**tool, "function": {**tool["function"], "name": c["name"]}} for c in calls]
+            messages = [user, {"role": "assistant", "content": "",
+                               "tool_calls": [{"function": call} for call in calls]}]
+            replies = [f"strata_caps_result_{i}" for i in range(count)]
+            messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
+            prompt = render(messages, tools)
+            bodies = re.findall(r"<tool_call>(strata_caps_call_\d+<arg_key>.*?)</tool_call>", prompt, re.S)
+            try:
+                parsed = [parse_glm_call(body) for body in bodies]
+            except ValueError:
+                return False
+            return [{"name": c.name, "arguments": c.arguments} for c in parsed] == calls \
+                and all(reply in prompt for reply in replies)
+
+        history = [user, {"role": "assistant", "content": "strata_caps_answer",
+                          "reasoning_content": "strata_caps_reasoning"}, user]
+        return {"supports_tools": all(s in tool_prompt for s in
+                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<arg_key>")),
+                "supports_tool_calls": calls_supported(1),
+                "supports_system_role": "strata_caps_system" in render(
+                    [{"role": "system", "content": "strata_caps_system"}, user]),
+                "supports_parallel_tool_calls": calls_supported(2),
+                "supports_preserve_reasoning": "strata_caps_reasoning" in render(history)}
+
 
 # ------------------------------------------------------------------------------------------------ requests
 # The content-part types the readers take as text (a part with no type that has a "text" field reads as text too)
@@ -133,6 +188,11 @@ IMAGE_PARTS = ("image_url", "input_image", "image")
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
+
+
+# GLM-5.3-Flash's template knows low, high and max (its default) and has no thinking-off; ChatTemplate.render maps the
+# levels effort_kwargs and budget_effort give onto them (and turns thinking off with an empty thinking block)
+GLM_EFFORT = {"low": "low", "medium": "high", "high": "max", "xhigh": "max"}
 
 
 def effort_kwargs(value) -> dict:
@@ -247,17 +307,21 @@ VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", 
 # message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
 TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07"}
 LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS}
+# GLM-5.3-Flash's call tags are type-4 tokens too (matched everywhere): in a message's text they stay text, as
+# </tool_call> does; an assistant message keeps them (a client replaying the model's raw call)
+GLM_TOOL_TAGS = {"<arg_key>": "\U000F0F01", "</arg_key>": "\U000F0F02", "<arg_value>": "\U000F0F03",
+                 "</arg_value>": "\U000F0F04"}
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 
 
-def literal_tags(controls) -> dict[str, str]:
+def literal_tags(controls, extra: dict[str, str] | None = None) -> dict[str, str]:
     """LITERAL_TAGS plus a mark for each control token's text (`controls`: the tokenizer's CONTROL literals,
     <|im_start|>, <|im_end|>, <|endoftext|>, ...).  The rendered prompt is encoded with those literals parsed, so one
     written inside a message - a file an agent reads, a pasted chat template - opened or ended a turn there.  Longest
     first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
-    tags = {**LITERAL_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(c for c in controls
-                                                                                if c not in LITERAL_TAGS)}}
+    tags = {**LITERAL_TAGS, **(extra or {}), **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(
+        c for c in controls if c not in LITERAL_TAGS and c not in (extra or {}))}}
     return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
 
 
@@ -296,7 +360,8 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
     if not _has_tag(messages, tags) and not _has_tag(tools, tags):
         return messages, tools, False
     out = []
-    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
+    own = {t: v for t, v in tags.items()                                    # what an assistant message keeps as written
+           if t not in TOOL_LITERAL_TAGS and t not in GLM_TOOL_TAGS}
     for m in messages:
         m = dict(m)
         content = m.get("content")
@@ -669,7 +734,7 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+def forced_call(tool_choice, tools: list[dict] | None, dialect: str = "qwen") -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
     "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
@@ -682,9 +747,9 @@ def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
         kind, name = "named", next(iter(names))
     if kind == "required" and names:
-        return CALL_START + "\n<function="
-    if kind == "named" and name in names:
-        return CALL_START + f"\n<function={name}>\n"
+        return CALL_START if dialect == "glm" else CALL_START + "\n<function="
+    if kind == "named" and name in names:   # GLM: `<tool_call>NAME`, its first <arg_key> (or </tool_call>) the model's
+        return CALL_START + name if dialect == "glm" else CALL_START + f"\n<function={name}>\n"
     print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
           "request): the model decides, as with \"auto\"", flush=True)
     return None
@@ -1347,3 +1412,111 @@ class OutputParser:
         self._reset_scan()
         self.state, self.lead = "content", True
         return [Event("tool_call", call=call)]
+
+
+# ------------------------------------------------------------------------------------------------ GLM-5.3-Flash
+# GLM writes a call as `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` - string values as
+# they are, the others as JSON (its template's tojson), as the form OutputParser reads does.  So its output is
+# rewritten, as it streams, into that form (`<tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n...
+# </function>\n</tool_call>`) and parsed by OutputParser: the same events, the same streaming of a call's arguments,
+# the same schema-typed values and recovery.
+GLM_CALL_TAGS = ("<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>")
+
+
+class GlmCallRewriter:
+    """GLM's call text -> OutputParser's, incrementally: push(delta) returns what can be passed on, holding back a tag
+    split across deltas (and a call's name and a key until they are whole); flush() returns the rest."""
+
+    def __init__(self):
+        self.state = "text"       # text | name | key | value_open | value | arg_close
+        self.held = ""            # input not yet rewritten
+        self.name = ""            # the call's name, or an argument's key, being read
+
+    def _watch(self) -> tuple[str, ...]:
+        return {"text": ("<tool_call>",), "name": ("<arg_key>", "</tool_call>"), "key": ("</arg_key>",),
+                "value_open": ("<arg_value>",), "value": ("</arg_value>",),
+                "arg_close": ("<arg_key>", "</tool_call>")}[self.state]
+
+    def push(self, delta: str) -> str:
+        self.held += delta
+        out = []
+        while True:
+            watch = self._watch()
+            hits = [(self.held.find(t), t) for t in watch if t in self.held]
+            if not hits:                                   # pass on what cannot be the start of a watched tag
+                keep = max((k for t in watch for k in range(1, len(t)) if self.held.endswith(t[:k])), default=0)
+                body, self.held = self.held[:len(self.held) - keep], self.held[len(self.held) - keep:]
+                out.append(self._text(body))
+                break
+            at, tag = min(hits)
+            out.append(self._text(self.held[:at]))
+            self.held = self.held[at + len(tag):]
+            out.append(self._tag(tag))
+        return "".join(out)
+
+    def _text(self, text: str) -> str:
+        """Text between tags: passed on (outside a call, a value), kept (a name, a key), or dropped (between args)."""
+        if self.state in ("text", "value"):
+            return text
+        if self.state in ("name", "key"):
+            self.name += text
+            return ""
+        if self.state == "value_open" and text.strip():    # a key with no <arg_value>: its value is this text
+            self.state = "value"
+            return text
+        return ""
+
+    def _tag(self, tag: str) -> str:
+        if self.state == "text":                           # <tool_call>
+            self.state, self.name = "name", ""
+            return "<tool_call>\n<function="
+        if self.state in ("name", "arg_close"):
+            head = self.name.strip() + ">\n" if self.state == "name" else ""
+            if tag == "</tool_call>":
+                self.state = "text"
+                return head + "</function>\n</tool_call>"
+            self.state, self.name = "key", ""               # <arg_key>
+            return head
+        if self.state == "key":                            # </arg_key>
+            self.state = "value_open"
+            return "<parameter=" + self.name.strip() + ">\n"
+        if self.state == "value_open":                     # <arg_value>
+            self.state = "value"
+            return ""
+        self.state = "arg_close"                           # </arg_value>
+        return "\n</parameter>\n"
+
+    def flush(self) -> str:
+        out, self.held = self._text(self.held), ""
+        return out
+
+
+def parse_glm_call(body: str, schema: dict | None = None) -> ToolCall:
+    """One GLM call's body (`NAME<arg_key>...` between <tool_call> and </tool_call>) -> ToolCall."""
+    rw = GlmCallRewriter()
+    text = rw.push("<tool_call>" + body + "</tool_call>") + rw.flush()
+    inner = text[len("<tool_call>\n"):]
+    end = inner.rfind("</tool_call>")
+    return parse_tool_call(inner[:end] if end >= 0 else inner, schema)
+
+
+class GlmOutputParser:
+    """OutputParser for GLM-5.3-Flash's output: its calls rewritten (GlmCallRewriter) before OutputParser reads them.
+    Everything else is OutputParser's; `buf` counts the rewriter's held text too (what is not passed on yet)."""
+
+    def __init__(self, *args, **kwargs):
+        self.inner = OutputParser(*args, **kwargs)
+        self.rw = GlmCallRewriter()
+
+    def feed(self, delta: str) -> list[Event]:
+        return self.inner.feed(self.rw.push(delta))
+
+    def finish(self, reason: str | None = None) -> list[Event]:
+        return self.inner.feed(self.rw.flush()) + self.inner.finish(reason)
+
+    @property
+    def buf(self) -> str:
+        return self.inner.buf + self.rw.held
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)

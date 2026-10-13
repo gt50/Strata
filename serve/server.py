@@ -54,9 +54,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
-                            tool_choice_of, unmark_think_literals)
+from serve.frontend import (GLM_TOOL_TAGS, THINK_END, ChatTemplate, Event, GlmOutputParser,  # noqa: E402
+                            OutputParser, anthropic_to_messages, forced_call, images_of, literal_tags,
+                            mark_think_literals, openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -66,6 +66,7 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
 IM_END = "<|im_end|>"
+GLM_END_TOKENS = ("<|endoftext|>", "<|user|>", "<|observation|>")   # GLM-5.3-Flash's eos, eot and eom
 IMAGE_PAD = "<|image_pad|>"
 
 
@@ -2862,7 +2863,10 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
+        # the model family the template is written for (ChatTemplate.dialect): "qwen" or "glm" (GLM-5.3-Flash)
+        self.dialect = getattr(template, "dialect", "qwen")
+        self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()),   # texts that stay text inside a message
+                                     GLM_TOOL_TAGS if self.dialect == "glm" else None)
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
@@ -2931,8 +2935,15 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        if self.dialect == "glm":   # a reply ends at <|user|> (the next turn), <|observation|> (a tool's) or the end
+            self.stop_ids = set()
+            for end in GLM_END_TOKENS:
+                ids = tokenizer.encode(end, parse_special=True)
+                if len(ids) == 1:   # a vocabulary without it splits it into ordinary pieces: those are no end
+                    self.stop_ids.update(ids)
+        else:
+            self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
+                                tokenizer.encode("<|endoftext|>", parse_special=True))
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -3827,7 +3838,8 @@ class Service:
                 print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        parser = (GlmOutputParser if self.dialect == "glm" else OutputParser)(
+            thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -4003,7 +4015,8 @@ class Service:
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
-                                if (self.reasoning_loop_recovery and not recovery_count and parser.state == "reasoning"
+                                if (self.reasoning_loop_recovery and self.dialect == "qwen" and not recovery_count
+                                        and parser.state == "reasoning"
                                         and n >= next_loop_check and not parser.buf and not parser.pending
                                         and not detok.pending()):
                                     next_loop_check = n + LOOP_CHECK_EVERY
@@ -5498,7 +5511,7 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+            force = forced_call(req.get("tool_choice"), tools, svc.dialect)   # a bad value is a 400 before anything
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -5741,7 +5754,7 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+            force = forced_call(req.get("tool_choice"), tools, svc.dialect)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -6370,7 +6383,10 @@ def main() -> int:
             tokens[i] = t
         merges = (tpath / "merges.txt").read_text(encoding="utf-8").split("\n")
         types = json.loads((tpath / "token_type.json").read_text())
-        tok = ST.Tokenizer(tokens, merges, types)
+        # the pre-tokenizer the model was trained with (tokenizer.json's "pre": qwen35, glm4); older packs have none
+        meta = json.loads((tpath / "tokenizer.json").read_text(encoding="utf-8")) \
+            if (tpath / "tokenizer.json").exists() else {}
+        tok = ST.Tokenizer(tokens, merges, types, pre=meta.get("pre", "qwen35"))
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
@@ -6526,7 +6542,8 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
+    # #458: "effort_position": "end" with an engine that has it (its system turn is ChatML: Qwen's templates only)
+    svc.effort_end = bool(effort_end) and svc.dialect == "qwen"
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]

@@ -63,6 +63,34 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# GLM-5.3-Flash's `glm4` pre-tokenizer: `.ref/llama.cpp/src/llama-vocab.cpp`, `case LLAMA_VOCAB_PRE_TYPE_CHATGLM4`
+# (L396 at llama.cpp 9b4dae81f).  Letters are `\p{L}+` (no `\p{M}`: a combining mark goes with the punctuation run, as
+# the model was trained), digits come in runs of up to three (`\p{N}{1,3}`).  The same expression as llama.cpp's
+# LLAMA3 case (`llama-bpe`), which is how it is checked: tools/test_strata_tokenizer_glm4.py runs it over llama.cpp's
+# own llama-bpe vocabulary and test strings (models/ggml-vocab-llama-bpe.gguf.inp / .out, the ids HF's tokenizer gave).
+GLM4_PATTERN = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
+# tokenizer.ggml.pre -> (pattern, where it was transcribed from).  A `pre` not listed is refused: another family's
+# split would round-trip perfectly and give the model ids it was never trained on.
+PRE_PATTERNS = {
+    "qwen35": (QWEN35_PATTERN, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
+    "glm4": (GLM4_PATTERN, "llama.cpp 9b4dae81f src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
+    "llama-bpe": (GLM4_PATTERN, "llama.cpp 9b4dae81f src/llama-vocab.cpp L289 (LLAMA_VOCAB_PRE_TYPE_LLAMA3): "
+                                "the glm4 expression, here for its check"),
+}
+# The pre types whose piece, when it is a vocabulary token as a whole, is that token without BPE (llama.cpp's
+# `ignore_merges`, set per type in llama_vocab::impl::load: LLAMA3 has it, CHATGLM4 and QWEN35 do not).  It decides
+# words BPE's merges would not reach: Llama 3's " Việt" is one token with it and three without.
+IGNORE_MERGES = {"llama-bpe"}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -86,7 +114,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        if pre not in PRE_PATTERNS:
+            raise ValueError("pre-tokenizer %r is not one this tokenizer has (%s)" % (pre, ", ".join(PRE_PATTERNS)))
+        self._re = regex.compile(PRE_PATTERNS[pre][0])
+        self.ignore_merges = pre in IGNORE_MERGES
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -224,7 +255,8 @@ class Tokenizer:
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
                 got = []
-                for tok in self._bpe(mapped):
+                whole = self.ignore_merges and mapped in self.ids
+                for tok in [mapped] if whole else self._bpe(mapped):
                     i = self.ids.get(tok)
                     if i is None:
                         raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
@@ -318,8 +350,8 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": PRE_PATTERNS[tk.pre][0],
+        "pre_pattern_source": PRE_PATTERNS[tk.pre][1],
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
