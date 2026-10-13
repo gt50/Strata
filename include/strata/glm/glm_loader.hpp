@@ -53,6 +53,7 @@ struct GlmLoadOptions {
 struct GlmPlan {
     uint64_t device_bytes = 0;    ///< everything but the experts, as loaded (F32 vectors, BF16 k_b / v_b)
     uint64_t expert_bytes = 0;    ///< the expert blobs
+    uint64_t expert_slot_bytes = 0;   ///< the largest blob (256-aligned): an expert cache slot's size
     uint64_t file_bytes = 0;      ///< the payloads read
     bool mtp = false;             ///< the MTP block will be loaded
     int tensors = 0;

@@ -12,6 +12,10 @@
 //      down - in every expert layout the card runs (the default, v1's separate SwiGLU pass, modes 0, 7 and 8).  The
 //      block scales put the gate and up values around +-10, so the clamp matters: limit 10 is shown to differ from
 //      none, and limit 0 is bitwise native_expert_grouped.
+//   4. the other expert types of Unsloth's UD-IQ4_XS file: IQ3_S / IQ4_XS (most layers), IQ4_XS / Q6_K (layer 11),
+//      IQ3_S / Q6_K (12, 44) and Q3_K / Q4_K (the MTP block), against glm_linear's GEMVs (native_mmvq: other code)
+//      for gate, up and down with the clamped SwiGLU on the host between them.
+#include "strata/kernels/glm_linear.hpp"
 #include "strata/kernels/glm_moe.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -130,9 +134,25 @@ std::vector<uint8_t> iq4xs_rows(int64_t rows, int64_t n, int e_lo, int e_hi, std
     return w;
 }
 
+// Rows of a GGUF block type: random bytes, then each block's fp16 scales (at `halves`, bytes into the block) set to
+// +-2^(e - 15) with e in [e_lo, e_hi] - random bytes there would give infinities and NaNs.
+struct BlockType { int type; size_t bytes; std::vector<size_t> halves; int e_lo, e_hi; const char* name; };
+std::vector<uint8_t> gguf_rows(const BlockType& bt, int64_t rows, int64_t n, std::mt19937& rng) {
+    std::vector<uint8_t> w((size_t) rows * (size_t) (n / 256) * bt.bytes);
+    std::uniform_int_distribution<int> byte(0, 255), ex(bt.e_lo, bt.e_hi), man(0, 1023), sgn(0, 1);
+    for (auto& b : w) b = (uint8_t) byte(rng);
+    for (size_t o = 0; o < w.size(); o += bt.bytes)
+        for (const size_t at : bt.halves) {
+            const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
+            std::memcpy(&w[o + at], &h, 2);
+        }
+    return w;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // the lines before a crash are kept
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
@@ -346,6 +366,112 @@ int main(int argc, char** argv) {
         }
         cudaFree(d_blobs); cudaFree(d_x); cudaFree(d_xq); cudaFree(d_ptr); cudaFree(d_start); cudaFree(d_dst);
         cudaFree(d_tok); cudaFree(d_ng); cudaFree(d_scr); cudaFree(d_out);
+    }
+
+    // ================= 4. the file's other expert types =================
+    {
+        constexpr int64_t H = 4096, FF = 2048;
+        constexpr int G = 4, TT = 8;
+        cudaStream_t st = nullptr;   // native_mmvq, under glm_linear, takes no default stream
+        check(cudaStreamCreate(&st), "stream");
+        // the scales chosen so a gate / up value is of the order of 10 over 4096 unit inputs, as in 3
+        const BlockType iq3s{21, 110, {0}, 6, 7, "IQ3_S"}, iq4xs{23, 136, {0}, 2, 3, "IQ4_XS"},
+            q6k{14, 210, {208}, 3, 4, "Q6_K"}, q4k{12, 144, {0, 2}, 5, 6, "Q4_K"}, q3k{11, 110, {108}, 7, 8, "Q3_K"};
+        struct Pair { BlockType gu, d; };
+        for (const Pair& pr : {Pair{iq3s, iq4xs}, Pair{iq4xs, q6k}, Pair{iq3s, q6k}, Pair{q3k, q4k}}) {
+            std::printf("\nnative_expert_grouped_clamped, %s gate / up, %s down, %lld x %lld, %d experts, %d tokens:\n",
+                        pr.gu.name, pr.d.name, (long long) H, (long long) FF, G, TT);
+            const bool ok = k::native_expert_supported(pr.gu.type, pr.d.type, H, FF);
+            expect(ok, "the grouped kernels take this shape and these types");
+            if (!ok) continue;
+            const k::NativeExpertLayout L = k::native_expert_layout(pr.gu.type, pr.d.type, H, FF);
+            const size_t slot = (L.bytes + 255) & ~(size_t) 255;
+            uint8_t* d_blobs = nullptr;
+            check(cudaMalloc(&d_blobs, slot * G), "blobs");
+            for (int b = 0; b < G; ++b) {
+                std::vector<uint8_t> blob = gguf_rows(pr.gu, 2 * FF, H, rng);
+                const auto down = gguf_rows(pr.d, H, FF, rng);
+                blob.insert(blob.end(), down.begin(), down.end());
+                if (blob.size() != L.bytes) {
+                    std::fprintf(stderr, "blob size %zu, layout %zu\n", blob.size(), L.bytes);
+                    return 2;
+                }
+                check(cudaMemcpy(d_blobs + slot * b, blob.data(), L.bytes, cudaMemcpyHostToDevice), "blob");
+            }
+            std::vector<float> x((size_t) TT * H);
+            for (auto& v : x) v = gauss(rng);
+            float* d_x = upload(x);
+            uint8_t* d_xq = nullptr;
+            check(cudaMalloc(&d_xq, (size_t) TT * (H / 32) * 36), "xq");
+            k::quantize_q8_1_rows(d_x, TT, H, d_xq, nullptr);
+            std::vector<int32_t> start, dst, tok;   // token t to experts t % G and (t + 1) % G
+            std::vector<unsigned long long> ptr;
+            int e = 0;
+            for (int b = 0; b < G; ++b) {
+                start.push_back(e);
+                ptr.push_back((unsigned long long) (uintptr_t) (d_blobs + slot * b));
+                for (int t = 0; t < TT; ++t)
+                    if (t % G == b || (t + 1) % G == b) { dst.push_back(e); tok.push_back(t); ++e; }
+            }
+            start.push_back(e);
+            const int NENT = e;
+            unsigned long long* d_ptr = upload(ptr);
+            int32_t *d_start = upload(start), *d_dst = upload(dst), *d_tok = upload(tok),
+                    *d_ng = upload(std::vector<int32_t>{G});
+            void* d_scr = nullptr;
+            check(cudaMalloc(&d_scr, k::native_expert_scratch_bytes(NENT, FF)), "scratch");
+            float* d_out = nullptr;
+            check(cudaMalloc(&d_out, (size_t) NENT * H * 4), "out");
+            // the reference: glm_linear's GEMVs a role at a time on the same x
+            std::vector<float> want((size_t) NENT * H);
+            int clamped = 0, values = 0;
+            {
+                float *d_g = nullptr, *d_u = nullptr, *d_h = nullptr, *d_y = nullptr;
+                void* d_lq = nullptr;
+                check(cudaMalloc(&d_g, FF * 4), "g");
+                check(cudaMalloc(&d_u, FF * 4), "u");
+                check(cudaMalloc(&d_h, FF * 4), "h");
+                check(cudaMalloc(&d_y, H * 4), "y");
+                check(cudaMalloc(&d_lq, k::glm_linear_scratch_bytes(H, 1)), "lq");
+                for (int b = 0; b < G; ++b)
+                    for (int en = start[(size_t) b]; en < start[(size_t) b + 1]; ++en) {
+                        const uint8_t* blob = d_blobs + slot * b;
+                        const float* xt = d_x + (size_t) tok[(size_t) en] * H;
+                        k::glm_linear({pr.gu.type, blob, H, FF}, xt, d_g, 1, d_lq, st);
+                        k::glm_linear({pr.gu.type, blob + L.up_off, H, FF}, xt, d_u, 1, d_lq, st);
+                        check(cudaDeviceSynchronize(), "ref gu");
+                        const std::vector<float> g = download(d_g, FF), u = download(d_u, FF);
+                        std::vector<float> h(FF);
+                        for (int i = 0; i < FF; ++i) {
+                            clamped += g[(size_t) i] > kLim || std::fabs(u[(size_t) i]) > kLim;
+                            values += 2;
+                            const float gg = std::min(g[(size_t) i], kLim), uu = std::clamp(u[(size_t) i], -kLim, kLim);
+                            h[(size_t) i] = gg / (1.0f + std::exp(-gg)) * uu;
+                        }
+                        check(cudaMemcpy(d_h, h.data(), FF * 4, cudaMemcpyHostToDevice), "h");
+                        k::glm_linear({pr.d.type, blob + L.down_off, FF, H}, d_h, d_y, 1, d_lq, st);
+                        check(cudaDeviceSynchronize(), "ref down");
+                        const std::vector<float> y = download(d_y, H);
+                        std::copy(y.begin(), y.end(), want.begin() + (size_t) en * H);
+                    }
+                cudaFree(d_g); cudaFree(d_u); cudaFree(d_h); cudaFree(d_y); cudaFree(d_lq);
+            }
+            char buf[64];
+            std::snprintf(buf, sizeof buf, " (%.1f%% of gate / up values past it)", 100.0 * clamped / values);
+            std::printf("  %-64s%s\n", "limit 10", buf);
+            for (const int mode : {-1, 0}) {
+                k::native_expert_set_mode(mode, 0);
+                k::native_expert_grouped_clamped(L, d_ptr, d_start, d_ng, d_dst, d_tok, G, NENT, d_xq, d_scr, d_out,
+                                                 kLim, nullptr);
+                check(cudaDeviceSynchronize(), "grouped");
+                expect_close(mode < 0 ? "the default layout, limit 10" : "mode 0, limit 10", want,
+                             download(d_out, (size_t) NENT * H), 2e-3);
+            }
+            k::native_expert_set_mode(-1, 0);
+            cudaFree(d_blobs); cudaFree(d_x); cudaFree(d_xq); cudaFree(d_ptr); cudaFree(d_start); cudaFree(d_dst);
+            cudaFree(d_tok); cudaFree(d_ng); cudaFree(d_scr); cudaFree(d_out);
+        }
+        cudaStreamDestroy(st);
     }
 
     std::printf("\nglm_moe: %d failures\n", g_bad);

@@ -319,7 +319,7 @@ FAMILIES = {
     # EXPERIMENTAL: another model on its own engine path (install_glm): none of the questions below apply, and its
     # sizes are its own ("models"), not MODELS' (its UD-IQ4_XS is not the Qwen one)
     "glm": {"title": "GLM-5.3-Flash", "by": "Z.ai; Unsloth's ~4-bit quantization",
-            "about": "another model (288 experts, 1M-token context), a 157 GB download; not run whole on Strata yet",
+            "about": "another model (288 experts, 1M-token context), a 157 GB download; very slow so far",
             "hf": hf("unsloth/GLM-5.3-Flash-GGUF") + "{q}/", "file": "GLM-5.3-Flash-{q}-0000{i}-of-00005.gguf",
             "shards": 5, "tag": "glm-", "name": "glm-5.3-flash", "experimental": True,
             "license": "MIT (the GGUF's general.license): https://huggingface.co/zai-org/GLM-5.3-Flash",
@@ -4932,9 +4932,9 @@ def install_glm(a, gpu, hip, amd, ram, multi, roots, port, cuda_tk, elsewhere) -
     models' memory modes: the engine keeps the experts the GPU has room for and reads the others from the mapped model
     files.  What setup does: one size, the context, the download (pinned, SHA-256 checked), the tokenizer, the config."""
     fam = FAMILIES["glm"]
-    warn("GLM-5.3-Flash is EXPERIMENTAL in Strata: its engine path matches reference code on small synthetic models of "
-         "its shapes (on an AMD Radeon 8060S), but the real model has not been run whole on Strata yet - please report "
-         "how it runs")
+    warn("GLM-5.3-Flash is EXPERIMENTAL in Strata: it answers correctly, but on the one PC it has run on (a Radeon 8060S "
+         "with 64 GB of RAM) under 1 token per second, because most of its experts are copied from the model files as it "
+         "answers (docs/GLM.md) - please report how it runs")
     say()
     sizes = fam["models"]
     names = list(sizes)

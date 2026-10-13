@@ -1,12 +1,12 @@
 # GLM-5.3-Flash (experimental)
 
-**Experimental: the engine path is written and checked piece by piece, but the real model has not been run whole on
-Strata yet.** Strata's GLM-5.3-Flash support runs [Z.ai's GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
+**Experimental: the real model runs and answers correctly on one PC, but very slowly (under 1 token per second) while
+most of its experts come from the SSD.** Strata's GLM-5.3-Flash support runs [Z.ai's GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)
 from [Unsloth's UD-IQ4_XS GGUF](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) on its own engine path (`src/glm`):
 another architecture than Qwen3.8-Flash-Next, with none of the Qwen engine's packs, memory modes or draft layer. Every
 piece below was checked against a double-precision transcription of llama.cpp's `glm5-next` graph on small synthetic
-models of GLM's shapes, and timed on GLM's real sizes, all on one AMD Radeon 8060S (Strix Halo, gfx1151, Windows).
-Back to [Which model?](MODELS.md).
+models of GLM's shapes, and timed on GLM's real sizes, all on one AMD Radeon 8060S (Strix Halo, gfx1151, Windows);
+the whole file was then run there ([the first run](#the-first-run-of-the-real-file)). Back to [Which model?](MODELS.md).
 
 > **On this page:** [Status](#status) · [The model](#the-model) · [Install](#install) ·
 > [Engine options](#engine-options) · [Chat, thinking and tools](#chat-thinking-and-tools) ·
@@ -16,7 +16,7 @@ Back to [Which model?](MODELS.md).
 
 | | |
 | --- | --- |
-| **Runs the real file** | not yet: the 157 GB download has not been run whole; only its metadata shard was read (geometry, tokenizer, chat template) |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 0.4-0.8 tokens/s and 25-80 s for a 20-token prompt, bound by copying experts from the file |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
@@ -29,12 +29,12 @@ From the GGUF's metadata (`glm5-next.*`, Unsloth revision `a38483c8`):
 
 | | |
 | --- | --- |
-| Layers | 46: 3 dense, then 43 MoE; 34 KDA (linear attention) and 12 MLA (layers 3, 7, ..., 43 and 45) |
+| Layers | 45 (`block_count` 46 less the MTP block): 3 dense, then 42 MoE; 34 KDA (linear attention) and 11 MLA (layers 3, 7, ..., 43) |
 | Experts | 288 per MoE layer, 8 used per token, 1 shared; 4096 x 2048 each |
 | Width | 4096 (hidden), 64 attention heads; four residual streams mixed by mHC (20 Sinkhorn rounds) |
 | MLA | latent 512 per token and layer (q rank 1536), no rotary part; a k-pool indexer (32 heads, pools of 4 cells, the best 512 pools) chooses the rows each query reads |
 | KDA | 64 heads of 128, short convolution of 4 |
-| Draft layer | 1 MTP block in the file (`nextn_predict_layers`) |
+| Draft layer | 1 MTP block in the file (`nextn_predict_layers`), as layer 45: MLA and MoE, no mHC |
 | Context | 1,048,576 tokens (trained) |
 | Vocabulary | 154,880 tokens, pre-tokenizer `glm4` |
 | License | MIT (`general.license`) |
@@ -146,6 +146,31 @@ come from slots or the SSD.
 | MLA prompt attention | 2048 queries over 2051 selected rows: 215 ms a layer (about 2.7 TFLOP/s in FP32) |
 | Indexer, one query | scores + selection 88 us at 32K cells, 213 us at 128K, 2.2 ms at 1M |
 
+## The first run of the real file
+
+Radeon 8060S (Strix Halo, 128 GB: 64 GB for Windows, 64 GB carved out for the GPU), Windows, the model on a Samsung
+990 EVO Plus NVMe, `--max-context 8192`, `--glm-expert-cache 3000` (3,000 slots of 15.8 MB, 47 GB: with the 10 GB of
+other weights, inside the carve-out), greedy, through `serve/server.py`:
+
+- **Loading:** the plan reads 1,412 tensors: 10.0 GB of weights besides the routed experts and 147.1 GB of experts.
+  Unsloth's file stores the mHC matrices (`hc_*_fn`) in Q8_0, dequantized to F32 at load, and some expert layers in
+  types the grouped kernels gained for it: Q6_K downs (layers 11, 12, 44), and the MTP block's Q3_K gate/up and Q4_K
+  down. Loaded in 45.7 s.
+- **Answers:** "What is the capital of France?" (effort low): "The capital of France is Paris."; a haiku with
+  thinking off; a tool call streamed as `get_weather` with `{"city": "Paris", "days": 2}` (the number typed).
+- **Speed:** almost all the time goes to copying missed experts from the mapped file into slots, at 0.45-0.9 GB/s:
+
+| Request | Prompt | Its experts | Answer | Its experts |
+| --- | --- | --- | --- | --- |
+| 24 tokens, cold start | 61.9 s | 39 hits, 3,590 misses (42.8 GB) | 9 tokens, 11.3 s | 1,900 hits, 788 misses (9.4 GB) |
+| 21 tokens | 34.8 s | 640 hits, 2,667 misses (31.8 GB) | 22 tokens, 39.3 s | 5,035 hits, 2,021 misses (24.1 GB) |
+| 24 tokens, again | 80.8 s | 607 hits, 3,022 misses (36.0 GB) | 9 tokens, 17.7 s | 1,892 hits, 796 misses (9.5 GB) |
+| 180 tokens (a tool) | 229.1 s | 435 hits, 9,068 misses (107.8 GB) | 18 tokens, 58.3 s | 3,322 hits, 2,390 misses (28.4 GB) |
+
+A token of an answer misses about 88 experts (1 GB); a 24-token prompt touches about 3,600 different experts, more
+than the 3,000 slots, so the same prompt again is no faster. The NVMe reads several GB/s: the copy from the mapped file
+(page faults) is what is slow, and the next step. The engine prints these lines per request in its log.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -166,7 +191,10 @@ python tools/test_setup_glm.py
 
 ## Not done yet
 
-- A run of the real model: speed, expert hit rates, quality against llama.cpp on the same file.
+- Fast expert reads (large unbuffered reads instead of page faults on the mapped file), and an automatic slot count
+  for APUs, whose reported free GPU memory includes shared system RAM (on the 8060S 115 GB: the automatic count did
+  not fit; the run above set `--glm-expert-cache 3000`).
+- Quality against llama.cpp on the same file.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
   lines while a prompt is read.

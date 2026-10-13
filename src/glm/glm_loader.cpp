@@ -193,8 +193,8 @@ std::string resolve(const GgufModel& m, const core::Glm5NextGeometry& g, std::ve
                 ok = k::glm_linear_kind((int) t.type, (int64_t) t.shape[0]) != k::kLinearNone;
                 plan.device_bytes += align256(bytes);
                 break;
-            case Kind::Vec:
-                ok = small_float(t.type);
+            case Kind::Vec:   // F32 on the device: a quantized one (Unsloth's Q8_0 hc_*_fn) dequantized at load
+                ok = small_float(t.type) || (k::iq_supported((int) t.type) && t.elements() % 256 == 0);
                 plan.device_bytes += align256(t.elements() * 4);
                 break;
             case Kind::Bf16:
@@ -225,6 +225,7 @@ std::string resolve(const GgufModel& m, const core::Glm5NextGeometry& g, std::ve
         const k::NativeExpertLayout el =
             k::native_expert_layout((int) gn->t->type, (int) dn->t->type, g.n_embd, g.n_ff_exp);
         plan.expert_bytes += align256(el.bytes) * (uint64_t) g.n_expert;
+        plan.expert_slot_bytes = std::max<uint64_t>(plan.expert_slot_bytes, align256(el.bytes));
         plan.device_bytes += align256((uint64_t) g.n_expert * 8);   // the blobs' addresses
     }
     for (const auto& [name, count] : types) plan.types.emplace_back(name, count);
@@ -302,18 +303,8 @@ bool GlmLoadedWeights::load(const GgufModel& m, const core::Glm5NextGeometry& g,
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
         uint64_t experts = plan_.expert_bytes;
-        if (opt.expert_cache_slots > 0) {   // the cache's slots, of the largest blob
-            uint64_t slot = 0;
-            for (const Need& n : ns)
-                if (n.kind == Kind::ExpGate && n.t) {
-                    const Need* dn = nullptr;
-                    for (const Need& d : ns)
-                        if (d.kind == Kind::ExpDown && d.il == n.il) dn = &d;
-                    slot = std::max<uint64_t>(slot, align256(k::native_expert_layout((int) n.t->type, (int) dn->t->type,
-                                                                                     g.n_embd, g.n_ff_exp).bytes));
-                }
-            experts = slot * (uint64_t) opt.expert_cache_slots;
-        }
+        if (opt.expert_cache_slots > 0)   // the cache's slots, of the largest blob
+            experts = plan_.expert_slot_bytes * (uint64_t) opt.expert_cache_slots;
         const uint64_t need = plan_.device_bytes + (opt.experts == GlmExpertHome::Device ? experts : 0);
         if (need > free_b) {
             err = "GlmLoadedWeights: the weights need " + std::to_string(need >> 20) + " MiB of device memory" +
@@ -351,10 +342,23 @@ bool GlmLoadedWeights::load(const GgufModel& m, const core::Glm5NextGeometry& g,
                 break;
             }
             case Kind::Vec: {
-                const std::vector<float> v = floats(src, t.type, t.elements());
-                uint8_t* d = take(v.size() * 4);
-                if (!cuda_ok(cudaMemcpy(d, v.data(), v.size() * 4, cudaMemcpyHostToDevice), n.name, err)) return fail();
-                *n.vec = (const float*) d;
+                const uint64_t ne = t.elements();
+                float* d = (float*) take(ne * 4);
+                if (small_float(t.type)) {
+                    const std::vector<float> v = floats(src, t.type, ne);
+                    if (!cuda_ok(cudaMemcpy(d, v.data(), ne * 4, cudaMemcpyHostToDevice), n.name, err)) return fail();
+                } else {   // quantized: dequantized on the device, straight into its F32 home
+                    void* raw = nullptr;
+                    bool ok = cuda_ok(cudaMalloc(&raw, bytes), n.name, err) &&
+                              cuda_ok(cudaMemcpy(raw, src, bytes, cudaMemcpyHostToDevice), n.name, err);
+                    if (ok) {
+                        k::iq_dequant_f32((int) t.type, raw, (int64_t) ne, d, nullptr);
+                        ok = cuda_ok(cudaDeviceSynchronize(), n.name, err);
+                    }
+                    if (raw) cudaFree(raw);
+                    if (!ok) return fail();
+                }
+                *n.vec = d;
                 break;
             }
             case Kind::Bf16: {

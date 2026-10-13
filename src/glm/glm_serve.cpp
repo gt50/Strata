@@ -2,6 +2,7 @@
 #include "strata/glm/glm_serve.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/glm/glm_expert_cache.hpp"
 #include "strata/glm/glm_loader.hpp"
 #include "strata/glm/glm_spec.hpp"
 
@@ -179,9 +180,7 @@ bool GlmServer::load(const GlmServeOptions& o, std::string& err, const std::func
             free_b = 0;
         }
         const uint64_t margin = (uint64_t) 3 << 30;   // the context's state and scratch, the runtime's own
-        const int64_t n_moe = p.g.n_layers - p.g.n_dense_lead;
-        const uint64_t blobs = (uint64_t) std::max<int64_t>(1, n_moe * p.g.n_expert);
-        const uint64_t blob = plan.expert_bytes / blobs;
+        const uint64_t blob = plan.expert_slot_bytes;   // a slot holds any layer's blob: the largest
         if (plan.device_bytes + plan.expert_bytes + margin > free_b && blob > 0) {
             const uint64_t room = free_b > plan.device_bytes + margin ? free_b - plan.device_bytes - margin : 0;
             lo.expert_cache_slots = std::max<int64_t>(64, (int64_t) (room / blob));
@@ -290,12 +289,15 @@ int GlmServer::run(const std::function<bool(std::string&)>& next_line, std::atom
         p.model.set_sampling(sp);
         stop.store(false);
         const int64_t budget = std::min<int64_t>(max_new, p.o.max_ctx - n);
+        GlmExpertCache* cache = p.weights.expert_cache();
+        const GlmExpertCache::Stats c0 = cache ? cache->stats() : GlmExpertCache::Stats{};
         const auto t0 = std::chrono::steady_clock::now();
         if (!gen.start(ids.data(), n, drafts, p.stream, err)) {
             emit("ERR " + err);
             return 1;
         }
         const auto t1 = std::chrono::steady_clock::now();
+        const GlmExpertCache::Stats c1 = cache ? cache->stats() : GlmExpertCache::Stats{};
         int64_t produced = 0;
         const char* finish = "length";
         bool failed = false;
@@ -328,6 +330,18 @@ int GlmServer::run(const std::function<bool(std::string&)>& next_line, std::atom
             return 1;
         }
         const auto t2 = std::chrono::steady_clock::now();
+        if (cache) {   // where a streamed request's time went: the experts read from the file per phase
+            const GlmExpertCache::Stats c2 = cache->stats();
+            auto phase = [](const GlmExpertCache::Stats& a, const GlmExpertCache::Stats& b) {
+                return fmt("%llu hits, %llu misses (%.2f GB, %.0f ms copying)", (unsigned long long) (b.hits - a.hits),
+                           (unsigned long long) (b.misses - a.misses), (b.bytes - a.bytes) / 1e9, b.fetch_ms - a.fetch_ms);
+            };
+            std::fprintf(stderr, "strata serve (GLM): prompt %lld tokens %.0f ms, experts %s; %lld tokens %.0f ms, experts %s\n",
+                         (long long) n, std::chrono::duration<double, std::milli>(t1 - t0).count(), phase(c0, c1).c_str(),
+                         (long long) produced, std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                         phase(c1, c2).c_str());
+            std::fflush(stderr);
+        }
         const GlmSpecStats& st = gen.stats();
         emit(fmt("DONE %lld %lld %.1f %.1f %s %lld %lld 0 0 0 0 0 0.0 %lld 0", (long long) produced, (long long) n,
                  std::chrono::duration<double, std::milli>(t1 - t0).count(),
