@@ -1,5 +1,6 @@
-"""Tests for setup.py's GLM-5.3-Flash choice (EXPERIMENTAL, install_glm): the five pinned shards with their sizes and
-SHA-256, the engine check before the download, the tokenizer with its glm4 split, a config that runs the GGUF directly
+"""Tests for setup.py's GLM-5.3-Flash choice (EXPERIMENTAL, install_glm): its two sizes' pinned shards (UD-IQ2_XXS four,
+UD-IQ4_XS five) with their sizes and SHA-256, the size recommended by what fits the GPU, the engine check before the
+download, the tokenizer with its glm4 split, a config that runs the GGUF directly
 (no pack, no MTP download, no Qwen memory modes), one GPU, and the Qwen questions left out.  Mocked - no GPU, no
 downloads, nothing written outside a temp folder.
 
@@ -22,8 +23,10 @@ sys.path.insert(0, str(ROOT))
 import setup  # noqa: E402
 
 M = "UD-IQ4_XS"
+M2 = "UD-IQ2_XXS"
 REV = "a38483c8cd5df544f53d70fb281afe97369d5ab6"
 SHARDS = [f"GLM-5.3-Flash-UD-IQ4_XS-0000{i}-of-00005.gguf" for i in range(1, 6)]
+SHARDS2 = [f"GLM-5.3-Flash-UD-IQ2_XXS-0000{i}-of-00004.gguf" for i in range(1, 5)]
 
 
 def quiet(fn, *args, **kw):
@@ -39,14 +42,23 @@ def quiet(fn, *args, **kw):
 
 
 class Pins(unittest.TestCase):
-    def test_the_five_shards(self):
-        self.assertEqual(list(setup.GLM_SHARDS), SHARDS)
-        self.assertEqual(round(sum(v[0] for v in setup.GLM_SHARDS.values()) / 1e9, 1),
-                         setup.FAMILIES["glm"]["models"][M]["download_gb"])
-        self.assertEqual(setup.HF_REVISIONS["unsloth/GLM-5.3-Flash-GGUF"], REV)
+    def test_the_shards_of_both_sizes(self):
+        self.assertEqual(list(setup.GLM_SHARDS), SHARDS2 + SHARDS)
         fam = setup.FAMILIES["glm"]
-        self.assertEqual([fam["file"].format(q=M, i=i) for i in range(1, fam["shards"] + 1)], SHARDS)
+        self.assertEqual(list(fam["models"]), [M2, M])       # the menu: the smaller first
+        for m, names in ((M, SHARDS), (M2, SHARDS2)):
+            size = fam["models"][m]
+            self.assertEqual(round(sum(setup.GLM_SHARDS[n][0] for n in names) / 1e9, 1), size["download_gb"])
+            self.assertEqual([fam["file"].format(q=m, i=i, n=size["shards"]) for i in range(1, size["shards"] + 1)],
+                             names)
+        self.assertEqual(setup.HF_REVISIONS["unsloth/GLM-5.3-Flash-GGUF"], REV)
         self.assertTrue(fam["experimental"])
+
+    def test_what_each_size_needs_to_fit(self):
+        # glm_loader_parity --plan: 7.0 + 95.2 GB and 10.0 + 147.1 GB, and the engine's 3 GB of room
+        sizes = setup.FAMILIES["glm"]["models"]
+        self.assertEqual(sizes[M2]["fit_gb"], 105.2)
+        self.assertEqual(sizes[M]["fit_gb"], 160.1)
 
     def test_not_a_size_of_the_other_families(self):
         # its UD-IQ4_XS is GLM's own: the Qwen one in MODELS keeps its three shards
@@ -81,7 +93,8 @@ class Base(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def main(self, argv, ram=127.8, glm=True, n_gpus=1, model=True, family=True, answers=None, free=500.0):
+    def main(self, argv, ram=127.8, glm=True, n_gpus=1, model=True, family=True, answers=None, free=500.0, size=M,
+             vram=24.0):
         """answers: None = --yes; else {words of a question: its answer} (Enter for the others), every question asked
         kept in self.asked.  glm=False: an engine without the GLM path."""
         self.asked = []
@@ -96,7 +109,7 @@ class Base(unittest.TestCase):
         eng.mkdir(exist_ok=True)
         (eng / "BUILD.json").write_text(json.dumps({"version": "0.1.43.1", "source": "local"}))
         (eng / setup.EXE).write_bytes(b"engine=0.1.43.1\n" + (setup.GLM_ENGINE_MARK if glm else b""))
-        found = [{"index": i, "name": "NVIDIA GeForce RTX 4090", "vram_gb": 24.0, "arch": "89", "driver": "580.97"}
+        found = [{"index": i, "name": "NVIDIA GeForce RTX 4090", "vram_gb": vram, "arch": "89", "driver": "580.97"}
                  for i in range(n_gpus)]
 
         def fake_download(url, dst, what=None):
@@ -137,7 +150,7 @@ class Base(unittest.TestCase):
             mock.patch.object(setup, "write_run_script", lambda tag, cfg, port, *_: self.t / f"start-{tag}.bat"),
             mock.patch.object(setup, "start", mock.Mock(side_effect=AssertionError("started"))),
             mock.patch.object(sys, "argv", ["setup.py", *(["--family", "glm"] if family else []),
-                                            *(["--model", M] if model else []),
+                                            *(["--model", size] if model else []),
                                             *(["--yes"] if answers is None else []), "--no-start",
                                             "--models-dir", str(self.t / "models"), *argv]),
             mock.patch("builtins.input", fake_input),
@@ -146,8 +159,9 @@ class Base(unittest.TestCase):
             for p in patches:
                 st.enter_context(p)
             code, out = quiet(setup.main)
-        cfg = self.t / f"strata-glm-{M.lower()}.json"
-        return code, out, (json.loads(cfg.read_text()) if cfg.exists() else None)
+        cfgs = sorted(self.t.glob("strata-glm-*.json"))
+        self.assertLessEqual(len(cfgs), 1)
+        return code, out, (json.loads(cfgs[0].read_text()) if cfgs else None)
 
 
 class Install(Base):
@@ -158,7 +172,7 @@ class Install(Base):
         base = f"https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/{REV}/UD-IQ4_XS/"
         self.assertEqual(self.downloads, [base + n for n in SHARDS])          # no image encoder, no MTP tensors
         self.assertEqual([v[0] for v in self.verified], SHARDS)
-        self.assertEqual([v[1:] for v in self.verified], list(setup.GLM_SHARDS.values()))
+        self.assertEqual([v[1:] for v in self.verified], [setup.GLM_SHARDS[n] for n in SHARDS])
         # the tokenizer only: no pack, no draft layer
         self.assertEqual([Path(r[1]).name for r in self.runs], ["strata_tokenizer.py"])
         tok = self.runs[0]
@@ -180,6 +194,21 @@ class Install(Base):
         self.assertEqual(code, 0, out)
         ch = setup.choices_from_config(self.t / f"strata-glm-{M.lower()}.json")
         self.assertEqual((ch["family"], ch["model"], ch["context"]), ("glm", M, 32768))
+
+    def test_install_the_2_bit_size(self):
+        code, out, cfg = self.main([], size=M2)
+        self.assertEqual(code, 0, out)
+        base = f"https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF/resolve/{REV}/UD-IQ2_XXS/"
+        self.assertEqual(self.downloads, [base + n for n in SHARDS2])
+        self.assertEqual([v[0] for v in self.verified], SHARDS2)
+        self.assertEqual([v[1:] for v in self.verified], [setup.GLM_SHARDS[n] for n in SHARDS2])
+        models = self.t / "models" / "glm-UD-IQ2_XXS"
+        self.assertEqual(cfg["args"], ["--native", str(models / SHARDS2[0]), "--max-context", "32768"])
+        self.assertEqual(cfg["model_name"], "glm-5.3-flash-ud-iq2_xxs")
+        self.assertEqual(Path(cfg["tokenizer"]), self.t / "data" / "packs" / "glm-ud-iq2_xxs" / "tokenizer")
+        # a run of setup again reads its answers back (the size is in no other family's list)
+        ch = setup.choices_from_config(self.t / "strata-glm-ud-iq2_xxs.json")
+        self.assertEqual((ch["family"], ch["model"]), ("glm", M2))
 
     def test_engine_without_glm_stops_before_the_download(self):
         code, out, cfg = self.main([], glm=False)
@@ -204,6 +233,9 @@ class Install(Base):
         self.assertEqual(code, 1)
         self.assertIn("need ~158 GB", out)
         self.assertEqual(self.downloads, [])
+        code, out, cfg = self.main([], free=100.0, size=M2)
+        self.assertEqual(code, 1)
+        self.assertIn("need ~103 GB", out)
 
     def test_a_tokenizer_without_the_glm_split_is_extracted_again(self):
         tok = self.t / "data" / "packs" / "glm-ud-iq4_xs" / "tokenizer"
@@ -240,6 +272,34 @@ class Choices(Base):
         for key in ("vision", "parallel", "draft_vocab"):
             self.assertNotIn(key, cfg)
 
+    def test_recommended_size(self):
+        """--yes without --model: the best size that fits the GPU whole, else the smallest."""
+        for vram, want in ((24.0, M2), (110.0, M2), (170.0, M)):
+            code, out, cfg = self.main([], model=False, vram=vram)
+            self.assertEqual(code, 0, out)
+            self.assertIn(f"size: {want}", out)
+            line = next(ln for ln in out.splitlines() if "(recommended)" in ln)
+            self.assertIn(want, line)
+            for p in self.t.glob("strata-glm-*.json"):
+                p.unlink()
+        self.assertIn("UD-IQ2_XXS ~2-bit", out)
+        self.assertIn("fits this GPU whole", out)
+
+    def test_the_room_of_an_apu(self):
+        # the 8060S: 64 GB carved out, 63.6 left to Windows - the runtime reported 115 GB free and UD-IQ2_XXS fit
+        apu = {"uma": True, "dedicated_gb": 64.0, "shared_gb": 31.8, "vram_gb": 95.8}
+        room = setup.glm_gpu_room(apu, 63.6)
+        sizes = setup.FAMILIES["glm"]["models"]
+        self.assertGreaterEqual(room, sizes[M2]["fit_gb"])
+        self.assertLess(room, sizes[M]["fit_gb"])
+        self.assertEqual(setup.glm_gpu_room({"vram_gb": 24.0}, 128.0), 24.0)   # a card: its VRAM
+
+    def test_its_size_named_for_another_family(self):
+        # --model UD-IQ2_XXS alone: the first family has no such size; the message names GLM's
+        code, out, cfg = self.main(["--family", "qwen"], size=M2, family=False)
+        self.assertEqual(code, 1)
+        self.assertIn("--family glm --model UD-IQ2_XXS", out)
+
     def test_unknown_size(self):
         code, out, cfg = self.main(["--model", "Q2_0"], model=False)
         self.assertEqual(code, 1)
@@ -253,16 +313,18 @@ class Choices(Base):
         self.assertNotIn("layer_split", cfg)
 
     def test_menus(self):
-        """Interactive: the family menu lists GLM last, marked [experimental]; then only the context is asked (one size,
-        none of the Qwen questions), Enter = the engine's default 32K."""
+        """Interactive: the family menu lists GLM last, marked [experimental]; then its size and the context (none of
+        the Qwen questions), Enter = the recommended size and the engine's default 32K."""
         code, out, cfg = self.main([], model=False, family=False, answers={"Which model": "5"})
         self.assertEqual(code, 0, out)
         line = next(ln for ln in out.splitlines() if ln.startswith("  5) "))
         self.assertIn("GLM-5.3-Flash", line)
         self.assertIn("[experimental]", line)
-        self.assertEqual(len(self.asked), 2, self.asked)
+        self.assertEqual(len(self.asked), 3, self.asked)
         self.assertTrue(self.asked[0].startswith("Which model?"))
-        self.assertTrue(self.asked[1].startswith("Context?"))
+        self.assertTrue(self.asked[1].startswith("Which size?"))
+        self.assertTrue(self.asked[2].startswith("Context?"))
+        self.assertEqual(cfg["model_name"], "glm-5.3-flash-ud-iq2_xxs")   # neither fits a 24 GB card: the smaller
         self.assertEqual(cfg["args"][-1], "32768")
 
 

@@ -145,10 +145,12 @@ START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 ### GLM-5.3-Flash (experimental)
 
 **[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash)** by Z.ai is another model, not a version of the one
-above: 288 experts per layer, a 1M-token context, MIT license. Setup offers Unsloth's UD-IQ4_XS of it (`--family
-glm`, a 157 GB download), which Strata runs on its own engine path. It is experimental: the path is checked piece by
-piece on an AMD Radeon 8060S, where the real model also answers correctly but slowly so far (2-3 tokens per
-second, many experts read from the SSD); the ready-made engines do not have it, and it has no images. Details, what is measured and what is not: [GLM-5.3-Flash](GLM.md).
+above: 288 experts per layer, a 1M-token context, MIT license. Setup offers two of Unsloth's quantizations of it
+(`--family glm`): UD-IQ2_XXS (a 102 GB download) and UD-IQ4_XS (157 GB), which Strata runs on its own engine path.
+It is experimental: the path is checked piece by piece on an AMD Radeon 8060S (128 GB), where the real model answers
+correctly - UD-IQ2_XXS at 16-24 tokens per second with all its experts on the GPU, UD-IQ4_XS at 2-3 (many experts
+read from the SSD) with 6% lower perplexity. Setup recommends the size that fits the GPU whole. The ready-made
+engines do not have the path, and it has no images. Details, what is measured and what is not: [GLM-5.3-Flash](GLM.md).
 
 ```
 START-HERE.bat --setup --family glm

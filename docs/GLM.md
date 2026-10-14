@@ -19,7 +19,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 | **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s, 4-12 s for a 20-token prompt and 94 s for a 3,712-token one, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)). UD-IQ2_XXS (102 GB) fits there whole: 16-24 tokens/s and 0.6-1.0 s for a short prompt, for 6% higher perplexity ([below](#ud-iq2_xxs-the-experts-resident)) |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
-| **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
+| **Setup** | `--family glm`: UD-IQ2_XXS or UD-IQ4_XS, the one that fits the GPU whole recommended; marked experimental |
 | **Server** | chat, thinking levels, tool calls (streamed too), the OpenAI and Anthropic APIs; no images |
 | **One GPU** | no layer split, no batch slots (one request at a time), no calibration |
 
@@ -39,14 +39,14 @@ From the GGUF's metadata (`glm5-next.*`, Unsloth revision `a38483c8`):
 | Vocabulary | 154,880 tokens, pre-tokenizer `glm4` |
 | License | MIT (`general.license`) |
 
-The UD-IQ4_XS file is five shards, 156.8 GB together; shard 1 (9.4 MB) holds only metadata. Setup pins the five sizes
-and SHA-256 from the Hub's LFS pointers (`GLM_SHARDS` in `setup.py`).
+The UD-IQ4_XS file is five shards, 156.8 GB together; shard 1 (9.4 MB) holds only metadata. Setup pins every shard's
+size and SHA-256 from the Hub's LFS pointers (`GLM_SHARDS` in `setup.py`), for both sizes it offers.
 
 **UD-IQ2_XXS** (four shards, 101.8 GB) runs too: 7.0 GB of weights besides the experts and 95.2 GB of experts,
 IQ2_XXS gate / up over IQ3_XXS down in 39 of the 42 MoE layers, IQ2_S / IQ4_XS in layer 11, IQ2_XXS / IQ4_XS in 12 and
 44, Q2_K / Q3_K in the MTP block (`glm_moe_parity` section 4 checks those pairs). On the 8060S all its experts fit, so
 nothing is read from the SSD: about 8x the speed of UD-IQ4_XS, for 6% higher perplexity
-([below](#ud-iq2_xxs-the-experts-resident)). Setup does not offer it yet.
+([below](#ud-iq2_xxs-the-experts-resident)).
 
 ## Install
 
@@ -56,19 +56,23 @@ START-HERE.bat --setup --family glm
 
 Linux: `./setup.sh --setup --family glm`. Setup:
 
-1. Asks only the context: 8K to 256K are offered, 32K recommended (the engine's default). `--context` takes up to
-   1,048,576. Strata's GLM tests use a few thousand tokens, so long contexts are untested.
+1. Asks the size (`--model`): UD-IQ2_XXS (101.8 GB) or UD-IQ4_XS (156.8 GB). It recommends the better one whose
+   experts all fit the GPU (with the weights besides them and the engine's 3 GB of room: 105.2 and 160.1 GB), else
+   UD-IQ2_XXS. For an APU it counts the carve-out and the RAM less 6 GB for the system (the 8060S: about 122 GB, so
+   UD-IQ2_XXS; the runtime there reports 115 GB free, and the file fit), for a card its VRAM. Then the context: 8K to
+   256K are offered, 32K recommended (the engine's default). `--context` takes up to 1,048,576. Strata's GLM tests
+   use a few thousand tokens, so long contexts are untested.
 2. Checks the engine before the download: the GLM path must be in it (`setup.glm_engine` looks for the GLM start line's
    text in the binary, because a build with the GLM path and a release without it can carry the same version). Today's
    ready-made engines do not have it. Build one: on Windows with AMD, `tools\hip\build_windows.bat` (it builds for
    gfx1151 among others, [AMD_HIP.md](AMD_HIP.md)), then `START-HERE.bat --setup --family glm --backend hip
    --prebuilt dist\`; on Linux with AMD, setup compiles the engine from the checkout itself.
-3. Downloads the five shards (157 GB; files already in another Strata folder or given with `--gguf-dir` are reused)
-   and checks their sizes and SHA-256.
-4. Extracts the tokenizer from shard 1 into `Strata-data/packs/glm-ud-iq4_xs/tokenizer/`, with a round trip over a
-   test corpus. Nothing else is prepared: the engine reads the GGUF as it is.
-5. Writes `strata-glm-ud-iq4_xs.json` (`--native <shard 1> --max-context N`, `"arch": "glm5-next"`) and
-   `run-glm-ud-iq4_xs.bat` / `.sh`.
+3. Downloads the size's shards (four or five; files already in another Strata folder or given with `--gguf-dir` are
+   reused) and checks their sizes and SHA-256.
+4. Extracts the tokenizer from shard 1 into `Strata-data/packs/glm-<size>/tokenizer/` (`glm-ud-iq2_xxs`,
+   `glm-ud-iq4_xs`), with a round trip over a test corpus. Nothing else is prepared: the engine reads the GGUF as it is.
+5. Writes `strata-glm-<size>.json` (`--native <shard 1> --max-context N`, `"arch": "glm5-next"`) and
+   `run-glm-<size>.bat` / `.sh`.
 
 Setup options made for the Qwen models (`--kv`, `--vision`, `--draft-vocab`, `--parallel`, `--low-ram`,
 `--resident-budget-gib`, `--kv-streaming`, `--vram-reserve-mib`, ...) are said and left out.
@@ -418,5 +422,5 @@ python tools/test_setup_glm.py
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
   lines while a prompt is read.
 - Several GPUs, calibration, a ready-made engine with the GLM path.
-- UD-IQ2_XXS in setup (`--family glm` offers UD-IQ4_XS only); on an integrated GPU, whether a model whose experts all
-  fit should still keep `--glm-host-reserve-gb` available (it streams then, and is slower).
+- On an integrated GPU, whether a model whose experts all fit should still keep `--glm-host-reserve-gb` available (it
+  streams then, and is slower).

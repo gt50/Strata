@@ -253,9 +253,18 @@ UNSLOTH_IQ4_XS_SHARDS = {
     "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf":
         (43836407744, "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"),
 }
-# EXPERIMENTAL: Z.ai's GLM-5.3-Flash (llama.cpp's architecture glm5-next), Unsloth's UD-IQ4_XS: five shards at the pinned
-# revision (sizes and SHA-256: the Hub's LFS pointers).  It runs on its own engine path (install_glm, src/glm).
+# EXPERIMENTAL: Z.ai's GLM-5.3-Flash (llama.cpp's architecture glm5-next), Unsloth's UD-IQ2_XXS (four shards) and
+# UD-IQ4_XS (five) at the pinned revision (sizes and SHA-256: the Hub's LFS pointers).  It runs on its own engine path
+# (install_glm, src/glm).
 GLM_SHARDS = {
+    "GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf":
+        (9429984, "337870cefce5fb34b2aa3ade54a0fbf61676697f7f9a906670c20edde74561f4"),
+    "GLM-5.3-Flash-UD-IQ2_XXS-00002-of-00004.gguf":
+        (49896298080, "d51a3d9ca05022d53e71753df75ee64ed5fd4e47655650ae023e9717b3ec158d"),
+    "GLM-5.3-Flash-UD-IQ2_XXS-00003-of-00004.gguf":
+        (49248507840, "89180f13784dc1128586b98adf1ca876279881a20bc4f01747703ce352563372"),
+    "GLM-5.3-Flash-UD-IQ2_XXS-00004-of-00004.gguf":
+        (2690716000, "9e0ef47daa1fdffce3cf2ac1594ce4634d176ad018be6e692729757f38d5fbf6"),
     "GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf":
         (9429984, "c2f3b6ab98d3df844f322ea376059202d2eaeedcee1f0eff455345b86a137dbd"),
     "GLM-5.3-Flash-UD-IQ4_XS-00002-of-00005.gguf":
@@ -318,13 +327,18 @@ FAMILIES = {
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
     # EXPERIMENTAL: another model on its own engine path (install_glm): none of the questions below apply, and its
     # sizes are its own ("models"), not MODELS' (its UD-IQ4_XS is not the Qwen one)
-    "glm": {"title": "GLM-5.3-Flash", "by": "Z.ai; Unsloth's ~4-bit quantization",
-            "about": "another model (288 experts, 1M-token context), a 157 GB download; slow so far",
-            "hf": hf("unsloth/GLM-5.3-Flash-GGUF") + "{q}/", "file": "GLM-5.3-Flash-{q}-0000{i}-of-00005.gguf",
-            "shards": 5, "tag": "glm-", "name": "glm-5.3-flash", "experimental": True,
+    # its sizes: "shards" their own count (the pattern's {n}); "fit_gb" what the engine needs to keep every expert on
+    # the GPU (glm_loader_parity --plan: the weights besides the experts, the experts, and its 3 GB of room)
+    "glm": {"title": "GLM-5.3-Flash", "by": "Z.ai; Unsloth's ~2-bit and ~4-bit quantizations",
+            "about": "another model (288 experts, 1M-token context), a 102 or 157 GB download",
+            "hf": hf("unsloth/GLM-5.3-Flash-GGUF") + "{q}/", "file": "GLM-5.3-Flash-{q}-0000{i}-of-0000{n}.gguf",
+            "tag": "glm-", "name": "glm-5.3-flash", "experimental": True,
             "license": "MIT (the GGUF's general.license): https://huggingface.co/zai-org/GLM-5.3-Flash",
             "sha256": GLM_SHARDS,
-            "models": {"UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic)", "download_gb": 156.8}}},
+            "models": {"UD-IQ2_XXS": {"about": "~2-bit (Unsloth Dynamic): 6% higher perplexity than UD-IQ4_XS",
+                                      "download_gb": 101.8, "shards": 4, "fit_gb": 105.2},
+                       "UD-IQ4_XS": {"about": "~4-bit (Unsloth Dynamic): the better answers", "download_gb": 156.8,
+                                     "shards": 5, "fit_gb": 160.1}}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -4048,14 +4062,15 @@ def choices_from_config(cfg_path: Path) -> dict:
     tag = cfg_path.stem[len("strata-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
-    if model not in MODELS:                            # (sizes have no dash except UD-Q4_K_XL: the old rule)
+    known = FAMILIES[family].get("models") or MODELS   # GLM's sizes are its own (its UD-IQ2_XXS is in no other list)
+    if model not in known:                             # (sizes have no dash except UD-Q4_K_XL: the old rule)
         model = tag.split("-")[-1].upper()
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
     esp = val("--control-vector-scaled")
     esp_path = esp.rsplit(":", 1)[0] if esp else None
-    return {"family": family, "model": model if model in MODELS else None,
+    return {"family": family, "model": model if model in known else None,
             "context": int(val("--max-context")) if val("--max-context") else None,
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
@@ -4926,24 +4941,40 @@ def glm_unused_flags(a) -> list[str]:
         ("--layer-split", a.layer_split)) if given]
 
 
+def glm_gpu_room(gpu: dict, ram: float) -> float:
+    """The GB the GLM engine can keep on this GPU: a card's VRAM; an APU's carve-out and its RAM less what the OS keeps
+    (the runtime counts the shared RAM as free - the 8060S with 64 of 128 GB carved out reported 115 GB - and setup's
+    own unified figure, the carve-out plus half the RAM, is below what it measured: UD-IQ2_XXS's 105 GB fit)."""
+    if gpu.get("uma"):
+        return gpu.get("dedicated_gb", 0.0) + ram - UMA_OS_LEFT_GB
+    return float(gpu.get("vram_gb") or 0.0)
+
+
 def install_glm(a, gpu, hip, amd, ram, multi, roots, port, cuda_tk, elsewhere) -> int:
     """Steps 2-7 for GLM-5.3-Flash (EXPERIMENTAL): another architecture on its own engine path (src/glm), run straight
     from the GGUF - no pack, no n-gram table, no MTP download (its draft layer is in the GGUF) and none of the Qwen
     models' memory modes: the engine keeps the experts the GPU has room for and reads the others from the mapped model
     files.  What setup does: one size, the context, the download (pinned, SHA-256 checked), the tokenizer, the config."""
     fam = FAMILIES["glm"]
-    warn("GLM-5.3-Flash is EXPERIMENTAL in Strata: it answers correctly, but on the one PC it has run on (a Radeon 8060S "
-         "with 64 GB of RAM) 2-3 tokens per second, because many of its experts are read from the model files as it "
-         "answers (docs/GLM.md) - please report how it runs")
+    warn("GLM-5.3-Flash is EXPERIMENTAL in Strata: it answers correctly, and has run on one PC (a Radeon 8060S, 128 GB): "
+         "16-24 tokens per second with UD-IQ2_XXS, all of its experts on the GPU; 2-3 with UD-IQ4_XS, which does not "
+         "fit and reads many experts from the model files as it answers (docs/GLM.md) - please report how it runs")
     say()
     sizes = fam["models"]
     names = list(sizes)
     if a.model and a.model not in sizes:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
+    # recommended: the best size whose experts all fit the GPU (the speed above), else the smallest (the fewest bytes
+    # read from the SSD as it answers)
+    room = glm_gpu_room(gpu, ram)
+    fits = [m for m in names if sizes[m]["fit_gb"] <= room]
+    best = fits[-1] if fits else names[0]
     for i, m in enumerate(names, 1):
-        say(f"  {i}) {m} {sizes[m]['about']}; download {sizes[m]['download_gb']:.0f} GB")
-    model = a.model or (names[0] if len(names) == 1 else
-                        names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1])
+        where = "fits this GPU whole" if m in fits else "part of its experts read from the SSD (slower)"
+        say(f"  {i}) {m} {sizes[m]['about']}; download {sizes[m]['download_gb']:.0f} GB; {where}" +
+            ("   (recommended)" if m == best else ""))
+    model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)],
+                                     str(names.index(best) + 1), a.yes)) - 1]
     ok(f"size: {model}")
     tag = fam["tag"] + model
     if multi:
@@ -4968,7 +4999,8 @@ def install_glm(a, gpu, hip, amd, ram, multi, roots, port, cuda_tk, elsewhere) -
                                    str(GLM_CONTEXTS.index(GLM_CONTEXT_DEFAULT) + 1), a.yes)) - 1]
     ok(f"context: {ctx} tokens")
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    shards = [models_dir / fam["file"].format(q=model, i=i) for i in range(1, fam["shards"] + 1)]
+    n = sizes[model]["shards"]
+    shards = [models_dir / fam["file"].format(q=model, i=i, n=n) for i in range(1, n + 1)]
     if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]
@@ -4996,7 +5028,7 @@ def install_glm(a, gpu, hip, amd, ram, multi, roots, port, cuda_tk, elsewhere) -
 
     step(4, "the Strata engine")
     eng, gpu, _, llama, meta, lib_dirs, _ = get_engine(a, gpu, hip, amd, "none", cuda_tk)
-    if not glm_engine(eng / EXE):                      # checked before the 157 GB download
+    if not glm_engine(eng / EXE):                      # checked before the 102-157 GB download
         fail(f"this engine ({meta.get('version', '?')}) has no {fam['title']} path",
              "the GLM engine is not in a ready-made release yet: compile it from a checkout with src/glm "
              + ("(tools\\hip\\build_windows.bat, then --prebuilt <its dist folder>, docs/AMD_HIP.md)" if hip and WIN
@@ -5073,7 +5105,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES),
                     help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, glm = GLM-5.3-Flash (EXPERIMENTAL)")
-    ap.add_argument("--model", choices=list(MODELS))
+    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *(m for d in FAMILIES.values()
+                                                                       for m in d.get("models", {}))])))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -5493,7 +5526,8 @@ def main() -> int:
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
     if a.model and a.model not in names:
         # #444: say which family has that size, and (with --gguf-dir) which files Strata can run at all
-        elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
+        elsewhere_fams = [f for f in FAMILIES if a.model in FAMILIES[f].get("models", {}) or
+                          (a.model in MODELS and f in MODELS[a.model].get("families", ("qwen", "swift")))]
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names)
              + (f" (or {a.model}: " + ", ".join(f"--family {f} --model {a.model}" for f in elsewhere_fams) + ")"
                 if elsewhere_fams else "")
