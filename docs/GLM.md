@@ -42,6 +42,14 @@ From the GGUF's metadata (`glm5-next.*`, Unsloth revision `a38483c8`):
 The UD-IQ4_XS file is five shards, 156.8 GB together; shard 1 (9.4 MB) holds only metadata. Setup pins the five sizes
 and SHA-256 from the Hub's LFS pointers (`GLM_SHARDS` in `setup.py`).
 
+**UD-IQ2_XXS** (four shards, 101.8 GB) passes the loader's check too (`glm_loader_parity --plan` on its shards'
+headers alone): 7.0 GB of weights besides the experts and 95.2 GB of experts, IQ2_XXS gate / up over IQ3_XXS down in
+39 of the 42 MoE layers, IQ2_S / IQ4_XS in layer 11, IQ2_XXS / IQ4_XS in 12 and 44, Q2_K / Q3_K in the MTP block. The
+expert kernels take those pairs (`glm_moe_parity` section 4). Its largest expert is 9.8 MB (layer 11): by
+arithmetic, not a run, the 8060S's room would hold about 8,100 slots, about 65% of its 12,384 experts (UD-IQ4_XS:
+4,874 slots of 15.8 MB, 39%). Not run on the real file yet, its quality against UD-IQ4_XS is not measured, and setup
+does not offer it.
+
 ## Install
 
 ```

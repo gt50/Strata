@@ -13,8 +13,10 @@
 //      block scales put the gate and up values around +-10, so the clamp matters: limit 10 is shown to differ from
 //      none, and limit 0 is bitwise native_expert_grouped.
 //   4. the other expert types of Unsloth's UD-IQ4_XS file: IQ3_S / IQ4_XS (most layers), IQ4_XS / Q6_K (layer 11),
-//      IQ3_S / Q6_K (12, 44) and Q3_K / Q4_K (the MTP block), against glm_linear's GEMVs (native_mmvq: other code)
-//      for gate, up and down with the clamped SwiGLU on the host between them.
+//      IQ3_S / Q6_K (12, 44) and Q3_K / Q4_K (the MTP block), and of its UD-IQ2_XXS file: IQ2_XXS / IQ3_XXS (most
+//      layers), IQ2_S / IQ4_XS (11), IQ2_XXS / IQ4_XS (12, 44) and Q2_K / Q3_K (the MTP block), against glm_linear's
+//      GEMVs (native_mmvq: other code) for gate, up and down with the clamped SwiGLU on the host between them - a Q2_K
+//      gate / up, which no GEMV takes, against ggml's CPU dequantization in double instead.
 #include "strata/kernels/glm_linear.hpp"
 #include "strata/kernels/glm_moe.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -147,6 +149,49 @@ std::vector<uint8_t> gguf_rows(const BlockType& bt, int64_t rows, int64_t n, std
             std::memcpy(&w[o + at], &h, 2);
         }
     return w;
+}
+
+float half_to_float(uint16_t h) {   // IEEE binary16, subnormals included
+    const int e = (h >> 10) & 31, m = h & 1023;
+    const float v = e == 0 ? std::ldexp((float) m, -24) : std::ldexp((float) (m | 1024), e - 25);
+    return (h & 0x8000) ? -v : v;
+}
+
+/// ggml-quants.c's dequantize_row_q2_K: 84-byte blocks of 256 (16 scale/min bytes, 64 of 2-bit quants, d, dmin).
+std::vector<float> dequant_q2_K(const uint8_t* x, int64_t n) {
+    std::vector<float> y((size_t) n);
+    float* out = y.data();
+    for (int64_t b = 0; b < n / 256; ++b) {
+        const uint8_t* blk = x + b * 84;
+        uint16_t hd, hm;
+        std::memcpy(&hd, blk + 80, 2);
+        std::memcpy(&hm, blk + 82, 2);
+        const float d = half_to_float(hd), mn = half_to_float(hm);
+        const uint8_t* q = blk + 16;
+        int is = 0;
+        for (int n0 = 0; n0 < 256; n0 += 128) {
+            for (int shift = 0; shift < 8; shift += 2)
+                for (int half = 0; half < 2; ++half) {
+                    const uint8_t sc = blk[is++];
+                    const float dl = d * (float) (sc & 0xF), ml = mn * (float) (sc >> 4);
+                    for (int l = 0; l < 16; ++l) *out++ = dl * (float) ((q[l + 16 * half] >> shift) & 3) - ml;
+                }
+            q += 32;
+        }
+    }
+    return y;
+}
+
+/// The values a row of q8_1 blocks (36 bytes: fp16 d, fp16 sum, 32 int8) stands for.
+std::vector<float> decode_q8_1(const uint8_t* x, int64_t n) {
+    std::vector<float> y((size_t) n);
+    for (int64_t b = 0; b < n / 32; ++b) {
+        uint16_t hd;
+        std::memcpy(&hd, x + b * 36, 2);
+        const float d = half_to_float(hd);
+        for (int i = 0; i < 32; ++i) y[(size_t) (b * 32 + i)] = d * (float) (int8_t) x[b * 36 + 4 + i];
+    }
+    return y;
 }
 
 }  // namespace
@@ -376,9 +421,14 @@ int main(int argc, char** argv) {
         check(cudaStreamCreate(&st), "stream");
         // the scales chosen so a gate / up value is of the order of 10 over 4096 unit inputs, as in 3
         const BlockType iq3s{21, 110, {0}, 6, 7, "IQ3_S"}, iq4xs{23, 136, {0}, 2, 3, "IQ4_XS"},
-            q6k{14, 210, {208}, 3, 4, "Q6_K"}, q4k{12, 144, {0, 2}, 5, 6, "Q4_K"}, q3k{11, 110, {108}, 7, 8, "Q3_K"};
+            q6k{14, 210, {208}, 3, 4, "Q6_K"}, q4k{12, 144, {0, 2}, 5, 6, "Q4_K"}, q3k{11, 110, {108}, 7, 8, "Q3_K"},
+            iq2xxs{16, 66, {0}, 6, 7, "IQ2_XXS"}, iq2s{22, 82, {0}, 6, 7, "IQ2_S"}, iq3xxs{18, 98, {0}, 6, 7, "IQ3_XXS"},
+            q2k{10, 84, {80, 82}, 8, 9, "Q2_K"};
         struct Pair { BlockType gu, d; };
-        for (const Pair& pr : {Pair{iq3s, iq4xs}, Pair{iq4xs, q6k}, Pair{iq3s, q6k}, Pair{q3k, q4k}}) {
+        // the UD-IQ4_XS file's pairs, then the UD-IQ2_XXS file's: IQ2_XXS / IQ3_XXS (most layers), IQ2_S / IQ4_XS
+        // (layer 11), IQ2_XXS / IQ4_XS (12, 44), Q2_K / Q3_K (the MTP block)
+        for (const Pair& pr : {Pair{iq3s, iq4xs}, Pair{iq4xs, q6k}, Pair{iq3s, q6k}, Pair{q3k, q4k}, Pair{iq2xxs, iq3xxs},
+                               Pair{iq2s, iq4xs}, Pair{iq2xxs, iq4xs}, Pair{q2k, q3k}}) {
             std::printf("\nnative_expert_grouped_clamped, %s gate / up, %s down, %lld x %lld, %d experts, %d tokens:\n",
                         pr.gu.name, pr.d.name, (long long) H, (long long) FF, G, TT);
             const bool ok = k::native_expert_supported(pr.gu.type, pr.d.type, H, FF);
@@ -388,6 +438,7 @@ int main(int argc, char** argv) {
             const size_t slot = (L.bytes + 255) & ~(size_t) 255;
             uint8_t* d_blobs = nullptr;
             check(cudaMalloc(&d_blobs, slot * G), "blobs");
+            std::vector<std::vector<uint8_t>> hblobs;   // a Q2_K gate / up's reference reads them on the host
             for (int b = 0; b < G; ++b) {
                 std::vector<uint8_t> blob = gguf_rows(pr.gu, 2 * FF, H, rng);
                 const auto down = gguf_rows(pr.d, H, FF, rng);
@@ -397,6 +448,17 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 check(cudaMemcpy(d_blobs + slot * b, blob.data(), L.bytes, cudaMemcpyHostToDevice), "blob");
+                hblobs.push_back(std::move(blob));
+            }
+            if (pr.gu.type == 10) {   // the device's Q2_K dequantization (a prompt's dequantized path) against ggml's
+                float* d_w = nullptr;
+                check(cudaMalloc(&d_w, (size_t) FF * H * 4), "dequant");
+                k::iq_dequant_f32(10, d_blobs, FF * H, d_w, nullptr);
+                check(cudaDeviceSynchronize(), "dequant");
+                const std::vector<float> got = download(d_w, (size_t) (FF * H));
+                expect(got == dequant_q2_K(hblobs[0].data(), FF * H),
+                       "iq_dequant_f32 bitwise ggml's dequantize_row_q2_K");
+                cudaFree(d_w);
             }
             std::vector<float> x((size_t) TT * H);
             for (auto& v : x) v = gauss(rng);
@@ -422,8 +484,10 @@ int main(int argc, char** argv) {
             check(cudaMalloc(&d_scr, k::native_expert_scratch_bytes(NENT, FF)), "scratch");
             float* d_out = nullptr;
             check(cudaMalloc(&d_out, (size_t) NENT * H * 4), "out");
-            // the reference: glm_linear's GEMVs a role at a time on the same x
+            // the reference: glm_linear's GEMVs a role at a time on the same x.  Q2_K gate / up has no GEMV (only the
+            // expert kernels take it): ggml's CPU dequantization instead, in double on the q8_1 x the kernels read
             std::vector<float> want((size_t) NENT * H);
+            const std::vector<uint8_t> xq_host = download(d_xq, (size_t) TT * (H / 32) * 36);
             int clamped = 0, values = 0;
             {
                 float *d_g = nullptr, *d_u = nullptr, *d_h = nullptr, *d_y = nullptr;
@@ -437,10 +501,30 @@ int main(int argc, char** argv) {
                     for (int en = start[(size_t) b]; en < start[(size_t) b + 1]; ++en) {
                         const uint8_t* blob = d_blobs + slot * b;
                         const float* xt = d_x + (size_t) tok[(size_t) en] * H;
-                        k::glm_linear({pr.gu.type, blob, H, FF}, xt, d_g, 1, d_lq, st);
-                        k::glm_linear({pr.gu.type, blob + L.up_off, H, FF}, xt, d_u, 1, d_lq, st);
-                        check(cudaDeviceSynchronize(), "ref gu");
-                        const std::vector<float> g = download(d_g, FF), u = download(d_u, FF);
+                        std::vector<float> g, u;
+                        if (pr.gu.type == 10) {
+                            const std::vector<float> xr =
+                                decode_q8_1(xq_host.data() + (size_t) tok[(size_t) en] * (H / 32) * 36, H);
+                            const std::vector<float> wg = dequant_q2_K(hblobs[(size_t) b].data(), FF * H),
+                                                     wu = dequant_q2_K(hblobs[(size_t) b].data() + L.up_off, FF * H);
+                            g.assign(FF, 0.0f);
+                            u.assign(FF, 0.0f);
+                            for (int64_t r = 0; r < FF; ++r) {
+                                double sg = 0, su = 0;
+                                for (int64_t c = 0; c < H; ++c) {
+                                    sg += (double) wg[(size_t) (r * H + c)] * xr[(size_t) c];
+                                    su += (double) wu[(size_t) (r * H + c)] * xr[(size_t) c];
+                                }
+                                g[(size_t) r] = (float) sg;
+                                u[(size_t) r] = (float) su;
+                            }
+                        } else {
+                            k::glm_linear({pr.gu.type, blob, H, FF}, xt, d_g, 1, d_lq, st);
+                            k::glm_linear({pr.gu.type, blob + L.up_off, H, FF}, xt, d_u, 1, d_lq, st);
+                            check(cudaDeviceSynchronize(), "ref gu");
+                            g = download(d_g, FF);
+                            u = download(d_u, FF);
+                        }
                         std::vector<float> h(FF);
                         for (int i = 0; i < FF; ++i) {
                             clamped += g[(size_t) i] > kLim || std::fabs(u[(size_t) i]) > kLim;

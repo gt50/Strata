@@ -244,7 +244,7 @@ GlmLinearKind glm_linear_kind(int type, int64_t n_in) noexcept {
         if (small || (type == 42 ? n_in % 64 == 0 : n_in % 256 == 0)) return kLinearNative;
         return kLinearNone;
     }
-    if (iq_supported(type) && iq_row_bytes(type, n_in) > 0) return kLinearIq;
+    if (iq_mmvq_supported(type) && iq_row_bytes(type, n_in) > 0) return kLinearIq;
     return kLinearNone;
 }
 

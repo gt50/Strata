@@ -22,6 +22,8 @@ size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
 /// q8_1 blocks for `n_rows` rows of `n_cols` floats (n_cols a multiple of 32): y is n_rows * n_cols/32 blocks.
 void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream);
 
+/// The types iq_mmvq takes: not every one iq_supported dequantizes (Q2_K, the expert kernels' alone).
+bool iq_mmvq_supported(int ggml_type) noexcept;
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
