@@ -32,6 +32,8 @@ struct GlmServeOptions {
     int n_draft = 0;                  ///< --spec N: drafts a round (0: none)
     std::vector<int32_t> eos_ids;     ///< --eos-ids a,b,...; empty: the GGUF's end tokens
     int64_t max_chunk = 256;          ///< --glm-chunk: a prompt's tokens a pass
+    int64_t prompt_group = 8192;      ///< --glm-prompt-group: with streamed experts, a prompt's tokens run layer by
+                                      ///< layer (GlmModel::init_prompt_group; 0: chunk by chunk)
     int64_t expert_cache_slots = -1;  ///< --glm-expert-cache N: experts streamed through N slots; 0 all resident;
                                       ///< -1 (default) resident when they fit, else as many slots as fit
     bool experts_host = false;        ///< --glm-experts-host: the experts (or their slots) in mapped host memory

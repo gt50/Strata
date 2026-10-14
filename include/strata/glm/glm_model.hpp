@@ -108,6 +108,15 @@ public:
     /// token the call has.  The last one waits for its next token: the next prompt() call's first (when it continues
     /// at the next position), or the caller's mtp_decode(next, last, h_nextn()), which drafts as it fills it.
     bool prompt(const int32_t* tokens, int64_t n, int64_t pos0, void* stream, std::string& err);
+    /// Runs prompt()'s tokens layer by layer, up to `tokens` of them (a multiple of max_chunk) at a time: every chunk
+    /// through block 0, then every chunk through block 1, and so on - the same calls in another order, so the same
+    /// results bit for bit - so that a layer's experts are fetched once for those tokens instead of once for each chunk
+    /// (with an expert cache that cannot hold them all: the prompt's whole cost).  Keeps their four streams
+    /// (16 n_embd bytes a token) and their selections between the layers.  0 or max_chunk: chunk by chunk.
+    bool init_prompt_group(int64_t tokens, std::string& err);
+    int64_t prompt_group() const { return group_tokens_; }
+    /// The device bytes init_prompt_group(tokens) allocates (about 72 KB a token at GLM-5.3-Flash's sizes).
+    static uint64_t prompt_group_bytes(const core::Glm5NextGeometry& g, int64_t tokens);
     /// Whether prompt() runs the MTP block over its tokens (on by default when the model has one).
     void set_mtp_over_prompt(bool on) { mtp_prompt_ = on; }
     bool has_mtp() const { return has_mtp_; }
@@ -205,6 +214,9 @@ private:
     int64_t pending_pos_ = -1;   ///< a prompt's last position, its MTP row waiting for the next token
     float *hall_ = nullptr, *eb_ = nullptr, *h_pending_ = nullptr;
     int32_t* mtp_tok_ = nullptr;
+    // a prompt run layer by layer: the group's four streams [group_tokens_][4][n_embd]
+    int64_t group_tokens_ = 0;
+    float* gx_ = nullptr;
 
     bool start(int32_t token, int64_t pos, const char* who, void* stream, std::string& err);
     void head(int64_t row, void* stream);   ///< logits() and h_nextn() from token `row` of x_

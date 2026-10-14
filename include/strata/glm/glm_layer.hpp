@@ -124,6 +124,16 @@ public:
     /// The one-token step for `pos` written to `pinned` (page-locked host memory, kStepCount values) and copied from
     /// there on `stream` without waiting: the caller keeps `pinned` until the copy has run (a captured decode).
     void stage_pos(int64_t pos, int32_t* pinned, void* stream);
+    /// A prompt run layer by layer (GlmModel::init_prompt_group): room for the steps and selections of `tokens`
+    /// tokens, so that each chunk's stay while the group's other chunks run the same layer.
+    bool init_group(int64_t tokens, std::string& err);
+    /// The steps of the group's n tokens at pos0 .. pos0 + n - 1, uploaded once (synchronizes `stream`).
+    void set_group(int64_t pos0, int64_t n, void* stream);
+    /// The group's tokens c0 .. c0 + n - 1 for the next layer calls (n <= max_tokens): their steps, and their rows
+    /// of the selections a full-indexer layer writes and the shared layers after it read.
+    void use_chunk(int64_t c0, int64_t n);
+    /// Back to the context's own steps and selections (the ones a captured decode step reads).
+    void end_group();
     int64_t max_ctx() const { return max_ctx_; }
     int64_t max_tokens() const { return max_tokens_; }
     int64_t tokens() const { return n_; }
@@ -177,6 +187,10 @@ private:
     int64_t top_k_ = 0;
     bool select_tail_ = true;
     void* arena_ = nullptr;
+    // a layer-by-layer prompt's steps [tokens][kStepCount] and selections [tokens][cap], and the context's own
+    int32_t *group_step_ = nullptr, *group_sel_ = nullptr, *own_step_ = nullptr, *own_sel_ = nullptr;
+    int64_t group_tokens_ = 0, group_pos0_ = 0;
+    void* group_arena_ = nullptr;
     friend struct GlmLayerImpl;
 };
 

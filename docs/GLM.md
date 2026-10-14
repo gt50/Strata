@@ -16,7 +16,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 
 | | |
 | --- | --- |
-| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s and 4-12 s for a 20-token prompt, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)) |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s, 4-12 s for a 20-token prompt and 94 s for a 3,712-token one, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)) |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
@@ -91,6 +91,7 @@ The config's `args`; the server adds `--serve`.
 | `--glm-experts-host` | off | the experts (or their slots) in mapped host memory instead of device memory |
 | `--glm-host-reserve-gb N` | 12 | an integrated GPU: the RAM the automatic slot count leaves Windows (or Linux) available |
 | `--glm-chunk N` | 256 | prompt tokens per pass (at least 16) |
+| `--glm-prompt-group N` | 8192 | with streamed experts, up to N prompt tokens run layer by layer, each layer's experts read once for them ([below](#long-prompts-layer-by-layer)); `0`: chunk by chunk |
 | `--eos-ids a,b,c` | the file's | end tokens; the file's eos, eot and eom: `<|endoftext|>`, `<|user|>`, `<|observation|>` |
 
 Other engine flags are named on stderr and skipped. The engine speaks the same line protocol as the Qwen engine
@@ -245,6 +246,29 @@ the MTP block over every prompt even without drafts (`--spec 0`), reading its ex
 with drafts. Measured on trace B's requests: prompt misses 14,943 -> 14,248, prompt time about 5% less, an answer's
 misses 18,880 -> 18,364.
 
+### Long prompts, layer by layer
+
+A prompt runs 256 tokens a pass (`--glm-chunk`), and chunk by chunk each pass went through all 45 layers. A pass of
+256 tokens uses most of every layer's experts, more than the slots hold, so each pass read most of the 147 GB from
+the SSD again. With streamed experts the engine now runs up to `--glm-prompt-group` tokens (8,192) layer by layer:
+every chunk through layer 0, then every chunk through layer 1, and so on, keeping the chunks' four streams and their
+selections between layers. The calls are the same, in another order, so the logits are the same bit for bit
+(`glm_prompt_parity` scenario E; on the real file every run below wrote the same logits as chunk by chunk). On the
+8060S with 4,874 slots, the prompt alone (`glm_loader_parity --logits`, a cold start each):
+
+| Prompt | Chunk by chunk | Groups of 1,024 | Groups of 4,096 | Groups of 8,192 |
+| --- | --- | --- | --- | --- |
+| 3,712 tokens (docs/DETAILS.md) | 713.0 s | 245.8 s | 94.3 s | one group, as 4,096 |
+| 8,000 tokens (serve/server.py) | | | 193.7 s | 140.2 s |
+
+The times fit about 55 s a group (the experts read once) and 10.7 ms a token of compute, one after the other.
+llama.cpp's CPU build took 270-280 s for 4,096 tokens, loading included ([below](#against-llamacpp-on-the-same-file)).
+Through the server (`serve/server.py`, a 1,491-token text and "summarize it", thinking off, 4,564-4,602
+automatic slots), the first token came after 289.6 s chunk by chunk (59,532 misses, 707.9 GB read) and 69.0 s layer by
+layer (11,647 misses, 138.4 GB); the same answer of 192 tokens at 2.0-2.1 tokens/s either way.
+A group takes 72 KB of device memory a token (590 MB at 8,192), from the slots' room. `STRATA_GLM_PROMPT_GROUP=N`
+sets it for `glm_loader_parity --logits`.
+
 ## Against llama.cpp on the same file
 
 Upstream llama.cpp (commit 1b70350, which has `glm5-next`; `third_party/llama.cpp` predates it), built for the CPU
@@ -312,9 +336,11 @@ selection Strata is closer to llama.cpp at 519 of 768 positions, by KL 0.0065 on
 0.0040-0.0089). So the comparison sees the selection, and Strata's matches llama.cpp's. Reading every cell is not
 better text prediction either: lower perplexity on the Python, higher on the English.
 
-Each text took Strata 934-943 s on the 8060S after loading: about 720 s for the 3,712-token prompt (in 256-token
-chunks, each reading most of the experts from the SSD again), then 1.8 tokens/s through decode. llama.cpp's CPU build
-took 270-280 s for the whole 4,096 as one batch, loading included, reading each expert once.
+Each text took Strata 934-943 s on the 8060S after loading: about 720 s for the 3,712-token prompt chunk by chunk
+(each 256-token chunk reading most of the experts from the SSD again), then 1.8 tokens/s through decode. llama.cpp's
+CPU build took 270-280 s for the whole 4,096 as one batch, loading included, reading each expert once. Layer by layer
+([above](#long-prompts-layer-by-layer)) the same prompt takes 94.3 s, and the English text's 384 rows of logits are
+byte for byte the ones in the table.
 
 ## Tests
 
@@ -339,7 +365,8 @@ python tools/test_setup_glm.py
 - Per-layer slot shares (prompt misses 60% -> 48% in the replay above, decode 18.3% -> 17.6%): they need a
   per-layer table measured on the model; the shares were not learned well online.
 - Quality with thinking on, and on contexts much longer than 4,096 tokens (where the selection keeps a smaller share).
-- Long prompts: 3,712 tokens take about 12 minutes, the experts read again for every 256-token chunk.
+- Reading the next layer's experts while a long prompt's layer computes: now about 55 s of reads a group and 10.7 ms
+  a token of compute, one after the other.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
   lines while a prompt is read.

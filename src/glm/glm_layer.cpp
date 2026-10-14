@@ -70,6 +70,7 @@ struct Linear {
 
 GlmContext::~GlmContext() {
     if (arena_) cudaFree(arena_);
+    if (group_arena_) cudaFree(group_arena_);
     if (eids_host_) cudaFreeHost(eids_host_);
     if (mmq_bounds_) cudaFree(mmq_bounds_);
     delete gemm_;
@@ -162,6 +163,49 @@ void GlmContext::set_positions(int64_t pos0, int64_t n, void* stream) {
     cudaStreamSynchronize((cudaStream_t) stream);
     pos_ = pos0;
     n_ = n;
+}
+
+bool GlmContext::init_group(int64_t tokens, std::string& err) {
+    if (!arena_ || group_arena_ || tokens < 1) {
+        err = "GlmContext::init_group: before init, twice, or no tokens";
+        return false;
+    }
+    const size_t steps = (size_t) (tokens * k::kStepCount) * sizeof(int32_t);
+    const size_t sels = (size_t) (tokens * cap_) * sizeof(int32_t);
+    const size_t a = (steps + 255) / 256 * 256;
+    if (cudaMalloc(&group_arena_, a + sels) != cudaSuccess) {
+        cudaGetLastError();
+        group_arena_ = nullptr;
+        err = "GlmContext::init_group: " + std::to_string(a + sels) + " bytes of steps and selections";
+        return false;
+    }
+    group_step_ = (int32_t*) group_arena_;
+    group_sel_ = (int32_t*) ((uint8_t*) group_arena_ + a);
+    own_step_ = step;
+    own_sel_ = sel_ids;
+    group_tokens_ = tokens;
+    return true;
+}
+
+void GlmContext::set_group(int64_t pos0, int64_t n, void* stream) {
+    std::vector<int32_t> st((size_t) (n * k::kStepCount));
+    for (int64_t t = 0; t < n; ++t) k::kpool_step(pos0 + t, top_k_, select_tail_, &st[(size_t) (t * k::kStepCount)]);
+    cudaMemcpyAsync(group_step_, st.data(), st.size() * sizeof(int32_t), cudaMemcpyHostToDevice, (cudaStream_t) stream);
+    cudaStreamSynchronize((cudaStream_t) stream);
+    group_pos0_ = pos0;
+}
+
+void GlmContext::use_chunk(int64_t c0, int64_t n) {
+    step = group_step_ + (size_t) (c0 * k::kStepCount);
+    sel_ids = group_sel_ + (size_t) (c0 * cap_);
+    pos_ = group_pos0_ + c0;
+    n_ = n;
+}
+
+void GlmContext::end_group() {
+    if (!group_arena_) return;
+    step = own_step_;
+    sel_ids = own_sel_;
 }
 
 void GlmContext::linear(const GlmLinear& w, const float* x, float* y, int n, void* stream) {

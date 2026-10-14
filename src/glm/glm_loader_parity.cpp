@@ -19,6 +19,7 @@
 
 #include "glm_test_gguf.hpp"
 #include "strata/glm/glm_loader.hpp"
+#include "strata/glm/glm_serve.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -161,7 +162,8 @@ int bench_file(const char* shard, int64_t slots) {
 /// prompt(), then every later id through decode() whatever the model would have chosen, a row of logits before each -
 /// a text's per-position predictions (perplexity) on the path serving takes.  N_NEW is then not used.
 /// STRATA_GLM_TOP_K=N replaces the indexer's top_k (cells; a multiple of 4): one above the context reads every cell,
-/// for how much the sparse selection changes a long text's logits.
+/// for how much the sparse selection changes a long text's logits.  The prompt runs layer by layer in groups of
+/// STRATA_GLM_PROMPT_GROUP tokens (serving's default, --glm-prompt-group; 0: chunk by chunk) when the experts stream.
 int logits_real(const char* shard, const char* ids_path, const std::string& out, int n_new, int64_t slots) {
     try {
         std::vector<int32_t> ids, forced;
@@ -217,6 +219,15 @@ int logits_real(const char* shard, const char* ids_path, const std::string& out,
             return 1;
         }
         model.set_mtp_over_prompt(false);
+        {   // as serving runs a prompt (--glm-prompt-group); STRATA_GLM_PROMPT_GROUP=0: chunk by chunk
+            const char* e = std::getenv("STRATA_GLM_PROMPT_GROUP");
+            const int64_t group = e ? std::atoll(e) : glm::GlmServeOptions{}.prompt_group;
+            if (slots > 0 && !model.init_prompt_group(group, err)) {
+                std::fprintf(stderr, "%s\n", err.c_str());
+                return 1;
+            }
+            std::printf("prompt group %lld tokens\n", (long long) model.prompt_group());
+        }
         cudaStream_t s;
         check(cudaStreamCreate(&s), "stream");
         model.reset(s);
@@ -226,6 +237,9 @@ int logits_real(const char* shard, const char* ids_path, const std::string& out,
         if (!fl) { std::fprintf(stderr, "%s.logits: cannot write\n", out.c_str()); return 1; }
         const auto t0 = std::chrono::steady_clock::now();
         if (!model.prompt(ids.data(), n_prompt, 0, s, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        check(cudaStreamSynchronize(s), "prompt");
+        std::printf("prompt of %lld tokens in %.1f s\n", (long long) n_prompt,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         const std::vector<int32_t> ends = {154820, 154827, 154829};   // <|endoftext|> <|user|> <|observation|>
         for (int t = 0; t < n_new; ++t) {
             check(cudaMemcpyAsync(row.data(), model.logits(), V * 4, cudaMemcpyDeviceToHost, s), "logits");

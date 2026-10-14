@@ -169,6 +169,10 @@ bool glm_serve_options(int argc, char** argv, GlmServeOptions& o, std::string& e
             const char* v = value("--glm-chunk");
             if (!v) return false;
             o.max_chunk = std::max<int64_t>(16, std::atoll(v));
+        } else if (a == "--glm-prompt-group") {
+            const char* v = value("--glm-prompt-group");
+            if (!v) return false;
+            o.prompt_group = std::max<int64_t>(0, std::atoll(v));
         } else if (a == "--glm-expert-cache") {
             const char* v = value("--glm-expert-cache");
             if (!v) return false;
@@ -261,7 +265,9 @@ bool GlmServer::load(const GlmServeOptions& o, std::string& err, const std::func
             free_b = std::min<uint64_t>(free_b, room);
         }
         if (plan.device_bytes + plan.expert_bytes + margin > free_b && blob > 0) {
-            const uint64_t room = free_b > plan.device_bytes + margin ? free_b - plan.device_bytes - margin : 0;
+            // streamed: a long prompt's group (init_prompt_group, below) takes its room from the slots'
+            const uint64_t used = plan.device_bytes + margin + GlmModel::prompt_group_bytes(p.g, o.prompt_group);
+            const uint64_t room = free_b > used ? free_b - used : 0;
             lo.expert_cache_slots = std::max<int64_t>(64, (int64_t) (room / blob));
             log(fmt("strata serve (GLM): the experts (%.1f GB) do not fit beside the rest (%.1f GB of %.1f GB free): "
                     "%lld cache slots", plan.expert_bytes / 1e9, plan.device_bytes / 1e9, free_b / 1e9,
@@ -278,6 +284,9 @@ bool GlmServer::load(const GlmServeOptions& o, std::string& err, const std::func
     if (!p.model.init(p.g, p.weights.weights(), o.max_ctx, err, p.weights.expert_cache(), chunk) ||
         !p.model.init_verify(max_t, err))
         return false;
+    // streamed experts: a long prompt layer by layer, each layer's experts fetched once for a group of its tokens
+    // instead of once for every chunk (the cache holds a few layers' of them, not all)
+    if (lo.expert_cache_slots > 0 && !p.model.init_prompt_group(o.prompt_group, err)) return false;
     // the MTP block over a prompt only fills what drafting reads: without drafts (--spec 0) it would read its experts
     // for nothing and push cached ones out (on the real file: ~3% of an answer's misses, ~5% of a prompt's)
     p.model.set_mtp_over_prompt(o.n_draft > 0);

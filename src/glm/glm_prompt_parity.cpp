@@ -11,6 +11,9 @@
 //      indexer's selection is sparse: 512 pools of the 525 and the tail
 //   D  scenario A's prompt with the experts streamed through a cache of 6 slots: every MoE layer runs in rounds of
 //      what the cache holds, and the outputs are bitwise those of A
+//   E  scenario A's prompt in chunks of 16, run layer by layer (GlmModel::init_prompt_group: groups of 32, then one
+//      chunk of 8; and one group of all 40): the logits, h, the first draft and two decode tokens after it bitwise
+//      those of the same chunks run one after another
 //
 // Every block is checked for every token of a call from the streams the device gave it (the taps) and its latent
 // history, the way glm_model_parity checks a decode token (glm_ref.hpp's verify: 1e-4, or a set of the reference's
@@ -519,6 +522,46 @@ int main(int argc, char** argv) {
     std::printf("  logits bitwise scenario A's: %s (%llu lookups in rounds of 6 slots, %llu misses)\n",
                 same ? "yes" : "*** NO ***", (unsigned long long) lookups, (unsigned long long) misses);
     if (!same) ++g_bad;
+
+    std::printf("\nE: scenario A's prompt in chunks of 16, chunk by chunk and layer by layer (groups of 32 and 64)\n");
+    {
+        // per model: the prompt's logits, h and the draft at 39, then two decode tokens' logits
+        auto outputs = [&](int64_t group) {
+            glm::GlmModel m;
+            std::string e;
+            if (!m.init(g, tm.w, MAX_CTX, e, nullptr, 16) || !m.init_prompt_group(group, e)) {
+                std::fprintf(stderr, "%s\n", e.c_str());
+                std::exit(1);
+            }
+            m.reset(stream);
+            vector<vector<float>> out;
+            if (!m.prompt(prompt40.data(), 40, 0, stream, e) || !m.mtp_decode(tokens[40], 39, m.h_nextn(), stream, e)) {
+                std::fprintf(stderr, "%s\n", e.c_str());
+                std::exit(1);
+            }
+            check(cudaStreamSynchronize(stream), "grouped prompt");
+            out.push_back(download(m.logits(), (size_t) g.n_vocab));
+            out.push_back(download(m.h_nextn(), (size_t) D));
+            out.push_back(download(m.mtp_logits(), (size_t) g.n_vocab));
+            for (int64_t p = 40; p < 42; ++p) {
+                if (!m.decode(tokens[(size_t) p], p, stream, e)) {
+                    std::fprintf(stderr, "%s\n", e.c_str());
+                    std::exit(1);
+                }
+                check(cudaStreamSynchronize(stream), "decode after a grouped prompt");
+                out.push_back(download(m.logits(), (size_t) g.n_vocab));
+            }
+            std::printf("  group %lld: %lld\n", (long long) group, (long long) m.prompt_group());
+            return out;
+        };
+        const auto chunked = outputs(0);
+        for (int64_t group : {32, 64}) {
+            const bool eq = outputs(group) == chunked;
+            std::printf("  layer by layer in groups of %lld: logits, h, the draft and 2 decode tokens bitwise chunk by "
+                        "chunk's: %s\n", (long long) group, eq ? "yes" : "*** NO ***");
+            if (!eq) ++g_bad;
+        }
+    }
 
     std::printf("\nglm_prompt: A %lld, B %lld, C %lld failures; %d in all\n", (long long) fails_a, (long long) fails_b,
                 (long long) fails_c, g_bad);

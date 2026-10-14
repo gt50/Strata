@@ -4,6 +4,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/kda.hpp"
+#include "strata/kernels/kpool.hpp"
 #include "strata/kernels/mhc.hpp"
 
 #include <cuda_runtime.h>
@@ -66,6 +67,7 @@ GlmModel::~GlmModel() {
     if (staged_) cudaEventDestroy((cudaEvent_t) staged_);
     if (state_arena_) cudaFree(state_arena_);
     if (buf_arena_) cudaFree(buf_arena_);
+    if (gx_) cudaFree(gx_);
     if (win_arena_) cudaFree(win_arena_);
     if (pick_host_) cudaFreeHost(pick_host_);
     if (hist_host_) cudaFreeHost(hist_host_);
@@ -352,6 +354,28 @@ bool GlmModel::init(const core::Glm5NextGeometry& g, const GlmModelWeights& w, i
     return true;
 }
 
+uint64_t GlmModel::prompt_group_bytes(const core::Glm5NextGeometry& g, int64_t tokens) {
+    if (tokens <= 0) return 0;   // (a group no larger than the chunk allocates nothing either: an upper bound)
+    const uint64_t per = (uint64_t) (4 * g.n_embd) * sizeof(float) +
+                         (uint64_t) (k::kStepCount + g.idx_top_k + g.idx_kpool - 1) * sizeof(int32_t);
+    return (uint64_t) tokens * per + 512;
+}
+
+bool GlmModel::init_prompt_group(int64_t tokens, std::string& err) {
+    if (!buf_arena_ || gx_) { err = "GlmModel::init_prompt_group: before init, or twice"; return false; }
+    if (tokens <= max_chunk_) return true;   // chunk by chunk
+    tokens = std::min((tokens + max_chunk_ - 1) / max_chunk_ * max_chunk_, max_ctx_);   // a call has max_ctx at most
+    if (cudaMalloc((void**) &gx_, (size_t) (tokens * 4 * g_.n_embd) * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        gx_ = nullptr;
+        err = "GlmModel::init_prompt_group: the four streams of " + std::to_string(tokens) + " tokens";
+        return false;
+    }
+    if (!ctx_.init_group(tokens, err)) return false;
+    group_tokens_ = tokens;
+    return true;
+}
+
 void GlmModel::reset(void* stream) {
     pending_pos_ = -1;
     const cudaStream_t s = (cudaStream_t) stream;
@@ -498,43 +522,83 @@ bool GlmModel::prompt(const int32_t* tokens, int64_t n, int64_t pos0, void* stre
     const bool mtp = has_mtp_ && mtp_prompt_;
     const bool pend = mtp && pending_pos_ >= 0 && pending_pos_ == pos0 - 1;   // the last call's last position
     pending_pos_ = -1;
-    int64_t nc = 0;
-    for (int64_t c0 = 0; c0 < n; c0 += nc) {
-        nc = std::min(max_chunk_, n - c0);
-        const size_t xb = (size_t) nc * 4 * D * sizeof(float);
-        // pageable source: staged before the call returns; set_positions synchronizes the stream after its own copy
-        cudaMemcpyAsync(tok_, tokens + c0, (size_t) nc * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-        ctx_.set_positions(pos0 + c0, nc, stream);
-        ctx_.sel_valid = false;
-        k::iq_embed_rows(w_.tok_embd.type, w_.tok_embd.data, w_.tok_embd.row_bytes, tok_, nc, D, e_, stream);
-        k::mhc_init(e_, x_, (int) nc, D, stream);
-        float* tx = taps_ ? taps_->x : nullptr;
-        if (tx) cudaMemcpyAsync(tx, x_, xb, cudaMemcpyDeviceToDevice, s);
-        for (int64_t il = 0; il < g_.n_layers; ++il) {
-            if (!glm_layer_decode(g_, il, w_.blocks[(size_t) il], states_[(size_t) il], ctx_, x_, stream, err))
-                return false;
-            if (tx) cudaMemcpyAsync((uint8_t*) tx + (size_t) (il + 1) * xb, x_, xb, cudaMemcpyDeviceToDevice, s);
+    float* tx = taps_ ? taps_->x : nullptr;
+    // the MTP block over the positions of the call's chunk c0 .. c0 + nc - 1 whose next token the call has (from the
+    // last call's last), xc the chunk's four streams after the main layers
+    auto mtp_chunk = [&](int64_t c0, int64_t nc, const float* xc) {
+        const int64_t first = c0 == 0 && pend ? 1 : 0;
+        const int64_t m = c0 + nc < n ? nc : nc - 1;
+        if (first + m == 0) return true;
+        std::vector<int32_t> next;
+        if (first) next.push_back(tokens[0]);
+        for (int64_t i = 0; i < m; ++i) next.push_back(tokens[c0 + 1 + i]);
+        // pageable: staged before the call returns
+        cudaMemcpyAsync(mtp_tok_, next.data(), next.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+        if (first) cudaMemcpyAsync(hall_, h_pending_, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        if (m > 0) {   // h_nextn of the chunk's tokens: as head() computes it, a row each
+            k::mhc_mean(xc, hall_ + first * D, (int) m, D, stream);
+            k::glm_rms_norm(hall_ + first * D, w_.output_norm, m, D, (float) g_.rms_eps, stream);
         }
-        tap_main(nc, stream);
-        if (mtp) {   // the MTP block over the positions whose next token this call has, from the last call's last
-            const int64_t first = c0 == 0 && pend ? 1 : 0;
-            const int64_t m = c0 + nc < n ? nc : nc - 1;
-            if (first + m > 0) {
-                std::vector<int32_t> next;
-                if (first) next.push_back(tokens[0]);
-                for (int64_t i = 0; i < m; ++i) next.push_back(tokens[c0 + 1 + i]);
-                // pageable: staged before the call returns
-                cudaMemcpyAsync(mtp_tok_, next.data(), next.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
-                if (first) cudaMemcpyAsync(hall_, h_pending_, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
-                if (m > 0) {   // h_nextn of the chunk's tokens: as head() computes it, a row each
-                    k::mhc_mean(x_, hall_ + first * D, (int) m, D, stream);
-                    k::glm_rms_norm(hall_ + first * D, w_.output_norm, m, D, (float) g_.rms_eps, stream);
-                }
-                if (!mtp_pass(pos0 + c0 - first, first + m, hall_, stream, err)) return false;
+        return mtp_pass(pos0 + c0 - first, first + m, hall_, stream, err);
+    };
+    const int64_t group = std::max(group_tokens_, max_chunk_);
+    int64_t ng = 0, head_row = 0;
+    for (int64_t g0 = 0; g0 < n; g0 += ng) {
+        ng = std::min(group, n - g0);
+        if (ng <= max_chunk_) {   // one chunk
+            const int64_t c0 = g0, nc = ng;
+            const size_t xb = (size_t) nc * 4 * D * sizeof(float);
+            // pageable source: staged before the call returns; set_positions synchronizes the stream after its copy
+            cudaMemcpyAsync(tok_, tokens + c0, (size_t) nc * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+            ctx_.set_positions(pos0 + c0, nc, stream);
+            ctx_.sel_valid = false;
+            k::iq_embed_rows(w_.tok_embd.type, w_.tok_embd.data, w_.tok_embd.row_bytes, tok_, nc, D, e_, stream);
+            k::mhc_init(e_, x_, (int) nc, D, stream);
+            if (tx) cudaMemcpyAsync(tx, x_, xb, cudaMemcpyDeviceToDevice, s);
+            for (int64_t il = 0; il < g_.n_layers; ++il) {
+                if (!glm_layer_decode(g_, il, w_.blocks[(size_t) il], states_[(size_t) il], ctx_, x_, stream, err))
+                    return false;
+                if (tx) cudaMemcpyAsync((uint8_t*) tx + (size_t) (il + 1) * xb, x_, xb, cudaMemcpyDeviceToDevice, s);
             }
+            tap_main(nc, stream);
+            if (mtp && !mtp_chunk(c0, nc, x_)) return false;
+            head_row = nc - 1;
+            continue;
         }
+        // layer by layer: every chunk of the group through a block before the next block, the chunks' four streams
+        // in gx_ and their selections in the context's group rows
+        ctx_.set_group(pos0 + g0, ng, stream);
+        ctx_.sel_valid = false;
+        for (int64_t c = 0; c < ng; c += max_chunk_) {
+            const int64_t nc = std::min(max_chunk_, ng - c);
+            cudaMemcpyAsync(tok_, tokens + g0 + c, (size_t) nc * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+            k::iq_embed_rows(w_.tok_embd.type, w_.tok_embd.data, w_.tok_embd.row_bytes, tok_, nc, D, e_, stream);
+            k::mhc_init(e_, gx_ + (size_t) c * 4 * D, (int) nc, D, stream);
+        }
+        const int64_t c_last = (ng - 1) / max_chunk_ * max_chunk_, n_last = ng - c_last;   // the taps': as chunk by
+        const size_t xb = (size_t) n_last * 4 * D * sizeof(float);                       // chunk, the last chunk's
+        if (tx) cudaMemcpyAsync(tx, gx_ + (size_t) c_last * 4 * D, xb, cudaMemcpyDeviceToDevice, s);
+        bool ok = true;
+        for (int64_t il = 0; il < g_.n_layers && ok; ++il) {
+            for (int64_t c = 0; c < ng && ok; c += max_chunk_) {
+                ctx_.use_chunk(c, std::min(max_chunk_, ng - c));
+                ok = glm_layer_decode(g_, il, w_.blocks[(size_t) il], states_[(size_t) il], ctx_,
+                                      gx_ + (size_t) c * 4 * D, stream, err);
+            }
+            if (ok && tx)
+                cudaMemcpyAsync((uint8_t*) tx + (size_t) (il + 1) * xb, gx_ + (size_t) c_last * 4 * D, xb,
+                                cudaMemcpyDeviceToDevice, s);
+        }
+        if (ok) tap_main(n_last, stream);   // the context's selections are the last chunk's rows still
+        ctx_.end_group();
+        if (!ok) return false;
+        for (int64_t c = 0; mtp && c < ng; c += max_chunk_)
+            if (!mtp_chunk(g0 + c, std::min(max_chunk_, ng - c), gx_ + (size_t) c * 4 * D)) return false;
+        cudaMemcpyAsync(x_, gx_ + (size_t) (ng - 1) * 4 * D, (size_t) 4 * D * sizeof(float), cudaMemcpyDeviceToDevice,
+                        s);
+        head_row = 0;
     }
-    head(nc - 1, stream);
+    head(head_row, stream);
     if (mtp) {
         cudaMemcpyAsync(h_pending_, h_, (size_t) D * sizeof(float), cudaMemcpyDeviceToDevice, s);
         pending_pos_ = pos0 + n - 1;
