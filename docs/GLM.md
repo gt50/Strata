@@ -16,7 +16,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 
 | | |
 | --- | --- |
-| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s, 4-12 s for a 20-token prompt and 94 s for a 3,712-token one, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)) |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s, 4-12 s for a 20-token prompt and 94 s for a 3,712-token one, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)). UD-IQ2_XXS (102 GB) fits there whole: 16-24 tokens/s and 0.6-1.0 s for a short prompt, for 6% higher perplexity ([below](#ud-iq2_xxs-the-experts-resident)) |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm` (one size, UD-IQ4_XS), marked experimental |
@@ -42,13 +42,11 @@ From the GGUF's metadata (`glm5-next.*`, Unsloth revision `a38483c8`):
 The UD-IQ4_XS file is five shards, 156.8 GB together; shard 1 (9.4 MB) holds only metadata. Setup pins the five sizes
 and SHA-256 from the Hub's LFS pointers (`GLM_SHARDS` in `setup.py`).
 
-**UD-IQ2_XXS** (four shards, 101.8 GB) passes the loader's check too (`glm_loader_parity --plan` on its shards'
-headers alone): 7.0 GB of weights besides the experts and 95.2 GB of experts, IQ2_XXS gate / up over IQ3_XXS down in
-39 of the 42 MoE layers, IQ2_S / IQ4_XS in layer 11, IQ2_XXS / IQ4_XS in 12 and 44, Q2_K / Q3_K in the MTP block. The
-expert kernels take those pairs (`glm_moe_parity` section 4). Its largest expert is 9.8 MB (layer 11): by
-arithmetic, not a run, the 8060S's room would hold about 8,100 slots, about 65% of its 12,384 experts (UD-IQ4_XS:
-4,874 slots of 15.8 MB, 39%). Not run on the real file yet, its quality against UD-IQ4_XS is not measured, and setup
-does not offer it.
+**UD-IQ2_XXS** (four shards, 101.8 GB) runs too: 7.0 GB of weights besides the experts and 95.2 GB of experts,
+IQ2_XXS gate / up over IQ3_XXS down in 39 of the 42 MoE layers, IQ2_S / IQ4_XS in layer 11, IQ2_XXS / IQ4_XS in 12 and
+44, Q2_K / Q3_K in the MTP block (`glm_moe_parity` section 4 checks those pairs). On the 8060S all its experts fit, so
+nothing is read from the SSD: about 8x the speed of UD-IQ4_XS, for 6% higher perplexity
+([below](#ud-iq2_xxs-the-experts-resident)). Setup does not offer it yet.
 
 ## Install
 
@@ -277,6 +275,47 @@ layer (11,647 misses, 138.4 GB); the same answer of 192 tokens at 2.0-2.1 tokens
 A group takes 72 KB of device memory a token (590 MB at 8,192), from the slots' room. `STRATA_GLM_PROMPT_GROUP=N`
 sets it for `glm_loader_parity --logits`.
 
+### UD-IQ2_XXS: the experts resident
+
+Unsloth's 2-bit file (101.8 GB, pinned revision `a38483c8`, SHA-256 checked) on the same PC. Its 7.0 + 95.2 GB and
+the 3 GB of room fit the 115 GB the runtime reports free, so the engine loads every expert to the GPU, past the 64 GB
+carve-out into Windows' RAM, which kept 7.4-8.6 GB available (the 12 GB `--glm-host-reserve-gb` is
+for the slot count; a model that fits is not held to it). The same requests through the server, one session, both
+files with the automatic setting (`serve/server.py`, greedy, thinking off but the first):
+
+| Request | UD-IQ4_XS, 5,108 slots | UD-IQ2_XXS, all resident |
+| --- | --- | --- |
+| Loading | 64.0 s | 133.3 s |
+| 24 tokens ("the capital of France", effort low), 9-token answer | first token 16.2 s, 2.31 tokens/s | 0.8 s, 22.10 tokens/s |
+| 21 tokens (a haiku) | 5.3 s, 1.95 tokens/s | 0.6 s, 19.15 tokens/s |
+| 180 tokens (a tool call) | 57.0 s, 1.79 tokens/s | 3.3 s, 23.63 tokens/s |
+| 1,491 tokens ("summarize the text") | 86.8 s, 1.79 tokens/s | 23.2 s, 16.43 tokens/s |
+| trace B's six requests, 60 tokens each | 6.1-23.5 s, 1.80-2.62 tokens/s | 0.6-1.0 s, 16.51-18.71 tokens/s |
+
+The answers are right in both, as far as 60 tokens go (Paris; the tool call `get_weather`; German, Chinese, the
+arithmetic, code); the wording differs where the two files' logits do. The quality cost, measured as above on the three 450-token texts (P =
+64, 1,158 positions):
+
+| | English | Python | Chinese | All |
+| --- | --- | --- | --- | --- |
+| Perplexity, UD-IQ4_XS (Strata) | 11.896 | 5.289 | 13.483 | 9.467 |
+| Perplexity, UD-IQ2_XXS (Strata) | 12.279 | 5.423 | 15.202 | 10.041 |
+| Perplexity, UD-IQ2_XXS (llama.cpp, one batch) | 12.235 | 5.498 | 15.600 | 10.162 |
+
+UD-IQ2_XXS is 6.1% higher in perplexity over all three (Python 2.5%, English 3.2%, Chinese 12.8%); its top token is
+UD-IQ4_XS's at 890 of 1,158 positions (76.9%), KL 0.222 on average - ten times the distance between Strata and
+llama.cpp on one file. That distance on this file:
+
+| UD-IQ2_XXS, 1,158 positions | Same top token | KL mean | KL median | KL max |
+| --- | --- | --- | --- | --- |
+| Strata against llama.cpp, one batch | 1,054 (91.0%) | 0.0274 | 0.0149 | 0.843 |
+| Strata against llama.cpp, one token at a time | 1,054 (91.0%) | 0.0263 | 0.0150 | 2.218 |
+| llama.cpp one token at a time against one batch | 1,070 (92.4%) | 0.0279 | 0.0142 | 2.694 |
+
+Wider than on UD-IQ4_XS for llama.cpp's own two paths as much as for Strata: the 2-bit weights magnify rounding. Strata
+decoded each text's 386 tokens in 24.2 s (UD-IQ4_XS: 195-238 s); llama.cpp's CPU build took 83-85 s a text as one
+batch and 289-305 s one token at a time.
+
 ## Against llama.cpp on the same file
 
 Upstream llama.cpp (commit 1b70350, which has `glm5-next`; `third_party/llama.cpp` predates it), built for the CPU
@@ -379,3 +418,5 @@ python tools/test_setup_glm.py
 - Images, batch slots, prompt reuse between requests (each request reads its whole prompt), `logit_bias`, progress
   lines while a prompt is read.
 - Several GPUs, calibration, a ready-made engine with the GLM path.
+- UD-IQ2_XXS in setup (`--family glm` offers UD-IQ4_XS only); on an integrated GPU, whether a model whose experts all
+  fit should still keep `--glm-host-reserve-gb` available (it streams then, and is slower).
