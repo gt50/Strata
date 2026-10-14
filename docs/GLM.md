@@ -16,7 +16,7 @@ the whole file was then run there ([the first run](#the-first-run-of-the-real-fi
 
 | | |
 | --- | --- |
-| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers, thinking off, a streamed tool call; 2.2-3.0 tokens/s, 4-12 s for a 20-token prompt and 94 s for a 3,712-token one, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file ([below](#against-llamacpp-on-the-same-file)). UD-IQ2_XXS (102 GB) fits there whole: 16-24 tokens/s and 0.6-1.0 s for a short prompt, for 6% higher perplexity ([below](#ud-iq2_xxs-the-experts-resident)) |
+| **Runs the real file** | yes, on one PC (Radeon 8060S, 64 GB of RAM and a 64 GB GPU carve-out): correct answers with thinking on and off, a streamed tool call; 2.2-3.0 tokens/s, 4-12 s for a 20-token prompt and 94 s for a 3,712-token one, bound by reading experts from the SSD; its next-token choices and perplexity match llama.cpp's on the same file, thinking on too ([below](#against-llamacpp-on-the-same-file)). UD-IQ2_XXS (102 GB) fits there whole: 16-24 tokens/s and 0.6-1.0 s for a short prompt, for 6% higher perplexity ([below](#ud-iq2_xxs-the-experts-resident)) |
 | **GPUs** | AMD, built with HIP and run on a Radeon 8060S (gfx1151) only. The CUDA build of the GLM kernels has not been compiled; Intel (SYCL) has no GLM path |
 | **Engine** | not in a ready-made release: build it from a checkout that has `src/glm` (below) |
 | **Setup** | `--family glm`: UD-IQ2_XXS or UD-IQ4_XS, the one that fits the GPU whole recommended; marked experimental |
@@ -393,6 +393,24 @@ CPU build took 270-280 s for the whole 4,096 as one batch, loading included, rea
 ([above](#long-prompts-layer-by-layer)) the same prompt takes 94.3 s, and the English text's 384 rows of logits are
 byte for byte the ones in the table.
 
+**Thinking on.** Four prompts rendered as the server renders them with thinking on (its default: the prompt ends in
+`<think>`) - 17 x 24, the bat and the ball, an iterative Fibonacci function in Python, and in Chinese 5 apples less 2
+plus 3 - and Strata's greedy reasoning and answer, at most 384 tokens (`--logits ... 384`). On UD-IQ4_XS that is 1,230
+positions: the multiplication and the apples end on their own (277 and 185 tokens), the bat and ball's thinking ends
+and its answer is cut at 384, the Fibonacci thinking is cut at 384:
+
+| UD-IQ4_XS, thinking on, 1,230 positions | Same top token | KL mean | KL max |
+| --- | --- | --- | --- |
+| Strata against llama.cpp, one batch | 1,215 (98.8%) | 0.0041 | 0.322 |
+| Strata against llama.cpp, one token at a time | 1,224 (99.5%) | 0.0034 | 0.485 |
+| llama.cpp one token at a time against one batch | 1,213 (98.6%) | 0.0044 | 0.304 |
+
+As with thinking off, Strata is as close to llama.cpp as llama.cpp's own two paths. On UD-IQ2_XXS (1,279 positions, its
+own greedy text: the multiplication ends at 326 tokens) Strata against llama.cpp's batch: 1,258 (98.4%), KL mean 0.0072,
+max 0.275. The answers are right on both files: 408, $0.05, 6 apples (6个苹果); the Fibonacci reasoning, cut while it
+traced its loop, had the right function. Strata's times on UD-IQ4_XS: 139.6-309.5 s a prompt (185-384 tokens, the
+experts streamed); on UD-IQ2_XXS 12.0-24.4 s.
+
 ## Tests
 
 The GPU tests (ctest, HIP build; each `--selftest`): `kda_parity`, `mla_parity`, `kpool_parity`, `glm_moe_parity`,
@@ -415,7 +433,7 @@ python tools/test_setup_glm.py
 
 - Per-layer slot shares (prompt misses 60% -> 48% in the replay above, decode 18.3% -> 17.6%): they need a
   per-layer table measured on the model; the shares were not learned well online.
-- Quality with thinking on, and on contexts much longer than 4,096 tokens (where the selection keeps a smaller share).
+- Quality on contexts much longer than 4,096 tokens (where the selection keeps a smaller share).
 - Reading the next layer's experts while a long prompt's layer computes: now about 55 s of reads a group and 10.7 ms
   a token of compute, one after the other.
 - The CUDA build of the GLM kernels, and other AMD architectures than gfx1151.
