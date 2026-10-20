@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import random
 import shutil
 import socket
 import sys
@@ -23,15 +24,18 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
+                          StrataEngine, api_key_of, engine_args, forward_of, key_matches, layer_split_value,
+                          prompt_progress,
                           prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
-ANSWER = "xy" * 1000                             # longer than the old 1024 fallback: one token per byte (#606: not
-#                                                one token repeated, which the server ends at 256)
+# longer than the old 1024 fallback: one token per byte, and no repetition the server ends (one token or a short
+# phrase repeated 256 tokens long, #606 and repeat_stop_period): letters in a fixed pseudo-random order
+_RNG = random.Random(606)
+ANSWER = "".join(_RNG.choice("abcdefghijklmnopqrstuvwxyz ") for _ in range(2000))
 
 
 class RecordingEngine(MockEngine):
@@ -1961,8 +1965,34 @@ class RepeatStop(unittest.TestCase):
         done, log = self.run_reply("!" * 1000, limit=0)
         self.assertEqual((done["finish"], done["completion_tokens"]), ("stop", 1001))
         self.assertNotIn("repeated one token", log)
-        done, _ = self.run_reply("ab" * 400, limit=8)       # alternating tokens are not one run
+        done, _ = self.run_reply("abcd" * 3, limit=16)     # a phrase repeated, but shorter than the limit
         self.assertEqual(done["finish"], "stop")
+
+    def test_a_repeated_phrase_is_ended(self):
+        # "[unclear] " forever: a phrase of several tokens repeated, which the one-token run never sees
+        done, log = self.run_reply("ok " + "[unclear] " * 100 + " never")
+        self.assertEqual((done["finish"], done["stop_cause"]), ("length", "repetition"))
+        # the run starts at the space that ends "ok " (" [unclear]" repeats from there): 256 tokens after "ok"
+        self.assertEqual(done["completion_tokens"], 2 + 256)
+        self.assertIn("repeated the same 10 tokens", log)
+        done, _ = self.run_reply("ab" * 400, limit=8)        # alternating tokens: a phrase of two
+        self.assertEqual((done["finish"], done["stop_cause"]), ("length", "repetition"))
+        self.assertEqual(done["completion_tokens"], 8)
+
+    def test_period_one_keeps_only_the_one_token_rule(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ab" * 400, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.repeat_stop_tokens, svc.repeat_stop_period = 8, 1
+        with contextlib.redirect_stdout(io.StringIO()):
+            done = [x for kind, x in svc.run(tok.encode("hi"), False, None, 3000, {}, threading.Event())
+                    if kind == "done"][0]
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("stop_cause", done)
+
+    def test_a_long_reply_that_does_not_repeat_runs_to_the_end(self):
+        done, _ = self.run_reply(ANSWER)
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("stop_cause", done)
 
 
 class LayerSplit(unittest.TestCase):
@@ -3787,6 +3817,12 @@ class AmdTelemetry(unittest.TestCase):
     """#301: the AMD backend's readings from a fake amdgpu sysfs tree: KFD node -> render node, as setup numbers the
     cards (the CPU node skipped), and free_vram_mib on HIP."""
 
+    def setUp(self):
+        from serve import telemetry
+        p = mock.patch.object(telemetry, "WINDOWS", False)      # the sysfs reader, also when the tests run on Windows
+        p.start()
+        self.addCleanup(p.stop)
+
     def tree(self, d):
         nodes = Path(d) / "class/kfd/kfd/topology/nodes"
         for n, props in ((0, "cpu_cores_count 16\nsimd_count 0\ngfx_target_version 0\ndrm_render_minor 0\n"),
@@ -3845,6 +3881,124 @@ class AmdTelemetry(unittest.TestCase):
             self.tree(d)
             with mock.patch.object(telemetry, "SYSFS", d):
                 self.assertEqual(svc.free_vram_mib(), 26 << 10)
+
+
+class AmdWindowsTelemetry(unittest.TestCase):
+    """The AMD backend's readings on Windows: ADL's PMLog sensors (first supported id wins) and the GPU memory
+    counter's instance name for an adapter LUID."""
+
+    def test_sensor_choice(self):
+        from serve.telemetry import ADL_POWER, ADL_TEMP, ADL_UTIL, adl_pick
+        strix = {1: 600, 19: 12, 23: 84, 28: 49, 29: 51, 30: 2, 33: 4}      # a Radeon 8060S's supported sensors
+        self.assertEqual((adl_pick(strix, ADL_UTIL), adl_pick(strix, ADL_TEMP), adl_pick(strix, ADL_POWER)),
+                         (12, 49, 84))
+        self.assertEqual((adl_pick({8: 55, 29: 60}, ADL_TEMP), adl_pick({30: 40}, ADL_POWER)), (55, 40))
+        self.assertIsNone(adl_pick({}, ADL_UTIL))
+
+    def test_luid_instance(self):
+        from serve.telemetry import luid_instance
+        self.assertEqual(luid_instance(0, 0x179E6), "luid_0x00000000_0x000179e6_phys_0")
+        self.assertEqual(luid_instance(-1, 0xFFFFFFFF), "luid_0xffffffff_0xffffffff_phys_0")
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_no_card_breaks_nothing(self):
+        from serve import telemetry
+        g = telemetry._AmdWindows(99)                                       # no such AMD card (or no ADL at all)
+        self.assertFalse(g.ok())
+        with mock.patch.object(telemetry, "WINDOWS", True):
+            self.assertIsNone(telemetry.free_vram_mib(99, amd=True))
+
+
+class UserArgs(unittest.TestCase):
+    """"user_args": engine options of the user's own, over setup's "args" (setup keeps the key on every run)."""
+
+    def test_replace_and_add(self):
+        cfg = {"args": ["--pack", "p", "--kv-resident", "32768", "--resident-budget-gib", "36", "--vision"],
+               "user_args": ["--no-prefill-borrow", "--kv-resident", "0", "--conversation-cache-mib", "16384"]}
+        self.assertEqual(engine_args(cfg), ["--pack", "p", "--resident-budget-gib", "36", "--vision",
+                                            "--no-prefill-borrow", "--kv-resident", "0",
+                                            "--conversation-cache-mib", "16384"])
+        self.assertEqual(engine_args({"args": ["--a", "1"]}), ["--a", "1"])           # absent: as before
+        self.assertEqual(engine_args({"args": ["--x", "-1"], "user_args": ["--x", "2"]}), ["--x", "2"])  # -1 a value
+
+    def test_bad_values(self):
+        for bad in ("--x", [1], ["value-first", "--x"], {"--x": 1}):
+            with self.assertRaises(ValueError):
+                engine_args({"args": [], "user_args": bad})
+
+    def test_the_settings_page_edits_user_args_for_their_options(self):
+        from serve import runconfig
+        cfg = {"args": ["--vram-reserve-mib", "700"], "user_args": ["--vram-reserve-mib", "900"]}
+        self.assertEqual(runconfig.value_of(cfg, "vram_reserve_mib"), 900)
+        new, _ = runconfig.apply(cfg, {"vram_reserve_mib": 1200})
+        self.assertEqual((new["args"], new["user_args"]), (["--vram-reserve-mib", "700"], ["--vram-reserve-mib", "1200"]))
+
+
+class Forward(unittest.TestCase):
+    """"forward": POSTs to a path answered by another server (an embedding model, a reranker), as it answers."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+
+        class Side(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                if self.path == "/v1/rerank":
+                    self.send_response(400)
+                    data = b'{"error": "no query"}'
+                else:
+                    self.send_response(200)
+                    data = json.dumps({"seen": json.loads(body), "auth": self.headers.get("Authorization")}).encode()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        cls.side = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Side)
+        threading.Thread(target=cls.side.serve_forever, daemon=True).start()
+        side = f"http://127.0.0.1:{cls.side.server_address[1]}"
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc.forward = forward_of({"forward": {"/v1/embeddings": side + "/v1/embeddings",
+                                                  "/v1/rerank/": side + "/v1/rerank",
+                                                  "/v1/gone": "http://127.0.0.1:9/"}})
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        for s in (cls.httpd, cls.side):
+            s.shutdown()
+            s.server_close()
+
+    def post(self, path, body, headers=None):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_answers_come_back_as_they_are(self):
+        code, r = self.post("/v1/embeddings", {"model": "qwen3-embedding", "input": ["a"]}, {"Authorization": "Bearer k"})
+        self.assertEqual((code, r["seen"]["input"], r["auth"]), (200, ["a"], None))   # Strata's key is not passed on
+        self.assertEqual(self.post("/v1/rerank", {"query": ""}), (400, {"error": "no query"}))
+        code, r = self.post("/v1/gone", {})
+        self.assertEqual((code, r["error"]["code"]), (502, "forward_failed"))
+        self.assertEqual(self.post("/v1/other", {})[0], 404)                        # not configured: as before
+
+    def test_the_config(self):
+        self.assertEqual(forward_of({}), {})
+        for bad in ({"/v1/chat/completions": "http://x"}, {"/v1/responses": "http://x"}, {"v1/e": "http://x"},
+                    {"/v1/e": "ftp://x"}, ["/v1/e"]):
+            with self.assertRaises(ValueError):
+                forward_of({"forward": bad})
 
 
 class SilentEngine(unittest.TestCase):

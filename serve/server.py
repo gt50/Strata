@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from http.client import HTTPException
@@ -61,6 +62,7 @@ from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import _PlainString, _extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
@@ -142,6 +144,10 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# The same guard for a short phrase repeated back to back ("[unclear] " forever, 3 tokens a time): a run of
+# repeat_stop_tokens tokens that repeats with a period of 2 to REPEAT_STOP_PERIOD tokens ends the reply the same way.
+# The config's "repeat_stop_period" sets the longest period; 1 keeps only the one-token guard.
+REPEAT_STOP_PERIOD = 16
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -934,6 +940,9 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        k = top_logprobs(sampling)
+        if k is not None:                       # an LP line after each T line (an engine without them ignores the key)
+            keys += f" logprobs={k}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -1431,6 +1440,11 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
+        # logprobs: the engine writes "LP <logprob> [id:logprob ...]" right after each "T <id>" (the same flush), read
+        # here before the token is yielded, so whoever takes the token finds its line in lp_lines
+        want_lp = top_logprobs(sampling or {}) is not None
+        self.lp_lines = collections.deque()
+        carry = NO_LINE
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1456,7 +1470,10 @@ class StrataEngine:
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
                                            "the request")
                 try:
-                    line = self.lines.get(timeout=min(wait, 0.5))
+                    if carry is not NO_LINE:              # the line read after a token for its LP line
+                        line, carry = carry, NO_LINE
+                    else:
+                        line = self.lines.get(timeout=min(wait, 0.5))
                 except queue.Empty:
                     if cancel.is_set():
                         return
@@ -1475,7 +1492,16 @@ class StrataEngine:
                     allow = silence
                     if cancel.is_set():
                         return
-                    yield int(line[2:])
+                    t = int(line[2:])
+                    if want_lp:
+                        try:
+                            carry = self.lines.get(timeout=0.5)
+                        except queue.Empty:
+                            carry = NO_LINE
+                        if isinstance(carry, str) and carry.startswith("LP "):
+                            self.lp_lines.append((t, carry))
+                            carry = NO_LINE
+                    yield t
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -1516,9 +1542,12 @@ class StrataEngine:
                 while True:
                     left = allow - (time.monotonic() - heard) if allow > 0 else None
                     try:
-                        if left is not None and left <= 0:
+                        if carry is not NO_LINE:          # read already, after the last token
+                            line, carry = carry, NO_LINE
+                        elif left is not None and left <= 0:
                             raise queue.Empty
-                        line = self.lines.get(timeout=left)
+                        else:
+                            line = self.lines.get(timeout=left)
                     except queue.Empty:
                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
                                            f"within {allow:.0f} s") from None
@@ -2042,11 +2071,66 @@ def layer_split_of(cfg: dict) -> bool:
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
+def user_args_of(cfg: dict) -> list[str]:
+    """The config's "user_args": engine options of the user's own, which setup never writes (it keeps the key on every
+    run, #629) and which win over setup's "args".  A list of strings; anything else is a config error."""
+    user = cfg.get("user_args")
+    if user is None:
+        return []
+    if not isinstance(user, list) or not all(isinstance(x, str) for x in user) or (user and not user[0].startswith("--")):
+        raise ValueError('"user_args" must be a list of engine options as strings, starting with an option '
+                         '(e.g. ["--no-prefill-borrow", "--kv-resident", "0"])')
+    return list(user)
+
+
+# Strata's own API paths: "forward" cannot take them over
+OWN_API_PATHS = {"/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/messages/count_tokens",
+                 "/v1/responses", "/v1/models", "/v1/load", "/v1/unload", "/v1/vram"}
+
+
+def forward_of(cfg: dict) -> dict:
+    """The config's "forward": {path: URL} - POST requests to these paths are answered by another server, e.g.
+    {"/v1/embeddings": "http://127.0.0.1:1234/v1/embeddings", "/v1/rerank": "http://127.0.0.1:8081/v1/rerank"} for
+    an embedding model and a reranker beside the main one, so apps keep one base URL.  Paths start with "/" and are
+    not Strata's own; URLs are http(s)."""
+    fwd = cfg.get("forward")
+    if fwd is None:
+        return {}
+    if not isinstance(fwd, dict):
+        raise ValueError('"forward" must be an object of path -> URL, e.g. {"/v1/embeddings": "http://127.0.0.1:1234/v1/embeddings"}')
+    out = {}
+    for path, url in fwd.items():
+        p = str(path).split("?")[0].rstrip("/")
+        if not p.startswith("/") or p in OWN_API_PATHS or p.startswith("/v1/responses"):
+            raise ValueError(f'"forward": {path!r} is not a path this server can hand on (Strata answers it itself)')
+        if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
+            raise ValueError(f'"forward": the URL for {path!r} must start with http:// or https://')
+        out[p] = url
+    return out
+
+
+def merge_user_args(args: list[str], user: list[str]) -> list[str]:
+    """`args` with every option `user` names (and the values after it, up to the next "--" option) taken out, then
+    `user` appended: so "--kv-resident 0" in user_args replaces setup's "--kv-resident 32768", and an option setup does
+    not write is simply added."""
+    names = {x for x in user if x.startswith("--")}
+    out, i = [], 0
+    while i < len(args):
+        if args[i] in names:
+            i += 1
+            while i < len(args) and not args[i].startswith("--"):
+                i += 1
+            continue
+        out.append(args[i])
+        i += 1
+    return out + user
+
+
 def engine_args(cfg: dict) -> list[str]:
-    """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
-    config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
-    layer_split_value)."""
-    args = list(cfg["args"])
+    """The engine's arguments: the config's, with "user_args" over them (user_args_of), and with several GPUs the
+    layer split across them ("layer_split" in the config: "auto" by default, or the first layer of each later GPU's
+    share, e.g. "18" or "16,32"; see layer_split_value)."""
+    args = merge_user_args(list(cfg["args"]), user_args_of(cfg))
     if layer_split_of(cfg) and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
     # opt-in: an auto split runs on the first card alone when it holds every profiled expert and the KV
@@ -2279,6 +2363,7 @@ class Detokenizer:
 
 
 OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
+NO_LINE = object()                                   # StrataEngine.generate: no line held after a token
 
 
 def stop_strings(req: dict) -> list[str]:
@@ -2445,6 +2530,10 @@ class Service:
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+        self.repeat_stop_period = REPEAT_STOP_PERIOD     # ... and a phrase of up to this many tokens repeated (1: off)
+        self.structured_plain_string = True             # a one-string-field json_schema answered as plain text
+        self.forward = {}                               # "forward": {path: URL} answered by another server
+        self.forward_timeout_s = 600
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
@@ -3203,6 +3292,11 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        stop_cause = None                               # why the generator ended a reply itself ("done": stop_cause)
+        # a short phrase repeated back to back ("[unclear] " forever): for each period p in 2..repeat_stop_period, how
+        # many tokens in a row equal the one p back; the run is p tokens longer than that count
+        period_max = max(1, min(int(self.repeat_stop_period or 1), 64))
+        period_tail, period_run, period_hit = [], [0] * (period_max + 1), 0
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -3305,6 +3399,17 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                if self.repeat_stop_tokens and period_max > 1:
+                                    for p in range(2, period_max + 1):
+                                        same = len(period_tail) >= p and period_tail[-p] == t
+                                        period_run[p] = period_run[p] + 1 if same else 0
+                                        if same and period_run[p] + p >= self.repeat_stop_tokens:
+                                            period_hit = p
+                                    period_tail.append(t)
+                                    del period_tail[:-period_max]
+                                    if period_hit:
+                                        repeated = True  # the same short phrase over and over: end it as above
+                                        break
                                 piece = detok.push(t)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
@@ -3443,10 +3548,19 @@ class Service:
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
+                        stop_cause = "reasoning_loop"
                         print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
                               "strata-<model>.json; remove it to turn this off)", flush=True)
+                    elif repeated and period_hit:
+                        stop_cause = "repetition"
+                        phrase = self.tok.decode(period_tail[-period_hit:])
+                        print(f"[strata] the reply repeated the same {period_hit} tokens ({phrase!r}) "
+                              f"{(period_run[period_hit] + period_hit) // period_hit} times in a row: ended as "
+                              "\"length\" with stop_cause \"repetition\" (repeat_stop_tokens / repeat_stop_period in "
+                              "strata-<model>.json; 0 / 1 turn this off)", flush=True)
                     elif repeated:
+                        stop_cause = "repetition"
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
@@ -3547,6 +3661,8 @@ class Service:
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
+        if stop_cause is not None and finish == "length":
+            done["stop_cause"] = stop_cause             # "length" that a larger max_tokens would not have changed
         yield "done", done
 
 
@@ -3729,6 +3845,93 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
+def top_logprobs(req: dict):
+    """The K for the engine's logprobs=K, or None when the request did not ask (OpenAI: "logprobs": true, with
+    "top_logprobs" 0..20; the legacy completions form, "logprobs": N, is taken as N)."""
+    lp = req.get("logprobs")
+    if lp is True:
+        k = req.get("top_logprobs")
+        return max(0, min(20, k)) if isinstance(k, int) and not isinstance(k, bool) else 0
+    if isinstance(lp, int) and not isinstance(lp, bool) and lp >= 0:
+        return min(20, lp)
+    return None
+
+
+class LogprobEntries:
+    """The engine's LP lines as OpenAI's logprobs.content entries.  Each token's "token" is the text it completes
+    (an incremental UTF-8 decode, as the reply's text is made), so a character split across tokens is in the token
+    that finishes it and the tokens, joined, spell the text; "bytes" are the token's own bytes.  The stop token
+    ends the reply and is not listed (OpenAI does not list it either).  Tokens that make no text of the reply (the
+    `</think>` tag and the newlines after it) are left out: spell() gives each piece of text the tokens that spell it."""
+
+    def __init__(self, svc):
+        self.tok, self.stop_ids = svc.tok, svc.stop_ids
+        self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.pending = []                          # entries read but not yet given to a piece of text
+
+    def spell(self, eng, text: str) -> list:
+        """The entries whose tokens spell `text`, the next piece of the reply: the tokens before it made no text
+        (they are dropped), the ones after it belong to the next piece.  If no run of tokens spells it (a piece the
+        server changed), all the entries read so far."""
+        self.pending += self.take(eng)
+        at = [0]
+        for e in self.pending:
+            at.append(at[-1] + len(e["token"]))
+        joined = "".join(e["token"] for e in self.pending)
+        i = joined.find(text)
+        while i >= 0 and text:
+            if i in at:
+                a = at.index(i)                    # the first token there: a "" before it starts a split character
+                end = i + len(text)
+                b = next((j for j in range(a + 1, len(at)) if at[j] == end), None)
+                if b is not None:
+                    out, self.pending = self.pending[a:b], self.pending[b:]
+                    return out
+            i = joined.find(text, i + 1)
+        out, self.pending = self.pending, []
+        return out
+
+    def raw(self, t):
+        if hasattr(self.tok, "token_bytes"):
+            return self.tok.token_bytes(t)
+        return self.tok.decode([t]).encode("utf-8")
+
+    def take(self, eng) -> list:
+        lines, out = getattr(eng, "lp_lines", None), []
+        while lines:
+            t, line = lines.popleft()
+            f = line.split()
+            if t in self.stop_ids or len(f) < 2 or f[1] == "nan":
+                continue
+            b = self.raw(t)
+            e = {"token": self.inc.decode(b), "logprob": float(f[1]), "bytes": list(b), "top_logprobs": []}
+            for x in f[2:]:
+                i, _, v = x.partition(":")
+                alt = self.raw(int(i))
+                e["top_logprobs"].append({"token": alt.decode("utf-8", "replace"), "logprob": float(v),
+                                          "bytes": list(alt)})
+            out.append(e)
+        return out
+
+
+def logprob_span(text: str, part: str, entries: list):
+    """The entries whose tokens spell `part`, a piece of `text` (the JSON inside a fenced answer), or None when the
+    tokens do not spell `text` or no token boundary falls at both ends of `part`."""
+    if "".join(e["token"] for e in entries) != text:
+        return None
+    start = text.find(part)
+    if start < 0:
+        return None
+    at, first = 0, None
+    for i, e in enumerate(entries):
+        if at == start and first is None:
+            first = i
+        if at == start + len(part) and first is not None:
+            return entries[first:i]
+        at += len(e["token"])
+    return entries[first:] if first is not None and at == start + len(part) else None
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
     an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
@@ -3743,6 +3946,13 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
     yield chunk({"role": "assistant", "content": ""})
+    lp = LogprobEntries(svc) if top_logprobs(req) is not None else None
+
+    def with_lp(c, key):
+        got = lp.spell(svc.engine, c["choices"][0]["delta"][key]) if lp is not None else None
+        if got:
+            c["choices"][0]["logprobs"] = {key: got}
+        return c
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
@@ -3759,9 +3969,9 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
+                yield with_lp(chunk({"reasoning_content": ev.text}), "reasoning_content")
             elif ev.kind == "content" and ev.text:
-                yield chunk({"content": ev.text})
+                yield with_lp(chunk({"content": ev.text}), "content")
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
@@ -3788,6 +3998,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+            if x.get("stop_cause"):
+                # Strata's own field beside finish_reason: "length" because the reply repeated itself ("repetition")
+                # or the thinking looped ("reasoning_loop"), so a larger max_tokens would not have helped
+                last["choices"][0]["stop_cause"] = x["stop_cause"]
             yield last
 
 
@@ -3801,11 +4015,14 @@ def _is_json(text: str) -> bool:
 
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    lps = {}                                       # "content" / "reasoning_content" -> logprob entries
     for c in chunks:
-        if c is None:                              # a heartbeat
+        if not isinstance(c, dict):                # a heartbeat (None, or a progress note from structured_chunks)
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
+        for k, v in (c["choices"][0].get("logprobs") or {}).items():
+            lps.setdefault(k, []).extend(v)
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -3830,32 +4047,69 @@ def openai_collect(chunks) -> dict:
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
            "usage": last["usage"]}
+    if last["choices"][0].get("stop_cause"):
+        out["choices"][0]["stop_cause"] = last["choices"][0]["stop_cause"]
+    if lps:
+        out["choices"][0]["logprobs"] = {"content": lps.get("content", []), "refusal": None, **(
+            {"reasoning_content": lps["reasoning_content"]} if lps.get("reasoning_content") else {})}
     if last.get("timings"):
         out["timings"] = last["timings"]
     return out
 
 
 def structured_chunks(chunks, validator):
-    """Buffer structured streams so a client never receives unvalidated content."""
+    """Buffer structured streams so a client never receives unvalidated content.  While it buffers, the heartbeat is a
+    progress note (str: an SSE comment, which clients ignore) with what has been written so far, so a client - or
+    a person reading the stream - can tell a long answer from a stuck one."""
     buffered = []
     heartbeat = time.monotonic()
+    written = chars = 0
     try:
         for chunk in chunks:
             progress = chunk is not None and "prompt_progress" in chunk
             if chunk is not None and not progress:
                 buffered.append(chunk)      # a progress chunk carries no content: there is nothing in it to validate
+                delta = chunk["choices"][0]["delta"]
+                piece = (delta.get("content") or "") + (delta.get("reasoning_content") or "")
+                if piece:
+                    written += 1
+                    chars += len(piece)
             if chunk is None or progress or time.monotonic() - heartbeat >= 1:
                 heartbeat = time.monotonic()
-                yield chunk if progress else None
+                if progress:
+                    yield chunk
+                else:
+                    yield (f"keep-alive: structured output buffered until it is validated, {written} pieces "
+                           f"({chars} characters) written so far" if written else None)
         result = openai_collect(buffered)
         choice = result["choices"][0]
-        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
+        content = validated_json(choice["message"]["content"], validator, choice["finish_reason"],
+                                 choice.get("stop_cause"))
+        logprobs = None
+        lps = choice.get("logprobs")
+        if lps and lps.get("content") and not isinstance(validator, _PlainString):
+            # logprobs asked for: the JSON as the model wrote it (validated above, the same value as the canonical
+            # form) when token boundaries fall at both its ends, so the tokens spell the content; else the canonical
+            # form without logprobs, which its tokens would not spell
+            raw = choice["message"]["content"] or ""
+            part = _extract_json(raw)
+            span = logprob_span(raw, part, lps["content"])
+            if span is not None:
+                content, logprobs = part, {"content": span}
+            if lps.get("reasoning_content"):
+                logprobs = {**(logprobs or {}), "reasoning_content": lps["reasoning_content"]}
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
             delta["reasoning_content"] = choice["message"]["reasoning_content"]
-        yield {**buffered[0], "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-        yield buffered[-1]
+        piece = {"index": 0, "delta": delta, "finish_reason": None}
+        if logprobs:
+            piece["logprobs"] = logprobs
+        yield {**buffered[0], "choices": [piece]}
+        end = buffered[-1]
+        if end["choices"][0].get("logprobs"):           # its entries are in the piece above (or left out with it)
+            end = {**end, "choices": [{k: v for k, v in end["choices"][0].items() if k != "logprobs"}]}
+        yield end
     finally:
         chunks.close()
 
@@ -4355,11 +4609,40 @@ def make_handler(svc: Service):
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
+        def _forward(self, url):
+            """The request's body POSTed to `url` (the config's "forward") and that server's answer passed back as it
+            came: status, body and type.  The checks before it are Strata's own (Host, API key, web pages); Strata's
+            API key is not sent on.  A server that does not answer is a 502 naming it."""
+            body = self._body() or b""
+            headers = {"Content-Type": self.headers.get("Content-Type") or "application/json",
+                       "Accept": self.headers.get("Accept") or "application/json"}
+            try:
+                req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=svc.forward_timeout_s) as r:
+                    status, data, ctype = r.status, r.read(), r.headers.get("Content-Type") or "application/json"
+            except urllib.error.HTTPError as e:
+                with e:
+                    status, data, ctype = e.code, e.read(), e.headers.get("Content-Type") or "application/json"
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                reason = getattr(e, "reason", None) or e
+                self._json(502, {"error": {"type": "server_error", "code": "forward_failed",
+                                           "message": f"the server this path is forwarded to ({url}) did not answer: "
+                                                      f"{reason}"}})
+                return
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def _post(self):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
+                return
+            if path in svc.forward:                          # "forward": another server answers this path
+                self._forward(svc.forward[path])
                 return
             if path == "/settings":
                 self._settings()
@@ -4658,7 +4941,7 @@ def make_handler(svc: Service):
         def _captured(self, items, api):
             try:
                 for item in items:
-                    if item is not None:
+                    if item is not None and not isinstance(item, str):   # not a heartbeat or a progress note
                         if api == "openai":
                             delta = item["choices"][0]["delta"]
                             content, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
@@ -4694,7 +4977,8 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
-            messages, validator = prepare_format(req.get("response_format"), messages)
+            messages, validator = prepare_format(req.get("response_format"), messages,
+                                                 plain_string=svc.structured_plain_string)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
@@ -4729,6 +5013,8 @@ def make_handler(svc: Service):
                 for c in chunks:
                     if c is None:
                         self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                    elif isinstance(c, str):                     # structured_chunks' progress note: a comment too
+                        self.wfile.write(b": " + c.replace("\n", " ").encode() + b"\n\n")
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
                     self.wfile.flush()
@@ -4784,8 +5070,10 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
 
+            ended = {}                                       # the generator's "done": its stop_cause for check()
+
             def check(text, finish):
-                return validated_json(text, validator, finish)
+                return validated_json(text, validator, finish, ended.get("stop_cause"))
 
             def events():
                 yield from asm.start()
@@ -4797,6 +5085,7 @@ def make_handler(svc: Service):
                         yield from asm.feed(x)
                     elif kind == "done":
                         done = x
+                        ended.update(x)
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
                     yield from asm.finish(done, check)
             items = self._capture(events(), "responses")
@@ -4863,7 +5152,8 @@ def make_handler(svc: Service):
             except ValueError as e:
                 raise ResponsesError(str(e), "input") from None
             try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
+                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools),
+                                                     plain_string=svc.structured_plain_string)
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
@@ -5518,6 +5808,25 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    try:
+        user_args_of(cfg)                               # a bad "user_args" stops the start with the reason
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    rp = cfg.get("repeat_stop_period", REPEAT_STOP_PERIOD)   # a short phrase repeated: up to this many tokens long
+    if isinstance(rp, bool) or not isinstance(rp, int) or not 1 <= rp <= 64:
+        raise SystemExit(f"[strata] config \"repeat_stop_period\" must be a whole number from 1 to 64 (1 = only one "
+                         f"repeated token, as #606), not {rp!r}")
+    svc.repeat_stop_period = rp
+    sp = cfg.get("structured_plain_string", True)
+    if not isinstance(sp, bool):
+        raise SystemExit(f"[strata] config \"structured_plain_string\" must be true or false, not {sp!r}")
+    svc.structured_plain_string = sp
+    try:
+        svc.forward = forward_of(cfg)
+    except ValueError as e:
+        raise SystemExit(f"[strata] config {e}")
+    for path, url in svc.forward.items():
+        print(f"[strata] {path} is forwarded to {url}", flush=True)
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:

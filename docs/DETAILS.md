@@ -723,6 +723,12 @@ print(r.choices[0].message.content)
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in
   `strata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
+  A short phrase repeated back to back is ended the same way: a run of `repeat_stop_tokens` tokens that repeats with a
+  period of 2 to 16 tokens (`[unclear] ` written until `max_tokens` ran out, 12,000 tokens and 229 s, on a scanned
+  page). `"repeat_stop_period": N` sets the longest period (1 to 64; `1` keeps only the one-token rule). Such a reply
+  keeps `finish_reason` `"length"` (what OpenAI clients expect), and its choice says why with Strata's own field
+  `"stop_cause": "repetition"` (`"reasoning_loop"` for the thinking guard below): a larger `max_tokens` would not
+  have helped.
 - **Repeated reasoning (opt-in, #728).** The single-token guard above does not see a model that repeats whole
   passages. `"reasoning_loop_recovery"` in `strata-<model>.json` is `false` (the default), `"stop"` or `"recover"`
   (`true` means `"recover"`). Every 512 output tokens, at a complete character and parser boundary, the reasoning is
@@ -840,6 +846,17 @@ print(r.choices[0].message.content)
   each token on at once. The web app's settings and MCP tools only answer Strata's own page: when you open it through
   a proxy or tunnel whose address differs, add that address, e.g. `"trusted_origins": ["https://strata.example.com"]`.
   With the key set, any `Host` name reaches the server (see Host names below).
+- **Engine options of your own (`"user_args"`).** A list of engine options, e.g. `["--no-prefill-borrow",
+  "--kv-resident", "0", "--conversation-cache-mib", "16384"]`. The server applies it over `"args"` when it starts the
+  engine: an option in both takes the `"user_args"` value(s), any other is added. Setup never writes the key, so every
+  setup run and update keeps it, while hand edits to `"args"` are dropped (setup writes `"args"`, #629). The web app's
+  Settings edit an option in `"user_args"` when it is there.
+- **Other servers behind the same address (`"forward"`).** `{"/v1/embeddings": "http://127.0.0.1:1234/v1/embeddings",
+  "/v1/rerank": "http://127.0.0.1:8081/v1/rerank"}` hands POST requests to those paths to another server (an embedding
+  model, a reranker: llama.cpp's `llama-server --embedding` / `--reranking`, LM Studio) and passes its answer back as
+  it came, so an app that expects them beside the chat model keeps one base URL. The Host, API-key and web-page checks
+  are Strata's own; Strata's API key is not sent on. Strata's own paths cannot be forwarded; a server that does not
+  answer is a `502` with `code: forward_failed`.
 - **From web apps in a browser (CORS).** Off by default. `"cors_origins": ["https://chat.example.com"]` lets pages of
   those origins call `/v1/*` from the browser (Open WebUI's direct connections, browser extensions); `["*"]` lets any
   page do it - only sensible with an API key. It never opens `/settings`, `/unload` or the MCP tools.
@@ -1071,6 +1088,18 @@ suppresses what the model itself just said, not the prompt alone. Since engine 0
 the speculative decoding checks at once, exactly as if it decoded one token at a time (before, only the first of
 each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
 without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+
+**Logprobs.** `/v1/chat/completions` takes OpenAI's `"logprobs": true` (with `"top_logprobs": 0..20`), streamed or
+not, on a CUDA/HIP engine that has them (the engine gets `logprobs=K` on its GEN line and writes an `LP` line after
+each token; an older engine ignores the key and the reply has no `logprobs`). `choices[0].logprobs.content` lists
+each token with `token`, `logprob`, `bytes` and `top_logprobs`, from the model's distribution before penalties,
+temperature and sampling, as the SYCL port does ([INTEL.md](INTEL.md)); the stop token is not listed. A token's
+`token` is the text it completes, so a character split across tokens is in the token that finishes it and the
+tokens, joined, spell the reply. With thinking on, the thinking's tokens are under `reasoning_content`. With
+`response_format` `json_schema`, the answer is returned as the model wrote it (validated as usual) when its tokens
+spell it, the JSON inside a ```` ```json ```` fence included; otherwise the canonical JSON without `logprobs`.
+Measured on a Radeon 8060S (Windows, UD-IQ4_XS, `--spec 4 --mtp`, a greedy 255-token answer): the same text with
+and without `logprobs`, 38.2 and 38.4 tok/s.
 
 **Sampled drafting (opt-in, 0.1.40.2).** With temperature above 0 the engine keeps a draft only when it equals the token the model sampled for that position, and the draft layer proposes its best guess. Two opt-in switches change how the draft layer drafts a sampled request; greedy requests (temperature 0) are never touched and stay byte-identical. `STRATA_SPEC_COUPLED=1` (or `--coupled-draft`) drafts by sampling with the request's own settings and the random number the checking row will use; the text for a seed does not change. `STRATA_SPEC_PROB=1` is speculative rejection sampling: the draft layer samples its guess from its own distribution q, the check accepts it with probability min(1, p/q) (p is the model's distribution after penalties, top_k, top_p, min_p and temperature) and otherwise samples the replacement from the leftover distribution, so every token is distributed exactly as without drafts (the text for a seed then depends on the drafts, so it is reproducible only for the same engine, flags and prompt). Guesses without a distribution (prompt lookup, suffix drafts) keep the exact-match rule, which is already exact. Neither is faster in a way that holds up: on an RTX 3060 (IQ3_XXS, 200-token story and code answers, 10 interleaved pairs) the default's median output speed was 42.4 / 43.2 / 43.3 tok/s at temperature 0.3 / 0.7 / 1.0, coupled drafting 40.6 / 42.4 / 43.3 and rejection sampling 41.0 / 42.6 / 42.6, with run-to-run differences of up to 5% between repeats; drafts kept per round fell at 0.3 and rose by about 5 points at 1.0, which the cost of the longer sampled windows ate. `STRATA_SPEC_DEPTH=1` prints the acceptance by draft depth for each request; `STRATA_SPEC_MIN_TEMP=0.9` limits sampled drafting to hotter requests. Proof that the rejection rule keeps the distribution: `spec_prob_test` (chi-square, 2 million trials per case) and `spec_verify_parity` (GPU against the host reference).
 
@@ -1552,9 +1581,19 @@ The schema must accept only JSON objects at its root: `"type":"object"`, or an `
 object schemas (an `allOf` with an object member, or a local `$ref` to one, also counts), as apps written for
 llama.cpp's `json_schema` send. A root that also allows an array, string, number, boolean or null is refused. Local
 `#` references work; remote references are refused.
-`json_schema` is checked with the Python package `jsonschema` when it is installed (`python -m pip install
-"jsonschema>=4.23,<5"`; setup does not add it); without it the answer is only checked to be one JSON object, and the
-server says so once.
+`json_schema` is checked with the Python package `jsonschema` (setup installs it; an older install gets it with
+`UPDATE.bat` / `./update.sh`, or `python -m pip install "jsonschema>=4.23,<5"` in `.venv`); without it the answer is
+only checked to be one JSON object, and the server says so once.
+
+**A schema that is one string field** (`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}`,
+an optional `description`/`title`, no enum, pattern or length limit, nothing else allowed) is answered as **plain text**
+and the server builds the object around it: the directive asks for the text alone, and the answer becomes
+`{"text": "<the text>"}`. Measured on a scanned rent roll (UD-IQ4_XS, temperature 0, a document-reading prompt): asked
+for the JSON object, the model wrote the table inside the string, then the escaped newline `\n` 256 times in place of
+the page's last lines and the closing quote (stopped by the repetition guard); with the plain-text directive the same
+page came out whole in 165 tokens and ended on its own. A model that writes the JSON object anyway is taken at its
+word (that object, checked against the schema as usual). `"structured_plain_string": false` in `strata-<model>.json`
+turns this off. Not with tools.
 
 This is **schema prompting followed by server validation**, not grammar-constrained decoding. One generation
 is made per request, with no hidden retry. Successful responses contain a validated JSON object. Malformed JSON,
@@ -1563,7 +1602,11 @@ duplicate keys, non-finite numbers, schema violations and incomplete generations
 tools/MCP are refused explicitly. Without `response_format`, ordinary text and tool behavior stays the same.
 
 Structured SSE buffers the answer while sending keep-alive comments. It emits content only after validation,
-then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without invalid content deltas.
+then usage/timings and `[DONE]`; failures emit an SSE error and `[DONE]` without invalid content deltas. Once the
+model writes, the keep-alive comments (about one a second) say how far it is (`: keep-alive: structured output buffered
+until it is validated, 312 pieces (1480 characters) written so far`), so a long answer can be told from a stuck one.
+An answer the server ended because it repeated itself (`stop_cause` `"repetition"`, above) fails with a message that
+says so, instead of "increase the output budget", which only fits an answer that ran out of `max_tokens`.
 `/v1/status.structured_output` advertises the formats, validation method and buffered streaming behavior.
 
 ### API request monitor
