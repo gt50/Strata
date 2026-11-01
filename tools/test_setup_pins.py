@@ -426,7 +426,8 @@ class Requirements(unittest.TestCase):
     def test_an_install_from_before_the_pins_is_left_alone(self):
         lines = setup.requirement_lines()
         legacy = sorted(setup.PY_PACKAGES) + ["nvidia-cublas==13.0.2.14"]
-        deps = {"markupsafe", "certifi", "charset-normalizer", "idna", "urllib3", "colorama"}
+        deps = {"markupsafe", "certifi", "charset-normalizer", "idna", "urllib3", "colorama", "attrs",
+                "jsonschema-specifications", "referencing", "rpds-py", "typing-extensions"}
         # the packages it has stay as they are; only truststore (#3722: the operating system's certificates) is new, and it is wanted
         self.assertEqual(self.pip(legacy, lines, installed=deps)[0], ['truststore==0.10.5; python_version >= "3.10"'])
         deps.add("truststore")

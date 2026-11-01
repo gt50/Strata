@@ -522,8 +522,9 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 - JSON output: `response_format: {"type":"json_object"}` or `{"type":"json_schema", ...}` on `/v1/chat/completions`. The schema
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
   work and remote ones are refused. This is schema prompting followed by server validation, not grammar-constrained
-  decoding, with one generation per request. `jsonschema` is used when installed (`python -m pip install "jsonschema>=4.23,<5"`);
-  without it the answer is only checked to be one JSON object. Malformed output returns **502** with
+  decoding, with one generation per request. `json_schema` is checked with the Python package `jsonschema` (setup installs it; an
+  older install gets it with `UPDATE.bat` / `./update.sh`, or `python -m pip install "jsonschema>=4.23,<5"` in `.venv`); without it
+  the answer is only checked to be one JSON object. Malformed output returns **502** with
   `error.code: structured_output_failed`, an invalid schema **400**. JSON formats combined with tools or MCP are refused.
   Streaming buffers the answer and emits content only after validation. Math answers often hold LaTeX such as `\alpha`, which is
   not a valid JSON escape. Add `"repair_latex_escapes": true` to the `response_format` (or to `text.format` on `/v1/responses`) and,
